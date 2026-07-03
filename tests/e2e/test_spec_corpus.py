@@ -29,7 +29,7 @@ def load_local_cases():
     return cases
 
 
-def test_runner_rejects_unknown_operation(collection):
+def test_runner_rejects_unknown_operation():
     case = {
         "name": "unknown operation",
         "source": "unified-test-format",
@@ -39,10 +39,10 @@ def test_runner_rejects_unknown_operation(collection):
     }
 
     with pytest.raises(AssertionError, match="unsupported corpus operation"):
-        run_case(case, collection)
+        run_case(case, None)
 
 
-def test_runner_rejects_unsupported_expected_assertion_shape(collection):
+def test_runner_rejects_unsupported_expected_assertion_shape():
     case = {
         "name": "bad assertion",
         "source": "crud",
@@ -52,7 +52,7 @@ def test_runner_rejects_unsupported_expected_assertion_shape(collection):
     }
 
     with pytest.raises(AssertionError, match="expect_result must be an object"):
-        run_case(case, collection)
+        run_case(case, None)
 
 
 def test_runner_rejects_malformed_setup_document():
@@ -68,7 +68,7 @@ def test_runner_rejects_malformed_setup_document():
         validate_case(case, "generated")
 
 
-def test_runner_reports_skipped_unsupported_feature(collection):
+def test_runner_reports_skipped_unsupported_feature():
     case = {
         "name": "skip regex",
         "source": "crud",
@@ -79,7 +79,7 @@ def test_runner_reports_skipped_unsupported_feature(collection):
     }
 
     with pytest.raises(pytest.skip.Exception, match="regex is unsupported"):
-        run_case(case, collection)
+        run_case(case, None)
 
 
 def run_case(case, collection):
@@ -101,6 +101,9 @@ def run_case(case, collection):
 
 
 def run_operation(operation, collection):
+    if "expect_result" in operation:
+        assert isinstance(operation["expect_result"], dict), "expect_result must be an object"
+
     expected_error = operation.get("expect_error")
     if expected_error:
         error_type = ERROR_TYPES[expected_error["type"]]
@@ -114,7 +117,6 @@ def run_operation(operation, collection):
 
     result = execute_operation(operation, collection)
     if "expect_result" in operation:
-        assert isinstance(operation["expect_result"], dict), "expect_result must be an object"
         assert_result(result, operation["expect_result"])
     if "expect_documents" in operation:
         assert result == operation["expect_documents"]

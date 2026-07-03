@@ -22,8 +22,12 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Check Rust toolchain
-        run: rustup show
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustup show
+          cargo fmt --version
 
       - name: Check Rust formatting
         run: cargo fmt -- --check
@@ -38,4 +42,4 @@ jobs:
         run: uv sync --locked --dev
 
       - name: Run PyMongo e2e suite
-        run: uv run pytest tests/e2e
+        run: uv run --locked pytest tests/e2e

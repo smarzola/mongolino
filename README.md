@@ -98,7 +98,7 @@ Run the PyMongo end-to-end suite with `uv`:
 
 ```sh
 uv sync --locked --dev
-uv run pytest tests/e2e
+uv run --locked pytest tests/e2e
 ```
 
 The e2e suite builds or locates `target/debug/mongolino`, starts it on a
