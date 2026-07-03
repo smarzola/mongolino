@@ -525,14 +525,63 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         Some(Bson::Document(filter)) => filter.clone(),
         Some(_) => return Ok(command_error(9, "find filter must be a document")),
     };
-    let batch_size = command
-        .get_i32("batchSize")
-        .or_else(|_| command.get_i64("batchSize").map(|value| value as i32))
-        .unwrap_or(101)
-        .clamp(1, 1000);
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "find",
+            "filter",
+            "batchSize",
+            "projection",
+            "sort",
+            "skip",
+            "limit",
+            "singleBatch",
+            "$db",
+            "lsid",
+        ],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+    if let Err(errmsg) = optional_bool(command, "singleBatch") {
+        return Ok(command_error(9, &errmsg));
+    }
+    let batch_size = match optional_i64(command, "batchSize") {
+        Ok(Some(value)) if value < 0 => {
+            return Ok(command_error(9, "batchSize must be non-negative"));
+        }
+        Ok(Some(value)) => value.min(1000) as usize,
+        Ok(None) => 101,
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let skip = match optional_i64(command, "skip") {
+        Ok(Some(value)) if value < 0 => return Ok(command_error(9, "skip must be non-negative")),
+        Ok(Some(value)) => value as usize,
+        Ok(None) => 0,
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let limit = match optional_i64(command, "limit") {
+        Ok(Some(value)) if value < 0 => return Ok(command_error(9, "limit must be non-negative")),
+        Ok(Some(0)) | Ok(None) => None,
+        Ok(Some(value)) => Some(value as usize),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let projection = match parse_projection(command) {
+        Ok(value) => value,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
+    let sort = match parse_sort(command) {
+        Ok(value) => value,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
     let namespace = namespace(db, collection);
 
-    if let Some(id_filter) = simple_id_equality_filter(&filter) {
+    if sort.is_none()
+        && skip == 0
+        && limit.is_none()
+        && projection.is_none()
+        && batch_size > 0
+        && let Some(id_filter) = simple_id_equality_filter(&filter)
+    {
         let wanted_id = id_key_from_bson(id_filter);
         if let Some(document) = conn
             .query_row(
@@ -559,12 +608,279 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
             Ok(false) => {}
             Err(err) => return Ok(command_error(err.code, &err.errmsg)),
         }
-        if docs.len() >= batch_size as usize {
-            break;
-        }
+    }
+
+    if let Some(sort) = sort {
+        sort_documents(&mut docs, &sort);
+    }
+    if skip > 0 {
+        docs = docs.into_iter().skip(skip).collect();
+    }
+    if let Some(limit) = limit {
+        docs.truncate(limit);
+    }
+    docs.truncate(batch_size);
+    if let Some(projection) = &projection {
+        docs = docs
+            .into_iter()
+            .map(|document| apply_projection(&document, projection))
+            .collect();
     }
 
     Ok(cursor_response(db, collection, docs))
+}
+
+fn optional_i64(command: &Document, key: &str) -> std::result::Result<Option<i64>, String> {
+    match command.get(key) {
+        None => Ok(None),
+        Some(Bson::Int32(value)) => Ok(Some(*value as i64)),
+        Some(Bson::Int64(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be an integer")),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ProjectionMode {
+    Include,
+    Exclude,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectionSpec {
+    mode: ProjectionMode,
+    fields: Vec<String>,
+    include_id: bool,
+}
+
+fn parse_projection(command: &Document) -> std::result::Result<Option<ProjectionSpec>, String> {
+    let Some(value) = command.get("projection") else {
+        return Ok(None);
+    };
+    let Bson::Document(projection) = value else {
+        return Err("projection must be a document".to_string());
+    };
+
+    let mut mode = None;
+    let mut fields = Vec::new();
+    let mut include_id = true;
+
+    for (field, value) in projection {
+        if field.starts_with('$') {
+            return Err("projection field names starting with $ are not supported".to_string());
+        }
+        let include = projection_value(value)?;
+        if field == "_id" {
+            include_id = include;
+            continue;
+        }
+
+        let field_mode = if include {
+            ProjectionMode::Include
+        } else {
+            ProjectionMode::Exclude
+        };
+        match (&mode, &field_mode) {
+            (None, _) => mode = Some(field_mode),
+            (Some(ProjectionMode::Include), ProjectionMode::Include)
+            | (Some(ProjectionMode::Exclude), ProjectionMode::Exclude) => {}
+            _ => {
+                return Err(
+                    "projection cannot mix inclusion and exclusion fields except _id".to_string(),
+                );
+            }
+        }
+        fields.push(field.to_string());
+    }
+
+    reject_path_collisions(&fields, "projection")?;
+    Ok(mode.map(|mode| ProjectionSpec {
+        mode,
+        fields,
+        include_id,
+    }))
+}
+
+fn projection_value(value: &Bson) -> std::result::Result<bool, String> {
+    match value {
+        Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => Ok(false),
+        Bson::Int32(1) | Bson::Int64(1) | Bson::Boolean(true) => Ok(true),
+        _ => Err("projection values must be 0, 1, true, or false".to_string()),
+    }
+}
+
+fn reject_path_collisions(paths: &[String], context: &str) -> std::result::Result<(), String> {
+    for (index, left) in paths.iter().enumerate() {
+        for right in paths.iter().skip(index + 1) {
+            if left == right
+                || left
+                    .strip_prefix(right)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+                || right
+                    .strip_prefix(left)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            {
+                return Err(format!(
+                    "{context} contains conflicting paths {left} and {right}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_projection(document: &Document, projection: &ProjectionSpec) -> Document {
+    match projection.mode {
+        ProjectionMode::Include => {
+            let mut out = Document::new();
+            if projection.include_id
+                && let Some(id) = document.get("_id")
+            {
+                out.insert("_id", id.clone());
+            }
+            for field in &projection.fields {
+                if let Some(value) = get_document_path(document, field) {
+                    set_document_path(&mut out, field, value.clone());
+                }
+            }
+            out
+        }
+        ProjectionMode::Exclude => {
+            let mut out = document.clone();
+            if !projection.include_id {
+                out.remove("_id");
+            }
+            for field in &projection.fields {
+                unset_document_path(&mut out, field);
+            }
+            out
+        }
+    }
+}
+
+fn get_document_path<'a>(document: &'a Document, path: &str) -> Option<&'a Bson> {
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut current = document.get(first)?;
+    for part in parts {
+        let Bson::Document(document) = current else {
+            return None;
+        };
+        current = document.get(part)?;
+    }
+    Some(current)
+}
+
+fn set_document_path(document: &mut Document, path: &str, value: Bson) {
+    let mut parts = path.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return;
+    };
+    let mut current = document;
+    for part in parts {
+        let needs_document = !matches!(current.get(part), Some(Bson::Document(_)));
+        if needs_document {
+            current.insert(part, Document::new());
+        }
+        current = current
+            .get_document_mut(part)
+            .expect("document inserted above");
+    }
+    current.insert(last, value);
+}
+
+fn unset_document_path(document: &mut Document, path: &str) {
+    let mut parts = path.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return;
+    };
+    let mut current = document;
+    for part in parts {
+        let Ok(next) = current.get_document_mut(part) else {
+            return;
+        };
+        current = next;
+    }
+    current.remove(last);
+}
+
+fn parse_sort(command: &Document) -> std::result::Result<Option<Vec<(String, i32)>>, String> {
+    let Some(value) = command.get("sort") else {
+        return Ok(None);
+    };
+    let Bson::Document(sort) = value else {
+        return Err("sort must be a document".to_string());
+    };
+    let mut spec = Vec::new();
+    for (field, direction) in sort {
+        if field.starts_with('$') {
+            return Err("sort field names starting with $ are not supported".to_string());
+        }
+        let direction = match direction {
+            Bson::Int32(1) | Bson::Int64(1) => 1,
+            Bson::Int32(-1) | Bson::Int64(-1) => -1,
+            _ => return Err("sort directions must be 1 or -1".to_string()),
+        };
+        spec.push((field.to_string(), direction));
+    }
+    Ok(Some(spec))
+}
+
+fn sort_documents(documents: &mut [Document], sort: &[(String, i32)]) {
+    documents.sort_by(|left, right| {
+        for (field, direction) in sort {
+            let ordering = compare_optional_bson(
+                get_document_path(left, field),
+                get_document_path(right, field),
+            );
+            if !ordering.is_eq() {
+                return if *direction == 1 {
+                    ordering
+                } else {
+                    ordering.reverse()
+                };
+            }
+        }
+        compare_optional_bson(left.get("_id"), right.get("_id"))
+    });
+}
+
+fn compare_optional_bson(left: Option<&Bson>, right: Option<&Bson>) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => compare_bson_order(left, right),
+    }
+}
+
+fn compare_bson_order(left: &Bson, right: &Bson) -> std::cmp::Ordering {
+    match (numeric_value(left), numeric_value(right)) {
+        (Some(left), Some(right)) => {
+            return left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal);
+        }
+        _ => {}
+    }
+
+    let left_rank = bson_type_rank(left);
+    let right_rank = bson_type_rank(right);
+    left_rank
+        .cmp(&right_rank)
+        .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
+}
+
+fn bson_type_rank(value: &Bson) -> i32 {
+    match value {
+        Bson::Null => 1,
+        Bson::Boolean(_) => 2,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => 3,
+        Bson::String(_) => 4,
+        Bson::ObjectId(_) => 5,
+        Bson::Array(_) => 6,
+        Bson::Document(_) => 7,
+        _ => 100,
+    }
 }
 
 fn simple_id_equality_filter(filter: &Document) -> Option<&Bson> {
@@ -1433,5 +1749,171 @@ mod tests {
         )
         .unwrap();
         assert_command_error(&response);
+    }
+
+    #[test]
+    fn find_projection_supports_inclusion_exclusion_and_id_override() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let included = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "filter": { "_id": "u1" },
+                    "projection": { "name": 1_i32, "profile.city": 1_i32, "_id": 0_i32 },
+                },
+            )
+            .unwrap(),
+        );
+        assert!(!included[0].contains_key("_id"));
+        assert_eq!(included[0].get_str("name").unwrap(), "Ada");
+        assert_eq!(
+            included[0]
+                .get_document("profile")
+                .unwrap()
+                .get_str("city")
+                .unwrap(),
+            "Rome"
+        );
+        assert!(!included[0].contains_key("age"));
+
+        let excluded = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "filter": { "_id": "u1" },
+                    "projection": { "profile.city": 0_i32, "tags": false },
+                },
+            )
+            .unwrap(),
+        );
+        assert!(excluded[0].contains_key("_id"));
+        assert!(
+            !excluded[0]
+                .get_document("profile")
+                .unwrap()
+                .contains_key("city")
+        );
+        assert!(!excluded[0].contains_key("tags"));
+    }
+
+    #[test]
+    fn find_sort_skip_limit_and_batch_size_shape_results() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let sorted = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "sort": { "age": -1_i32 },
+                    "skip": 1_i32,
+                    "limit": 1_i32,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].get_str("_id").unwrap(), "u2");
+
+        let limited_batch = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "sort": { "profile.city": 1_i32, "_id": 1_i32 },
+                    "batchSize": 2_i32,
+                    "limit": 0_i32,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(limited_batch.len(), 2);
+        assert_eq!(limited_batch[0].get_str("_id").unwrap(), "u2");
+    }
+
+    #[test]
+    fn find_sort_handles_missing_and_mixed_bson_types_deterministically() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "mixed",
+                "$db": "app",
+                "documents": [
+                    { "_id": "a", "value": "string" },
+                    { "_id": "b", "value": 3_i32 },
+                    { "_id": "c" },
+                    { "_id": "d", "value": false },
+                ],
+            },
+        )
+        .unwrap();
+
+        let ids = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "mixed", "$db": "app", "sort": { "value": 1_i32 } },
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .map(|doc| doc.get_str("_id").unwrap().to_string())
+        .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c", "d", "b", "a"]);
+    }
+
+    #[test]
+    fn find_rejects_invalid_projection_sort_and_bounds() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for command in [
+            doc! { "find": "users", "$db": "app", "projection": { "name": 1_i32, "age": 0_i32 } },
+            doc! { "find": "users", "$db": "app", "projection": { "name": 2_i32 } },
+            doc! { "find": "users", "$db": "app", "projection": { "$bad": 1_i32 } },
+            doc! { "find": "users", "$db": "app", "projection": { "profile": 1_i32, "profile.city": 1_i32 } },
+            doc! { "find": "users", "$db": "app", "sort": { "age": 2_i32 } },
+            doc! { "find": "users", "$db": "app", "sort": { "$bad": 1_i32 } },
+            doc! { "find": "users", "$db": "app", "skip": -1_i32 },
+            doc! { "find": "users", "$db": "app", "limit": -1_i32 },
+            doc! { "find": "users", "$db": "app", "batchSize": -1_i32 },
+            doc! { "find": "users", "$db": "app", "batchSize": 1.5 },
+        ] {
+            let response = find_documents(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn find_zero_batch_size_returns_empty_closed_batch_and_large_skip_is_empty() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let zero_batch = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "batchSize": 0_i32 },
+            )
+            .unwrap(),
+        );
+        assert!(zero_batch.is_empty());
+
+        let skipped = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "skip": 10_000_i64 },
+            )
+            .unwrap(),
+        );
+        assert!(skipped.is_empty());
     }
 }

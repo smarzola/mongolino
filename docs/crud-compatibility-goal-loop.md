@@ -81,7 +81,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and test harness
 - [x] Milestone 1: Insert correctness and write error contracts
 - [x] Milestone 2: Query matcher for `find`
-- [ ] Milestone 3: `find` result shaping
+- [x] Milestone 3: `find` result shaping
 - [ ] Milestone 4: `update` command subset
 - [ ] Milestone 5: `delete` command subset
 - [ ] Milestone 6: Real client verification and compatibility docs
@@ -272,6 +272,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 3: `find` Result Shaping
+
+Status note:
+
+- 2026-07-03: Added match-before-shape `find` handling for non-negative `skip`, non-negative `limit`, capped non-negative `batchSize`, inclusion/exclusion projection with `_id` override and dotted paths, deterministic sort on top-level/dotted fields, and explicit errors for unsupported or malformed shaping options. Verification: `cargo fmt`; `cargo test projection`; `cargo test sort`; `cargo test find`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 
