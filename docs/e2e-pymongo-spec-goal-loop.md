@@ -112,7 +112,7 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Python/uv test tooling foundation
+- [x] Milestone 0: Python/uv test tooling foundation
 - [ ] Milestone 1: PyMongo server fixture and handshake smoke
 - [ ] Milestone 2: CRUD e2e behavior coverage
 - [ ] Milestone 3: Spec-inspired corpus runner
@@ -168,6 +168,10 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_enviro
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note:
+
+- 2026-07-04: Added non-packaged uv Python test tooling with pytest and PyMongo, generated `uv.lock`, and added `tests/e2e/test_environment.py`. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_environment.py`. Initial sandboxed uv commands could not use `~/.cache/uv`, so the documented temporary cache path was used. Commit: pending.
 
 ## Milestone 1: PyMongo Server Fixture and Handshake Smoke
 
