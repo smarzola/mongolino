@@ -437,7 +437,7 @@ Commit requirement:
 
 Status note:
 
-- 2026-07-04: Added GitHub Actions CI for Rust formatting, Rust tests, Rust build, locked uv sync, and PyMongo e2e tests on push and pull request. Updated README development docs for Rust checks, uv e2e commands, local server behavior, and the local spec-inspired corpus scope. Final verification passed with `cargo fmt -- --check`, `cargo test`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: pending.
+- 2026-07-04: Added GitHub Actions CI for Rust formatting, Rust tests, Rust build, locked uv sync, and PyMongo e2e tests on push and pull request. Updated README development docs for Rust checks, uv e2e commands, local server behavior, and the local spec-inspired corpus scope. Final verification passed with `cargo fmt -- --check`, `cargo test`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: `767f217`.
 
 ## Final Verification
 
