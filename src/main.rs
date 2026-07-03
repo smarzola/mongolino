@@ -241,6 +241,7 @@ fn parse_op_msg_document(payload: &[u8]) -> Result<Document> {
     let _flags = read_i32(&payload[0..4])?;
     let mut offset = 4;
     let mut body = None;
+    let mut sequences: Vec<(String, Vec<Document>)> = Vec::new();
 
     while offset < payload.len() {
         let section_kind = payload[offset];
@@ -264,7 +265,29 @@ fn parse_op_msg_document(payload: &[u8]) -> Result<Document> {
                         "invalid document sequence size".to_string(),
                     ));
                 }
-                offset += size;
+                let section_end = offset + size;
+                let identifier_start = offset + 4;
+                let identifier_len = payload[identifier_start..section_end]
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| {
+                        MongolinoError::Protocol(
+                            "document sequence identifier missing terminator".to_string(),
+                        )
+                    })?;
+                let identifier = String::from_utf8_lossy(
+                    &payload[identifier_start..identifier_start + identifier_len],
+                )
+                .to_string();
+                let mut doc_offset = identifier_start + identifier_len + 1;
+                let mut docs = Vec::new();
+                while doc_offset < section_end {
+                    let (doc, consumed) = read_document_at(&payload[doc_offset..section_end])?;
+                    docs.push(doc);
+                    doc_offset += consumed;
+                }
+                sequences.push((identifier, docs));
+                offset = section_end;
             }
             other => {
                 return Err(MongolinoError::Protocol(format!(
@@ -274,7 +297,20 @@ fn parse_op_msg_document(payload: &[u8]) -> Result<Document> {
         }
     }
 
-    body.ok_or_else(|| MongolinoError::Protocol("OP_MSG body section missing".to_string()))
+    let mut body =
+        body.ok_or_else(|| MongolinoError::Protocol("OP_MSG body section missing".to_string()))?;
+    for (identifier, docs) in sequences {
+        if body.contains_key(&identifier) {
+            return Err(MongolinoError::Protocol(format!(
+                "OP_MSG document sequence duplicates body field {identifier}"
+            )));
+        }
+        body.insert(
+            identifier,
+            Bson::Array(docs.into_iter().map(Bson::Document).collect()),
+        );
+    }
+    Ok(body)
 }
 
 fn parse_op_query(payload: &[u8]) -> Result<(String, Document)> {
@@ -1894,6 +1930,31 @@ mod tests {
         let parsed = parse_op_msg_document(&payload).unwrap();
         assert_eq!(parsed.get_i32("ping").unwrap(), 1);
         assert_eq!(parsed.get_str("$db").unwrap(), "admin");
+    }
+
+    #[test]
+    fn op_msg_document_sequence_is_exposed_as_command_array() {
+        let body = doc! { "insert": "users", "$db": "app" };
+        let docs = vec![doc! { "_id": "u1" }, doc! { "_id": "u2" }];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_le_bytes());
+        payload.push(0);
+        body.to_writer(&mut payload).unwrap();
+        payload.push(1);
+
+        let mut sequence = Vec::new();
+        sequence.extend_from_slice(&0_i32.to_le_bytes());
+        sequence.extend_from_slice(b"documents\0");
+        for document in docs {
+            document.to_writer(&mut sequence).unwrap();
+        }
+        let sequence_size = sequence.len() as i32;
+        sequence[0..4].copy_from_slice(&sequence_size.to_le_bytes());
+        payload.extend_from_slice(&sequence);
+
+        let parsed = parse_op_msg_document(&payload).unwrap();
+        assert_eq!(parsed.get_str("insert").unwrap(), "users");
+        assert_eq!(parsed.get_array("documents").unwrap().len(), 2);
     }
 
     #[test]

@@ -84,7 +84,7 @@ When a milestone is complete:
 - [x] Milestone 3: `find` result shaping
 - [x] Milestone 4: `update` command subset
 - [x] Milestone 5: `delete` command subset
-- [ ] Milestone 6: Real client verification and compatibility docs
+- [x] Milestone 6: Real client verification and compatibility docs
 
 ## Milestone 0: Baseline and Test Harness
 
@@ -506,6 +506,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 6: Real Client Verification and Compatibility Docs
+
+Status note:
+
+- 2026-07-03: Updated README compatibility tables and CRUD examples for insert/find/update/delete, added OP_MSG document sequence parsing for real driver write batches, and verified automated CRUD coverage. Verification: `cargo fmt`; `cargo test`; `command -v mongosh` failed with exit 1 and no path; `command -v mongo` failed with exit 1 and no path; `python3 -c 'import pymongo; print(pymongo.version)'` failed with `ModuleNotFoundError: No module named 'pymongo'`; `python -c 'import pymongo; print(pymongo.version)'` failed with `ModuleNotFoundError: No module named 'pymongo'`. Real client smoke skipped because no MongoDB client was installed and no new tools were installed. Commit hash: reported after checkpoint commit.
 
 Problem:
 

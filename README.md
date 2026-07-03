@@ -1,10 +1,8 @@
 # mongolino
 
 `mongolino` is a small MongoDB wire-protocol server backed by one SQLite file.
-
-The first implementation is intentionally narrow: it accepts MongoDB `OP_MSG`
-handshakes and supports `hello`, `isMaster`, `ping`, `buildInfo`,
-`listDatabases`, basic `insert`, and basic `find`.
+It supports a documented single-server CRUD subset for simple client smoke
+tests and local experiments.
 
 ## Run
 
@@ -23,7 +21,10 @@ Example commands:
 ```javascript
 use app
 db.users.insertOne({ _id: "u1", name: "Ada" })
-db.users.find({ _id: "u1" })
+db.users.insertOne({ _id: "u2", name: "Grace", age: 39, profile: { city: "London" } })
+db.users.find({ age: { $gte: 38 } }, { name: 1, _id: 0 }).sort({ age: -1 }).toArray()
+db.users.updateOne({ _id: "u1" }, { $set: { name: "Ada Lovelace" }, $inc: { score: 1 } })
+db.users.deleteOne({ _id: "u2" })
 ```
 
 ## MongoDB Interface Surface
@@ -39,7 +40,7 @@ Compatibility flags:
 | --- | --- | --- | --- |
 | TCP listener | Compatible | Listens on `--addr`, defaulting to `127.0.0.1:27017`. | No TLS, Unix sockets, IPv6-specific handling, or connection limits. |
 | MongoDB message header | Compatible | Reads and writes standard 16-byte wire message headers with request/response IDs. | Does not validate all cross-field semantics. |
-| `OP_MSG` | Partial | Parses body section kind `0` and replies with `OP_MSG`. Skips document sequence section kind `1`. | Does not expose document sequence payloads to command handlers; ignores flags. |
+| `OP_MSG` | Partial | Parses body section kind `0`, exposes document sequence section kind `1` as command arrays, and replies with `OP_MSG`. | Ignores flags; no compression. |
 | `OP_QUERY` | Partial | Parses legacy query payloads and replies with `OP_REPLY`. Useful for legacy handshake-style clients. | No legacy cursor behavior beyond one-document command replies. |
 | Other opcodes | Unsupported | Returns an error document for unknown opcodes. | No `OP_COMPRESSED`, `OP_GET_MORE`, `OP_INSERT`, `OP_UPDATE`, `OP_DELETE`, or `OP_KILL_CURSORS`. |
 | `hello` | Compatible | Returns a standalone writable primary-style handshake with wire version and size limits. | No replica set, topology, compression, speculative auth, or server parameters. |
@@ -48,10 +49,12 @@ Compatibility flags:
 | `buildInfo` | Partial | Returns version, allocator/storage hints, BSON size, bitness, and `ok`. | Not byte-for-byte compatible with MongoDB server build metadata. |
 | `listDatabases` | Partial | Lists distinct database names derived from persisted namespaces. | Size accounting is placeholder `0`; empty databases are not tracked. |
 | `endSessions` | Stub | Returns `{ ok: 1.0 }`. | Sessions are not stored, validated, expired, or attached to operations. |
-| `insert` | Partial | Accepts `documents`, assigns `_id` when missing, and stores each BSON document in SQLite by namespace and `_id`. | Ordered/unordered semantics, write concern, duplicate key errors, validation, bypass flags, and bulk error reporting are not implemented. |
-| `find` | Partial | Returns a cursor with `id: 0` and `firstBatch`. Supports full collection scan with `batchSize` and exact `_id` lookup. | No query operators, projections, sort, skip, limit semantics, collation, read concern, getMore, tailable cursors, or non-`_id` indexes. |
-| Cursors | Partial | `find` returns all selected results in `firstBatch` and closes the cursor immediately with `id: 0`. | No server-side cursor storage, `getMore`, cursor timeout, or kill cursor support. |
-| BSON storage | Partial | Stores original BSON blobs in SQLite and derives a stable primary key from `_id`. | No typed secondary indexes, schema validation, document size enforcement beyond message size, or query planning. |
+| `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key `writeErrors`, and supports ordered/unordered batches. | No write concern, bypass document validation, schema validation, retryable writes, or sessions beyond accepting `lsid`. |
+| `find` | Partial | Returns a cursor with `id: 0` and `firstBatch`. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, and capped batch size. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, tailable cursors, or secondary indexes. Unsupported operators return command errors. |
+| `update` | Partial | Supports replacement updates, `$set`, `$unset`, `$inc`, upsert, single-update, multi-update, ordered/unordered batches, `_id` immutability, and duplicate-key write errors. | No array filters, positional operators, pipeline updates, `$rename`, `$push`, `$pull`, hints, collation, write concern, retryable writes, or transactions. |
+| `delete` | Partial | Supports batch deletes with `q` and `limit`; `limit: 1` deletes one deterministic match and `limit: 0` deletes all matches. | No hints, collation, write concern, retryable writes, or explain behavior. |
+| Cursors | Partial | `find` returns a shaped `firstBatch` and closes the cursor immediately with `id: 0`. | No server-side cursor storage, `getMore`, cursor timeout, or kill cursor support. If `batchSize` is smaller than remaining matches, extra matches are not retained for later fetches. |
+| BSON storage | Partial | Stores BSON blobs in SQLite and derives a stable primary key from `_id`. Inserts with operator-shaped field names store those names as data. | No typed secondary indexes, schema validation, document size enforcement beyond message size, or query planning. |
 | Authentication | Unsupported | No auth challenge or credential validation. | No SCRAM, x.509, keyfile, localhost exception, users, roles, or permissions. |
 | Transactions | Unsupported | No multi-operation transaction protocol. | No sessions, transaction numbers, retryable writes, snapshot reads, or rollback semantics. |
 | Indexes | Unsupported | SQLite has only internal storage indexes for namespace scans and `_id` primary-key lookups. | MongoDB `createIndexes`, `listIndexes`, `dropIndexes`, unique indexes beyond `_id`, and query planner behavior are not implemented. |
@@ -67,6 +70,22 @@ Documents are stored as BSON blobs in SQLite:
 If an inserted document does not include `_id`, `mongolino` assigns a BSON
 ObjectId before writing it to SQLite.
 
+## CRUD Compatibility Notes
+
+Supported query matching is intentionally small and explicit. Field equality
+works for scalars, documents, arrays, booleans, `null`, and comparable numeric
+types. Dotted paths can traverse embedded documents and arrays of documents.
+Unsupported or malformed operators return command errors instead of being
+silently accepted.
+
+Projection supports inclusion or exclusion mode, with `_id` as the only allowed
+mode override. Sort supports top-level or dotted fields with `1` or `-1`; missing
+fields sort deterministically before present fields in ascending order.
+
+Update paths support dotted document fields. Dotted updates through scalar
+parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, attempts to change
+`_id`, and unsupported update operators are rejected with write errors.
+
 ## Development
 
 ```sh
@@ -76,6 +95,6 @@ cargo test
 
 ## Scope
 
-This is not a full MongoDB replacement yet. The next major pieces are query
-operator support, update/delete commands, indexes, authentication behavior, and
-driver compatibility testing.
+This is not a full MongoDB replacement. The next major pieces are server-side
+cursors, indexes, broader query/update operators, authentication behavior,
+transactions, retryable writes, and deeper driver compatibility testing.
