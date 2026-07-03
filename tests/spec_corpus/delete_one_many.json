@@ -1,0 +1,45 @@
+{
+  "name": "delete one and many",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "group": "a"
+    },
+    {
+      "_id": "u2",
+      "group": "a"
+    },
+    {
+      "_id": "u3",
+      "group": "b"
+    }
+  ],
+  "operations": [
+    {
+      "name": "delete_one",
+      "filter": {
+        "group": "a"
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    },
+    {
+      "name": "delete_many",
+      "filter": {
+        "group": "b"
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u2",
+      "group": "a"
+    }
+  ]
+}

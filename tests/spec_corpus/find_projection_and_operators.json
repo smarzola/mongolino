@@ -1,0 +1,61 @@
+{
+  "name": "find projection and supported operators",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Ada",
+      "age": 37,
+      "active": true,
+      "profile": {
+        "city": "Rome"
+      }
+    },
+    {
+      "_id": "u2",
+      "name": "Grace",
+      "age": 39,
+      "active": false,
+      "profile": {
+        "city": "London"
+      }
+    },
+    {
+      "_id": "u3",
+      "name": "Katherine",
+      "age": 41,
+      "active": true,
+      "profile": {
+        "city": "Rome"
+      }
+    }
+  ],
+  "operations": [
+    {
+      "name": "find",
+      "filter": {
+        "$and": [
+          {
+            "profile.city": "Rome"
+          },
+          {
+            "age": {
+              "$gte": 37,
+              "$lt": 40
+            }
+          }
+        ]
+      },
+      "projection": {
+        "name": 1,
+        "_id": 0
+      },
+      "expect_documents": [
+        {
+          "name": "Ada"
+        }
+      ]
+    }
+  ]
+}

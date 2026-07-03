@@ -1,0 +1,21 @@
+{
+  "name": "unsupported command failure",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "createIndexes": "users",
+        "indexes": []
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 59,
+        "contains": "command 'createIndexes' is not supported yet"
+      }
+    }
+  ]
+}

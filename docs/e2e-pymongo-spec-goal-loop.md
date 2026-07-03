@@ -115,7 +115,7 @@ When a milestone is complete:
 - [x] Milestone 0: Python/uv test tooling foundation
 - [x] Milestone 1: PyMongo server fixture and handshake smoke
 - [x] Milestone 2: CRUD e2e behavior coverage
-- [ ] Milestone 3: Spec-inspired corpus runner
+- [x] Milestone 3: Spec-inspired corpus runner
 - [ ] Milestone 4: CI and documentation
 
 ## Milestone 0: Python/uv Test Tooling Foundation
@@ -307,7 +307,7 @@ Commit requirement:
 
 Status note:
 
-- 2026-07-04: Added PyMongo CRUD coverage for inserts, finds, projections, sorting, skip/limit/batch size, updates, upserts, duplicate-key preservation, `$inc` overflow, deletes, and explicit not-happy/adversarial errors. Fixed top-level unsupported query operator reporting and duplicate-key error codes for update upserts exposed by PyMongo. Verification passed with `cargo fmt`, `cargo test`, `cargo build`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e`. Commit: pending.
+- 2026-07-04: Added PyMongo CRUD coverage for inserts, finds, projections, sorting, skip/limit/batch size, updates, upserts, duplicate-key preservation, `$inc` overflow, deletes, and explicit not-happy/adversarial errors. Fixed top-level unsupported query operator reporting and duplicate-key error codes for update upserts exposed by PyMongo. Verification passed with `cargo fmt`, `cargo test`, `cargo build`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e`. Commit: `0bec938`.
 
 ## Milestone 3: Spec-Inspired Corpus Runner
 
@@ -375,6 +375,10 @@ uv run pytest tests/e2e
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note:
+
+- 2026-07-04: Added a local JSON spec-inspired corpus and PyMongo runner for handshake, duplicate-key preservation, projection/operators, update `$set`/`$inc`/upsert, unsupported update operators, delete one/many, unsupported commands, skip metadata, and malformed-runner adversarial checks. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_spec_corpus.py` (`11 passed, 1 skipped`), and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: pending.
 
 ## Milestone 4: CI and Documentation
 

@@ -1,0 +1,28 @@
+{
+  "name": "unsupported regex tracking case",
+  "source": "crud",
+  "status": "skip",
+  "skip_reason": "Regex query matching is outside mongolino's documented subset.",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Ada"
+    }
+  ],
+  "operations": [
+    {
+      "name": "find",
+      "filter": {
+        "name": {
+          "$regex": "A"
+        }
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "name": "Ada"
+        }
+      ]
+    }
+  ]
+}

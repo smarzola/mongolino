@@ -1,0 +1,14 @@
+{
+  "name": "handshake ping",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "ping",
+      "expect_result": {
+        "ok": 1.0
+      }
+    }
+  ]
+}

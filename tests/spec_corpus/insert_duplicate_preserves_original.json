@@ -1,0 +1,31 @@
+{
+  "name": "insert duplicate key preserves original",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Original"
+    }
+  ],
+  "operations": [
+    {
+      "name": "insert_one",
+      "document": {
+        "_id": "u1",
+        "name": "Duplicate"
+      },
+      "expect_error": {
+        "type": "DuplicateKeyError",
+        "code": 11000,
+        "contains": "duplicate key error"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "name": "Original"
+    }
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "name": "update set inc and upsert",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Ada",
+      "score": 1
+    },
+    {
+      "_id": "u2",
+      "name": "Grace",
+      "score": 2
+    }
+  ],
+  "operations": [
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$set": {
+          "name": "Ada Lovelace"
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_many",
+      "filter": {},
+      "update": {
+        "$inc": {
+          "score": 3
+        }
+      },
+      "expect_result": {
+        "matched_count": 2,
+        "modified_count": 2
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u3"
+      },
+      "update": {
+        "$set": {
+          "name": "Mary"
+        },
+        "$inc": {
+          "score": 1
+        }
+      },
+      "upsert": true,
+      "expect_result": {
+        "matched_count": 0,
+        "modified_count": 0,
+        "upserted_id": "u3"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "name": "Ada Lovelace",
+      "score": 4
+    },
+    {
+      "_id": "u2",
+      "name": "Grace",
+      "score": 5
+    },
+    {
+      "_id": "u3",
+      "name": "Mary",
+      "score": 1
+    }
+  ]
+}

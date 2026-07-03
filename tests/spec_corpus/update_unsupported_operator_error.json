@@ -1,0 +1,34 @@
+{
+  "name": "update unsupported operator failure",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "tags": []
+    }
+  ],
+  "operations": [
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$push": {
+          "tags": "new"
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "unsupported update operator $push"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "tags": []
+    }
+  ]
+}
