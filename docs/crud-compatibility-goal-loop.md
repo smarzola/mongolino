@@ -82,7 +82,7 @@ When a milestone is complete:
 - [x] Milestone 1: Insert correctness and write error contracts
 - [x] Milestone 2: Query matcher for `find`
 - [x] Milestone 3: `find` result shaping
-- [ ] Milestone 4: `update` command subset
+- [x] Milestone 4: `update` command subset
 - [ ] Milestone 5: `delete` command subset
 - [ ] Milestone 6: Real client verification and compatibility docs
 
@@ -344,6 +344,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: `update` Command Subset
+
+Status note:
+
+- 2026-07-03: Added `update` command support for replacement updates, `$set`, `$unset`, `$inc`, upsert, single/multi updates, ordered/unordered writeErrors, `_id` immutability, duplicate-key protection, conservative equality-based upsert document construction, and malformed/adversarial update validation. Verification: `cargo fmt`; `cargo test update`; `cargo test insert`; `cargo test find`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 

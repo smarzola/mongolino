@@ -345,6 +345,7 @@ fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
         "endSessions" => Ok(doc! { "ok": 1.0 }),
         "insert" => insert_documents(conn, command),
         "find" => find_documents(conn, command),
+        "update" => update_documents(conn, command),
         other => Ok(command_error(
             59,
             &format!("command '{other}' is not supported yet"),
@@ -514,6 +515,508 @@ fn write_error(index: i32, code: i32, errmsg: &str) -> Bson {
     })
 }
 
+fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("update") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "update command requires a collection name",
+            ));
+        }
+    };
+    let updates = match command.get_array("updates") {
+        Ok(updates) if !updates.is_empty() => updates,
+        Ok(_) => {
+            return Ok(command_error(
+                9,
+                "update command requires a non-empty updates array",
+            ));
+        }
+        Err(_) => return Ok(command_error(9, "update command requires an updates array")),
+    };
+    let ordered = match optional_bool(command, "ordered") {
+        Ok(value) => value.unwrap_or(true),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["update", "updates", "ordered", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let namespace = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    let mut matched_count = 0_i32;
+    let mut modified_count = 0_i32;
+    let mut upserted_count = 0_i32;
+    let mut upserted = Vec::new();
+    let mut write_errors = Vec::new();
+
+    for (index, entry) in updates.iter().enumerate() {
+        let result = apply_update_entry(&tx, &namespace, entry);
+        match result {
+            Ok(outcome) => {
+                matched_count += outcome.matched;
+                modified_count += outcome.modified;
+                if let Some(id) = outcome.upserted_id {
+                    upserted_count += 1;
+                    upserted.push(Bson::Document(doc! {
+                        "index": index as i32,
+                        "_id": id,
+                    }));
+                    matched_count += 1;
+                }
+            }
+            Err(errmsg) => {
+                write_errors.push(write_error(index as i32, 2, &errmsg));
+                if ordered {
+                    break;
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+    let mut response = doc! {
+        "n": matched_count,
+        "nModified": modified_count,
+        "ok": 1.0,
+    };
+    if upserted_count > 0 {
+        response.insert("nUpserted", upserted_count);
+        response.insert("upserted", upserted);
+    }
+    if !write_errors.is_empty() {
+        response.insert("writeErrors", write_errors);
+    }
+    Ok(response)
+}
+
+#[derive(Debug)]
+struct UpdateOutcome {
+    matched: i32,
+    modified: i32,
+    upserted_id: Option<Bson>,
+}
+
+fn apply_update_entry(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    entry: &Bson,
+) -> std::result::Result<UpdateOutcome, String> {
+    let Bson::Document(entry) = entry else {
+        return Err("update entries must be documents".to_string());
+    };
+    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi"])?;
+    let query = entry
+        .get_document("q")
+        .map_err(|_| "update entry requires q document".to_string())?;
+    let update = entry
+        .get_document("u")
+        .map_err(|_| "update entry requires u document".to_string())?;
+    let upsert = optional_bool_doc(entry, "upsert")?.unwrap_or(false);
+    let multi = optional_bool_doc(entry, "multi")?.unwrap_or(false);
+    let update = classify_update(update)?;
+
+    let mut matches = Vec::new();
+    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+        match matches_filter(&stored.document, query) {
+            Ok(true) => matches.push(stored),
+            Ok(false) => {}
+            Err(err) => return Err(err.errmsg),
+        }
+        if !multi && !matches.is_empty() {
+            break;
+        }
+    }
+
+    if matches.is_empty() {
+        if !upsert {
+            return Ok(UpdateOutcome {
+                matched: 0,
+                modified: 0,
+                upserted_id: None,
+            });
+        }
+
+        let mut new_document = build_upsert_document(query, &update)?;
+        ensure_document_id(&mut new_document);
+        let upserted_id = new_document
+            .get("_id")
+            .cloned()
+            .ok_or_else(|| "upsert document is missing _id".to_string())?;
+        insert_stored_document_tx(tx, namespace, &new_document)
+            .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
+        return Ok(UpdateOutcome {
+            matched: 0,
+            modified: 0,
+            upserted_id: Some(upserted_id),
+        });
+    }
+
+    let matched = matches.len() as i32;
+    let mut modified = 0_i32;
+    for stored in matches {
+        let new_document = apply_update_to_document(&stored.document, &update)?;
+        let new_id_key = id_key(&new_document).map_err(|err| err.to_string())?;
+        if new_id_key != stored.id_key {
+            return Err("update cannot change _id".to_string());
+        }
+        if new_document != stored.document {
+            update_stored_document_tx(tx, namespace, &stored.id_key, &new_document)
+                .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
+            modified += 1;
+        }
+    }
+
+    Ok(UpdateOutcome {
+        matched,
+        modified,
+        upserted_id: None,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct StoredDocument {
+    id_key: String,
+    document: Document,
+}
+
+fn stored_documents_for_namespace_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<StoredDocument>> {
+    let mut stmt =
+        tx.prepare("SELECT id_key, bson FROM documents WHERE namespace = ?1 ORDER BY created_at")?;
+    stmt.query_map(params![namespace], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?
+    .map(|row| {
+        let (id_key, bytes) = row?;
+        Ok(StoredDocument {
+            id_key,
+            document: decode_document(bytes)?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()
+}
+
+fn insert_stored_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    document: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    let id_key = id_key(document).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+    })?;
+    let mut encoded = Vec::new();
+    document.to_writer(&mut encoded).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+    })?;
+    tx.execute(
+        "INSERT INTO documents(namespace, id_key, bson, updated_at)
+         VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
+        params![namespace, id_key, encoded],
+    )?;
+    Ok(())
+}
+
+fn update_stored_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    id_key: &str,
+    document: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    let mut encoded = Vec::new();
+    document.to_writer(&mut encoded).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+    })?;
+    tx.execute(
+        "UPDATE documents SET bson = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE namespace = ?2 AND id_key = ?3",
+        params![encoded, namespace, id_key],
+    )?;
+    Ok(())
+}
+
+fn duplicate_or_sql_error(namespace: &str, document: &Document, err: rusqlite::Error) -> String {
+    if is_sqlite_constraint(&err) {
+        let key = id_key(document).unwrap_or_else(|_| "<unknown>".to_string());
+        format!("duplicate key error collection: {namespace} _id: {key}")
+    } else {
+        err.to_string()
+    }
+}
+
+fn reject_unsupported_entry_keys(
+    entry: &Document,
+    allowed: &[&str],
+) -> std::result::Result<(), String> {
+    if let Some(key) = entry.keys().find(|key| !allowed.contains(&key.as_str())) {
+        Err(format!("{key} is not supported for this command entry"))
+    } else {
+        Ok(())
+    }
+}
+
+fn optional_bool_doc(document: &Document, key: &str) -> std::result::Result<Option<bool>, String> {
+    match document.get(key) {
+        None => Ok(None),
+        Some(Bson::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum UpdateSpec {
+    Replacement(Document),
+    Modifier {
+        set: Document,
+        unset: Document,
+        inc: Document,
+    },
+}
+
+fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String> {
+    if update.is_empty() {
+        return Err("update document must not be empty".to_string());
+    }
+    let has_operator = update.keys().any(|key| key.starts_with('$'));
+    let has_replacement = update.keys().any(|key| !key.starts_with('$'));
+    if has_operator && has_replacement {
+        return Err("update document cannot mix replacement fields and operators".to_string());
+    }
+    if !has_operator {
+        return Ok(UpdateSpec::Replacement(update.clone()));
+    }
+
+    let mut set = Document::new();
+    let mut unset = Document::new();
+    let mut inc = Document::new();
+    let mut paths = Vec::new();
+    for (operator, operand) in update {
+        let Bson::Document(operand) = operand else {
+            return Err(format!("{operator} requires a document operand"));
+        };
+        match operator.as_str() {
+            "$set" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                set = operand.clone();
+            }
+            "$unset" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                unset = operand.clone();
+            }
+            "$inc" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                inc = operand.clone();
+            }
+            _ => return Err(format!("unsupported update operator {operator}")),
+        }
+    }
+    if paths.is_empty() {
+        return Err("modifier update must contain at least one path".to_string());
+    }
+    reject_path_collisions(&paths, "update")?;
+    Ok(UpdateSpec::Modifier { set, unset, inc })
+}
+
+fn append_update_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for key in document.keys() {
+        if key.is_empty() || key.starts_with('$') || key.split('.').any(|part| part.is_empty()) {
+            return Err(format!("{operator} contains unsupported path {key}"));
+        }
+        if key == "_id" || key.starts_with("_id.") {
+            return Err("update cannot change _id".to_string());
+        }
+        paths.push(key.to_string());
+    }
+    Ok(())
+}
+
+fn apply_update_to_document(
+    original: &Document,
+    update: &UpdateSpec,
+) -> std::result::Result<Document, String> {
+    match update {
+        UpdateSpec::Replacement(replacement) => {
+            let mut document = replacement.clone();
+            match (original.get("_id"), document.get("_id")) {
+                (Some(original_id), Some(new_id)) if !bson_values_equal(original_id, new_id) => {
+                    return Err("replacement update cannot change _id".to_string());
+                }
+                (Some(original_id), None) => {
+                    document.insert("_id", original_id.clone());
+                }
+                _ => {}
+            }
+            Ok(document)
+        }
+        UpdateSpec::Modifier { set, unset, inc } => {
+            let mut document = original.clone();
+            for (path, value) in set {
+                set_update_path(&mut document, path, value.clone())?;
+            }
+            for path in unset.keys() {
+                unset_update_path(&mut document, path)?;
+            }
+            for (path, operand) in inc {
+                inc_update_path(&mut document, path, operand)?;
+            }
+            Ok(document)
+        }
+    }
+}
+
+fn build_upsert_document(
+    query: &Document,
+    update: &UpdateSpec,
+) -> std::result::Result<Document, String> {
+    match update {
+        UpdateSpec::Replacement(replacement) => {
+            let mut document = replacement.clone();
+            if !document.contains_key("_id")
+                && let Some(id) = equality_id_from_filter(query)
+            {
+                document.insert("_id", id.clone());
+            }
+            Ok(document)
+        }
+        UpdateSpec::Modifier { .. } => {
+            let mut document = equality_document_from_filter(query)?;
+            document = apply_update_to_document(&document, update)?;
+            Ok(document)
+        }
+    }
+}
+
+fn equality_id_from_filter(query: &Document) -> Option<&Bson> {
+    match query.get("_id") {
+        Some(value) if !is_operator_document(value) => Some(value),
+        Some(Bson::Document(document)) if document.len() == 1 => document.get("$eq"),
+        _ => None,
+    }
+}
+
+fn equality_document_from_filter(query: &Document) -> std::result::Result<Document, String> {
+    let mut document = Document::new();
+    for (field, value) in query {
+        if field.starts_with('$') || field.contains('$') {
+            continue;
+        }
+        let value = if !is_operator_document(value) {
+            Some(value)
+        } else if let Bson::Document(operator) = value {
+            if operator.len() == 1 {
+                operator.get("$eq")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            set_update_path(&mut document, field, value.clone())?;
+        }
+    }
+    Ok(document)
+}
+
+fn set_update_path(
+    document: &mut Document,
+    path: &str,
+    value: Bson,
+) -> std::result::Result<(), String> {
+    let mut parts = path.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return Err("update path must not be empty".to_string());
+    };
+    let mut current = document;
+    for part in parts {
+        match current.get(part) {
+            Some(Bson::Document(_)) => {}
+            Some(_) => return Err(format!("cannot traverse scalar parent {part}")),
+            None => {
+                current.insert(part, Document::new());
+            }
+        }
+        current = current
+            .get_document_mut(part)
+            .map_err(|_| format!("cannot traverse scalar parent {part}"))?;
+    }
+    current.insert(last, value);
+    Ok(())
+}
+
+fn unset_update_path(document: &mut Document, path: &str) -> std::result::Result<(), String> {
+    let mut parts = path.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return Err("update path must not be empty".to_string());
+    };
+    let mut current = document;
+    for part in parts {
+        match current.get(part) {
+            Some(Bson::Document(_)) => {
+                current = current
+                    .get_document_mut(part)
+                    .map_err(|_| format!("cannot traverse scalar parent {part}"))?;
+            }
+            Some(_) => return Err(format!("cannot traverse scalar parent {part}")),
+            None => return Ok(()),
+        }
+    }
+    current.remove(last);
+    Ok(())
+}
+
+fn inc_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    if numeric_value(operand).is_none() {
+        return Err("$inc operands must be numeric".to_string());
+    }
+    let existing = get_document_path(document, path).cloned();
+    match existing {
+        None => set_update_path(document, path, operand.clone()),
+        Some(current) if numeric_value(&current).is_some() => {
+            let updated = add_numeric_bson(&current, operand)?;
+            set_update_path(document, path, updated)
+        }
+        Some(_) => Err("$inc can only apply to numeric fields".to_string()),
+    }
+}
+
+fn add_numeric_bson(left: &Bson, right: &Bson) -> std::result::Result<Bson, String> {
+    match (left, right) {
+        (Bson::Double(left), _) | (_, Bson::Double(left)) if left.is_nan() => {
+            Err("$inc does not support NaN".to_string())
+        }
+        (Bson::Double(_), _) | (_, Bson::Double(_)) => Ok(Bson::Double(
+            numeric_value(left).unwrap() + numeric_value(right).unwrap(),
+        )),
+        (Bson::Int64(left), Bson::Int64(right)) => left
+            .checked_add(*right)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$inc overflowed int64".to_string()),
+        _ => {
+            let sum = numeric_value(left).unwrap() as i64 + numeric_value(right).unwrap() as i64;
+            if (i32::MIN as i64..=i32::MAX as i64).contains(&sum) {
+                Ok(Bson::Int32(sum as i32))
+            } else {
+                Ok(Bson::Int64(sum))
+            }
+        }
+    }
+}
+
 fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
     let collection = match command.get_str("find") {
@@ -598,11 +1101,8 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         return Ok(cursor_response(db, collection, vec![]));
     }
 
-    let mut stmt =
-        conn.prepare("SELECT bson FROM documents WHERE namespace = ?1 ORDER BY created_at")?;
     let mut docs = Vec::new();
-    for row in stmt.query_map(params![namespace], |row| row.get::<_, Vec<u8>>(0))? {
-        let document = decode_document(row?)?;
+    for document in documents_for_namespace(conn, &namespace)? {
         match matches_filter(&document, &filter) {
             Ok(true) => docs.push(document),
             Ok(false) => {}
@@ -1915,5 +2415,275 @@ mod tests {
             .unwrap(),
         );
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn update_replacement_preserves_id_and_counts_modified_documents() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    { "q": { "_id": "u1" }, "u": { "name": "Ada Lovelace", "age": 38_i32 } }
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_i32("n").unwrap(), 1);
+        assert_eq!(response.get_i32("nModified").unwrap(), 1);
+        let docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(docs[0].get_str("_id").unwrap(), "u1");
+        assert_eq!(docs[0].get_str("name").unwrap(), "Ada Lovelace");
+        assert!(!docs[0].contains_key("profile"));
+    }
+
+    #[test]
+    fn update_modifiers_support_set_unset_inc_single_and_multi() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let single = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u1" },
+                        "u": {
+                            "$set": { "profile.city": "Milan", "profile.country": "IT" },
+                            "$unset": { "tags": "" },
+                            "$inc": { "age": 1_i32, "newCounter": 2_i32 },
+                        },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(single.get_i32("n").unwrap(), 1);
+        assert_eq!(single.get_i32("nModified").unwrap(), 1);
+
+        let multi = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    { "q": { "active": true }, "u": { "$inc": { "age": 1_i32 } }, "multi": true }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(multi.get_i32("n").unwrap(), 2);
+        assert_eq!(multi.get_i32("nModified").unwrap(), 2);
+
+        let docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            docs[0]
+                .get_document("profile")
+                .unwrap()
+                .get_str("city")
+                .unwrap(),
+            "Milan"
+        );
+        assert_eq!(docs[0].get_i32("age").unwrap(), 39);
+        assert_eq!(docs[0].get_i32("newCounter").unwrap(), 2);
+        assert!(!docs[0].contains_key("tags"));
+        assert_eq!(docs[2].get_f64("age").unwrap(), 42.0);
+    }
+
+    #[test]
+    fn update_upsert_supports_replacement_and_modifier_updates() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let replacement = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u4" },
+                        "u": { "name": "Dorothy", "age": 44_i32 },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(replacement.get_i32("n").unwrap(), 1);
+        assert_eq!(replacement.get_i32("nModified").unwrap(), 0);
+        assert_eq!(replacement.get_i32("nUpserted").unwrap(), 1);
+
+        let modifier = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "name": "Mary", "profile.city": { "$eq": "Arlington" } },
+                        "u": { "$set": { "active": true }, "$inc": { "score": 3_i32 } },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(modifier.get_i32("n").unwrap(), 1);
+        assert_eq!(modifier.get_i32("nUpserted").unwrap(), 1);
+
+        assert_eq!(find_ids(&conn, doc! { "_id": "u4" }), vec!["u4"]);
+        let mary = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "name": "Mary" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            mary[0]
+                .get_document("profile")
+                .unwrap()
+                .get_str("city")
+                .unwrap(),
+            "Arlington"
+        );
+        assert!(mary[0].get_bool("active").unwrap());
+        assert_eq!(mary[0].get_i32("score").unwrap(), 3);
+    }
+
+    #[test]
+    fn update_duplicate_key_upsert_returns_write_error_and_preserves_existing_document() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "name": "Nobody" },
+                        "u": { "_id": "u1", "name": "Replacement" },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(write_errors(&response)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada" }), vec!["u1"]);
+    }
+
+    #[test]
+    fn update_ordered_and_unordered_batches_handle_partial_failures() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let ordered = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "ordered": true,
+                "updates": [
+                    { "q": { "_id": "u1" }, "u": { "$inc": { "name": 1_i32 } } },
+                    { "q": { "_id": "u2" }, "u": { "$set": { "name": "Changed" } } },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(ordered.get_i32("n").unwrap(), 0);
+        assert_eq!(write_errors(&ordered)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Changed" }),
+            Vec::<String>::new()
+        );
+
+        let unordered = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "ordered": false,
+                "updates": [
+                    { "q": { "_id": "u1" }, "u": { "$inc": { "name": 1_i32 } } },
+                    { "q": { "_id": "u2" }, "u": { "$set": { "name": "Changed" } } },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(unordered.get_i32("n").unwrap(), 1);
+        assert_eq!(unordered.get_i32("nModified").unwrap(), 1);
+        assert_eq!(write_errors(&unordered)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(find_ids(&conn, doc! { "name": "Changed" }), vec!["u2"]);
+    }
+
+    #[test]
+    fn update_rejects_malformed_and_adversarial_shapes() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for command in [
+            doc! { "update": "users", "$db": "app" },
+            doc! { "update": "users", "$db": "app", "updates": "bad" },
+            doc! { "update": "users", "$db": "app", "updates": [] },
+            doc! { "update": "", "$db": "app", "updates": [] },
+            doc! { "update": "users", "$db": "app", "ordered": "yes", "updates": [] },
+            doc! { "update": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "updates": [] },
+        ] {
+            let response = update_documents(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
+
+        for update in [
+            doc! { "u": { "$set": { "name": "x" } } },
+            doc! { "q": { "_id": "u1" } },
+            doc! { "q": 1_i32, "u": { "$set": { "name": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": 1_i32 },
+            doc! { "q": { "_id": "u1" }, "u": {} },
+            doc! { "q": { "_id": "u1" }, "u": { "$set": { "name": "x" }, "plain": true } },
+            doc! { "q": { "_id": "u1" }, "u": { "$rename": { "name": "n" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$push": { "tags": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$pull": { "tags": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "_id": "other", "name": "x" } },
+            doc! { "q": { "_id": "u1" }, "u": { "$inc": { "name": 1_i32 } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$inc": { "age": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$set": { "age.value": 1_i32 } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$set": { "profile": 1_i32, "profile.city": "x" } } },
+            doc! { "q": { "$where": "bad" }, "u": { "$set": { "name": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$set": { "_id": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$unset": { "_id": "" } } },
+        ] {
+            let response = update_documents(
+                &conn,
+                &doc! { "update": "users", "$db": "app", "updates": [update] },
+            )
+            .unwrap();
+            assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+            assert!(!write_errors(&response).is_empty());
+        }
     }
 }
