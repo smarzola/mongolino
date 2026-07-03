@@ -1,0 +1,9 @@
+[package]
+name = "mongolino"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bson = "2.15.0"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+tokio = { version = "1.47.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
