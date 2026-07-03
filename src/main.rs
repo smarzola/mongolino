@@ -249,6 +249,11 @@ fn parse_op_msg_document(payload: &[u8]) -> Result<Document> {
 
         match section_kind {
             0 => {
+                if body.is_some() {
+                    return Err(MongolinoError::Protocol(
+                        "OP_MSG payload contains multiple body sections".to_string(),
+                    ));
+                }
                 let (doc, consumed) = read_document_at(&payload[offset..])?;
                 body = Some(doc);
                 offset += consumed;
@@ -1039,18 +1044,27 @@ fn add_numeric_bson(left: &Bson, right: &Bson) -> std::result::Result<Bson, Stri
         (Bson::Double(_), _) | (_, Bson::Double(_)) => Ok(Bson::Double(
             numeric_value(left).unwrap() + numeric_value(right).unwrap(),
         )),
-        (Bson::Int64(left), Bson::Int64(right)) => left
-            .checked_add(*right)
-            .map(Bson::Int64)
-            .ok_or_else(|| "$inc overflowed int64".to_string()),
-        _ => {
-            let sum = numeric_value(left).unwrap() as i64 + numeric_value(right).unwrap() as i64;
+        (Bson::Int32(left), Bson::Int32(right)) => {
+            let sum = (*left as i64) + (*right as i64);
             if (i32::MIN as i64..=i32::MAX as i64).contains(&sum) {
                 Ok(Bson::Int32(sum as i32))
             } else {
                 Ok(Bson::Int64(sum))
             }
         }
+        (Bson::Int64(left), Bson::Int64(right)) => left
+            .checked_add(*right)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$inc overflowed int64".to_string()),
+        (Bson::Int64(left), Bson::Int32(right)) => left
+            .checked_add(*right as i64)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$inc overflowed int64".to_string()),
+        (Bson::Int32(left), Bson::Int64(right)) => (*left as i64)
+            .checked_add(*right)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$inc overflowed int64".to_string()),
+        _ => unreachable!("non-numeric $inc operands should be rejected before addition"),
     }
 }
 
@@ -1302,6 +1316,7 @@ fn parse_projection(command: &Document) -> std::result::Result<Option<Projection
     let mut mode = None;
     let mut fields = Vec::new();
     let mut include_id = true;
+    let mut saw_id = false;
 
     for (field, value) in projection {
         if field.starts_with('$') {
@@ -1309,6 +1324,7 @@ fn parse_projection(command: &Document) -> std::result::Result<Option<Projection
         }
         let include = projection_value(value)?;
         if field == "_id" {
+            saw_id = true;
             include_id = include;
             continue;
         }
@@ -1332,11 +1348,19 @@ fn parse_projection(command: &Document) -> std::result::Result<Option<Projection
     }
 
     reject_path_collisions(&fields, "projection")?;
-    Ok(mode.map(|mode| ProjectionSpec {
-        mode,
-        fields,
-        include_id,
-    }))
+    Ok(mode
+        .or_else(|| {
+            saw_id.then_some(if include_id {
+                ProjectionMode::Include
+            } else {
+                ProjectionMode::Exclude
+            })
+        })
+        .map(|mode| ProjectionSpec {
+            mode,
+            fields,
+            include_id,
+        }))
 }
 
 fn projection_value(value: &Bson) -> std::result::Result<bool, String> {
@@ -1933,6 +1957,23 @@ mod tests {
     }
 
     #[test]
+    fn op_msg_rejects_multiple_body_sections() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_le_bytes());
+        payload.push(0);
+        doc! { "ping": 1_i32, "$db": "admin" }
+            .to_writer(&mut payload)
+            .unwrap();
+        payload.push(0);
+        doc! { "ping": 2_i32, "$db": "admin" }
+            .to_writer(&mut payload)
+            .unwrap();
+
+        let err = parse_op_msg_document(&payload).unwrap_err();
+        assert!(err.to_string().contains("multiple body sections"));
+    }
+
+    #[test]
     fn op_msg_document_sequence_is_exposed_as_command_array() {
         let body = doc! { "insert": "users", "$db": "app" };
         let docs = vec![doc! { "_id": "u1" }, doc! { "_id": "u2" }];
@@ -2467,6 +2508,59 @@ mod tests {
     }
 
     #[test]
+    fn find_projection_supports_id_only_specs() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let excluded_id = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "filter": { "_id": "u1" },
+                    "projection": { "_id": 0_i32 },
+                },
+            )
+            .unwrap(),
+        );
+        assert!(!excluded_id[0].contains_key("_id"));
+        assert_eq!(excluded_id[0].get_str("name").unwrap(), "Ada");
+        assert_eq!(excluded_id[0].get_i32("age").unwrap(), 37);
+
+        let included_id = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "filter": { "_id": "u1" },
+                    "projection": { "_id": 1_i32 },
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(included_id[0].len(), 1);
+        assert_eq!(included_id[0].get_str("_id").unwrap(), "u1");
+
+        let included_without_id = first_batch(
+            &find_documents(
+                &conn,
+                &doc! {
+                    "find": "users",
+                    "$db": "app",
+                    "filter": { "_id": "u1" },
+                    "projection": { "name": 1_i32, "_id": 0_i32 },
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(included_without_id[0].len(), 1);
+        assert_eq!(included_without_id[0].get_str("name").unwrap(), "Ada");
+        assert!(!included_without_id[0].contains_key("_id"));
+    }
+
+    #[test]
     fn find_sort_skip_limit_and_batch_size_shape_results() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -2671,6 +2765,93 @@ mod tests {
         assert_eq!(docs[0].get_i32("newCounter").unwrap(), 2);
         assert!(!docs[0].contains_key("tags"));
         assert_eq!(docs[2].get_f64("age").unwrap(), 42.0);
+    }
+
+    #[test]
+    fn update_inc_handles_mixed_integer_precision_and_overflow() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "numbers",
+                "$db": "app",
+                "documents": [
+                    { "_id": "overflow", "value": Bson::Int64(i64::MAX) },
+                    { "_id": "exact", "value": Bson::Int64(i64::MAX - 1) },
+                    { "_id": "promote", "value": Bson::Int32(i32::MAX) },
+                ],
+            },
+        )
+        .unwrap();
+
+        let overflow = update_documents(
+            &conn,
+            &doc! {
+                "update": "numbers",
+                "$db": "app",
+                "updates": [
+                    { "q": { "_id": "overflow" }, "u": { "$inc": { "value": 1_i32 } } }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(overflow.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(write_errors(&overflow)[0].get_i32("index").unwrap(), 0);
+        let overflow_docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "numbers", "$db": "app", "filter": { "_id": "overflow" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(overflow_docs[0].get_i64("value").unwrap(), i64::MAX);
+
+        let exact = update_documents(
+            &conn,
+            &doc! {
+                "update": "numbers",
+                "$db": "app",
+                "updates": [
+                    { "q": { "_id": "exact" }, "u": { "$inc": { "value": 1_i32 } } }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(exact.get_i32("n").unwrap(), 1);
+        assert_eq!(exact.get_i32("nModified").unwrap(), 1);
+        let exact_docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "numbers", "$db": "app", "filter": { "_id": "exact" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(exact_docs[0].get_i64("value").unwrap(), i64::MAX);
+
+        let promoted = update_documents(
+            &conn,
+            &doc! {
+                "update": "numbers",
+                "$db": "app",
+                "updates": [
+                    { "q": { "_id": "promote" }, "u": { "$inc": { "value": 1_i32 } } }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(promoted.get_i32("n").unwrap(), 1);
+        assert_eq!(promoted.get_i32("nModified").unwrap(), 1);
+        let promoted_docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "numbers", "$db": "app", "filter": { "_id": "promote" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            promoted_docs[0].get_i64("value").unwrap(),
+            i32::MAX as i64 + 1
+        );
     }
 
     #[test]
