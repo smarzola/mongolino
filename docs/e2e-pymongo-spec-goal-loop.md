@@ -114,7 +114,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Python/uv test tooling foundation
 - [x] Milestone 1: PyMongo server fixture and handshake smoke
-- [ ] Milestone 2: CRUD e2e behavior coverage
+- [x] Milestone 2: CRUD e2e behavior coverage
 - [ ] Milestone 3: Spec-inspired corpus runner
 - [ ] Milestone 4: CI and documentation
 
@@ -233,7 +233,7 @@ Commit requirement:
 
 Status note:
 
-- 2026-07-04: Added the PyMongo server fixture, dynamic localhost port allocation, temporary SQLite database handling, startup log capture, handshake tests for `ping`, `hello`, and `server_info()`, and startup/unsupported-command adversarial tests. Verification passed with `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_handshake.py`, and `cargo test`. The sandboxed pytest run could not bind `127.0.0.1`; the same pytest command passed when rerun with normal localhost permissions. Commit: pending.
+- 2026-07-04: Added the PyMongo server fixture, dynamic localhost port allocation, temporary SQLite database handling, startup log capture, handshake tests for `ping`, `hello`, and `server_info()`, and startup/unsupported-command adversarial tests. Verification passed with `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_handshake.py`, and `cargo test`. The sandboxed pytest run could not bind `127.0.0.1`; the same pytest command passed when rerun with normal localhost permissions. Commit: `a56a8f9`.
 
 ## Milestone 2: CRUD E2E Behavior Coverage
 
@@ -304,6 +304,10 @@ uv run pytest tests/e2e
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note:
+
+- 2026-07-04: Added PyMongo CRUD coverage for inserts, finds, projections, sorting, skip/limit/batch size, updates, upserts, duplicate-key preservation, `$inc` overflow, deletes, and explicit not-happy/adversarial errors. Fixed top-level unsupported query operator reporting and duplicate-key error codes for update upserts exposed by PyMongo. Verification passed with `cargo fmt`, `cargo test`, `cargo build`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e`. Commit: pending.
 
 ## Milestone 3: Spec-Inspired Corpus Runner
 

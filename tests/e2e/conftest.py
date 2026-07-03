@@ -2,6 +2,7 @@ import os
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +73,13 @@ def mongo_client(mongolino_server):
         yield client
     finally:
         client.close()
+
+
+@pytest.fixture
+def collection(mongo_client, request):
+    suffix = uuid.uuid4().hex
+    name = f"{request.node.name}_{suffix}".replace("[", "_").replace("]", "_")
+    return mongo_client["e2e"][name]
 
 
 def locate_or_build_mongolino() -> Path:

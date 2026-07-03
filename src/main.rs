@@ -612,7 +612,11 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
                 }
             }
             Err(errmsg) => {
-                write_errors.push(write_error(index as i32, 2, &errmsg));
+                write_errors.push(write_error(
+                    index as i32,
+                    update_error_code(&errmsg),
+                    &errmsg,
+                ));
                 if ordered {
                     break;
                 }
@@ -789,6 +793,14 @@ fn duplicate_or_sql_error(namespace: &str, document: &Document, err: rusqlite::E
         format!("duplicate key error collection: {namespace} _id: {key}")
     } else {
         err.to_string()
+    }
+}
+
+fn update_error_code(errmsg: &str) -> i32 {
+    if errmsg.starts_with("duplicate key error") {
+        11000
+    } else {
+        2
     }
 }
 
@@ -1589,6 +1601,13 @@ fn matches_logical_operator(
     operator: &str,
     operand: &Bson,
 ) -> MatchResult<bool> {
+    if !matches!(operator, "$and" | "$or" | "$nor") {
+        return Err(match_error(
+            2,
+            format!("unsupported top-level query operator {operator}"),
+        ));
+    }
+
     let clauses = match operand {
         Bson::Array(clauses) if !clauses.is_empty() => clauses,
         Bson::Array(_) => {
@@ -1615,10 +1634,7 @@ fn matches_logical_operator(
         "$and" => Ok(results.into_iter().all(|matched| matched)),
         "$or" => Ok(results.into_iter().any(|matched| matched)),
         "$nor" => Ok(!results.into_iter().any(|matched| matched)),
-        _ => Err(match_error(
-            2,
-            format!("unsupported top-level query operator {operator}"),
-        )),
+        _ => unreachable!("unsupported logical operator checked above"),
     }
 }
 
@@ -2938,7 +2954,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(write_errors(&response)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(write_errors(&response)[0].get_i32("code").unwrap(), 11000);
         assert_eq!(find_ids(&conn, doc! { "name": "Ada" }), vec!["u1"]);
     }
 
