@@ -113,7 +113,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Python/uv test tooling foundation
-- [ ] Milestone 1: PyMongo server fixture and handshake smoke
+- [x] Milestone 1: PyMongo server fixture and handshake smoke
 - [ ] Milestone 2: CRUD e2e behavior coverage
 - [ ] Milestone 3: Spec-inspired corpus runner
 - [ ] Milestone 4: CI and documentation
@@ -171,7 +171,7 @@ Commit requirement:
 
 Status note:
 
-- 2026-07-04: Added non-packaged uv Python test tooling with pytest and PyMongo, generated `uv.lock`, and added `tests/e2e/test_environment.py`. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_environment.py`. Initial sandboxed uv commands could not use `~/.cache/uv`, so the documented temporary cache path was used. Commit: pending.
+- 2026-07-04: Added non-packaged uv Python test tooling with pytest and PyMongo, generated `uv.lock`, and added `tests/e2e/test_environment.py`. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_environment.py`. Initial sandboxed uv commands could not use `~/.cache/uv`, so the documented temporary cache path was used. Commit: `6da5751`.
 
 ## Milestone 1: PyMongo Server Fixture and Handshake Smoke
 
@@ -230,6 +230,10 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note:
+
+- 2026-07-04: Added the PyMongo server fixture, dynamic localhost port allocation, temporary SQLite database handling, startup log capture, handshake tests for `ping`, `hello`, and `server_info()`, and startup/unsupported-command adversarial tests. Verification passed with `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_handshake.py`, and `cargo test`. The sandboxed pytest run could not bind `127.0.0.1`; the same pytest command passed when rerun with normal localhost permissions. Commit: pending.
 
 ## Milestone 2: CRUD E2E Behavior Coverage
 
