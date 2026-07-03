@@ -516,10 +516,15 @@ fn write_error(index: i32, code: i32, errmsg: &str) -> Bson {
 
 fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
-    let collection = command
-        .get_str("find")
-        .map_err(|_| MongolinoError::Protocol("find command requires a collection".to_string()))?;
-    let filter = command.get_document("filter").ok();
+    let collection = match command.get_str("find") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "find command requires a collection")),
+    };
+    let filter = match command.get("filter") {
+        None => Document::new(),
+        Some(Bson::Document(filter)) => filter.clone(),
+        Some(_) => return Ok(command_error(9, "find filter must be a document")),
+    };
     let batch_size = command
         .get_i32("batchSize")
         .or_else(|_| command.get_i64("batchSize").map(|value| value as i32))
@@ -527,7 +532,7 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         .clamp(1, 1000);
     let namespace = namespace(db, collection);
 
-    if let Some(id_filter) = filter.and_then(|filter| filter.get("_id")) {
+    if let Some(id_filter) = simple_id_equality_filter(&filter) {
         let wanted_id = id_key_from_bson(id_filter);
         if let Some(document) = conn
             .query_row(
@@ -544,16 +549,271 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         return Ok(cursor_response(db, collection, vec![]));
     }
 
-    let mut stmt = conn
-        .prepare("SELECT bson FROM documents WHERE namespace = ?1 ORDER BY created_at LIMIT ?2")?;
-    let docs = stmt
-        .query_map(params![namespace, batch_size], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
-        .map(|row| decode_document(row?))
-        .collect::<Result<Vec<_>>>()?;
+    let mut stmt =
+        conn.prepare("SELECT bson FROM documents WHERE namespace = ?1 ORDER BY created_at")?;
+    let mut docs = Vec::new();
+    for row in stmt.query_map(params![namespace], |row| row.get::<_, Vec<u8>>(0))? {
+        let document = decode_document(row?)?;
+        match matches_filter(&document, &filter) {
+            Ok(true) => docs.push(document),
+            Ok(false) => {}
+            Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+        }
+        if docs.len() >= batch_size as usize {
+            break;
+        }
+    }
 
     Ok(cursor_response(db, collection, docs))
+}
+
+fn simple_id_equality_filter(filter: &Document) -> Option<&Bson> {
+    if filter.len() == 1 {
+        filter
+            .get("_id")
+            .filter(|value| !is_operator_document(value))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct MatchError {
+    code: i32,
+    errmsg: String,
+}
+
+type MatchResult<T> = std::result::Result<T, MatchError>;
+
+fn match_error(code: i32, errmsg: impl Into<String>) -> MatchError {
+    MatchError {
+        code,
+        errmsg: errmsg.into(),
+    }
+}
+
+fn matches_filter(document: &Document, filter: &Document) -> MatchResult<bool> {
+    for (key, condition) in filter {
+        if key.starts_with('$') {
+            if !matches_logical_operator(document, key, condition)? {
+                return Ok(false);
+            }
+        } else if !matches_field_condition(document, key, condition)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn matches_logical_operator(
+    document: &Document,
+    operator: &str,
+    operand: &Bson,
+) -> MatchResult<bool> {
+    let clauses = match operand {
+        Bson::Array(clauses) if !clauses.is_empty() => clauses,
+        Bson::Array(_) => {
+            return Err(match_error(
+                2,
+                format!("{operator} requires a non-empty array"),
+            ));
+        }
+        _ => return Err(match_error(2, format!("{operator} requires an array"))),
+    };
+
+    let mut results = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let Bson::Document(clause) = clause else {
+            return Err(match_error(
+                2,
+                format!("{operator} entries must be documents"),
+            ));
+        };
+        results.push(matches_filter(document, clause)?);
+    }
+
+    match operator {
+        "$and" => Ok(results.into_iter().all(|matched| matched)),
+        "$or" => Ok(results.into_iter().any(|matched| matched)),
+        "$nor" => Ok(!results.into_iter().any(|matched| matched)),
+        _ => Err(match_error(
+            2,
+            format!("unsupported top-level query operator {operator}"),
+        )),
+    }
+}
+
+fn matches_field_condition(
+    document: &Document,
+    field: &str,
+    condition: &Bson,
+) -> MatchResult<bool> {
+    let values = values_at_path(document, field);
+    if is_operator_document(condition) {
+        let Bson::Document(operators) = condition else {
+            unreachable!("operator document checked above");
+        };
+        return matches_operator_document(&values, operators);
+    }
+
+    Ok(values
+        .iter()
+        .any(|candidate| bson_values_equal(candidate, condition)))
+}
+
+fn matches_operator_document(values: &[&Bson], operators: &Document) -> MatchResult<bool> {
+    if operators.keys().any(|key| !key.starts_with('$')) {
+        return Err(match_error(
+            2,
+            "field predicate cannot mix operators and literal document fields",
+        ));
+    }
+
+    for (operator, operand) in operators {
+        let matched = match operator.as_str() {
+            "$eq" => values
+                .iter()
+                .any(|candidate| bson_values_equal(candidate, operand)),
+            "$ne" => values
+                .iter()
+                .all(|candidate| !bson_values_equal(candidate, operand)),
+            "$gt" => values
+                .iter()
+                .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_gt())),
+            "$gte" => values
+                .iter()
+                .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_lt())),
+            "$lt" => values
+                .iter()
+                .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_lt())),
+            "$lte" => values
+                .iter()
+                .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_gt())),
+            "$in" => {
+                let Bson::Array(needles) = operand else {
+                    return Err(match_error(2, "$in requires an array"));
+                };
+                values.iter().any(|candidate| {
+                    needles
+                        .iter()
+                        .any(|needle| bson_values_equal(candidate, needle))
+                })
+            }
+            "$nin" => {
+                let Bson::Array(needles) = operand else {
+                    return Err(match_error(2, "$nin requires an array"));
+                };
+                values.iter().all(|candidate| {
+                    needles
+                        .iter()
+                        .all(|needle| !bson_values_equal(candidate, needle))
+                })
+            }
+            "$exists" => {
+                let Bson::Boolean(should_exist) = operand else {
+                    return Err(match_error(2, "$exists requires a boolean"));
+                };
+                !values.is_empty() == *should_exist
+            }
+            "$not" => {
+                let Bson::Document(nested) = operand else {
+                    return Err(match_error(2, "$not requires a document"));
+                };
+                !matches_operator_document(values, nested)?
+            }
+            _ => {
+                return Err(match_error(
+                    2,
+                    format!("unsupported query operator {operator}"),
+                ));
+            }
+        };
+
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn is_operator_document(value: &Bson) -> bool {
+    matches!(value, Bson::Document(document) if document.keys().any(|key| key.starts_with('$')))
+}
+
+fn values_at_path<'a>(document: &'a Document, path: &str) -> Vec<&'a Bson> {
+    let mut parts = path.split('.');
+    let Some(first) = parts.next() else {
+        return Vec::new();
+    };
+    let rest = parts.collect::<Vec<_>>();
+    document
+        .get(first)
+        .map(|value| values_at_path_parts(value, &rest))
+        .unwrap_or_default()
+}
+
+fn values_at_path_parts<'a>(value: &'a Bson, parts: &[&str]) -> Vec<&'a Bson> {
+    if parts.is_empty() {
+        return vec![value];
+    }
+
+    match value {
+        Bson::Document(document) => document
+            .get(parts[0])
+            .map(|next| values_at_path_parts(next, &parts[1..]))
+            .unwrap_or_default(),
+        Bson::Array(values) => values
+            .iter()
+            .flat_map(|next| values_at_path_parts(next, parts))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn bson_values_equal(candidate: &Bson, expected: &Bson) -> bool {
+    if let Bson::Array(values) = candidate {
+        if !matches!(expected, Bson::Array(_)) {
+            return values
+                .iter()
+                .any(|value| bson_values_equal(value, expected));
+        }
+    }
+
+    match (numeric_value(candidate), numeric_value(expected)) {
+        (Some(left), Some(right)) => left == right,
+        _ => candidate == expected,
+    }
+}
+
+fn compare_bson(
+    candidate: &Bson,
+    expected: &Bson,
+    predicate: impl Fn(std::cmp::Ordering) -> bool,
+) -> bool {
+    let Some(left) = numeric_value(candidate) else {
+        return false;
+    };
+    let Some(right) = numeric_value(expected) else {
+        return false;
+    };
+    left.partial_cmp(&right).is_some_and(predicate)
+}
+
+fn numeric_value(value: &Bson) -> Option<f64> {
+    match value {
+        Bson::Int32(value) => Some(*value as f64),
+        Bson::Int64(value) => Some(*value as f64),
+        Bson::Double(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn documents_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<Document>> {
+    let mut stmt =
+        conn.prepare("SELECT bson FROM documents WHERE namespace = ?1 ORDER BY created_at")?;
+    stmt.query_map(params![namespace], |row| row.get::<_, Vec<u8>>(0))?
+        .map(|row| decode_document(row?))
+        .collect::<Result<Vec<_>>>()
 }
 
 fn cursor_response(db: &str, collection: &str, documents: Vec<Document>) -> Document {
@@ -827,8 +1087,14 @@ mod tests {
     #[test]
     fn malformed_find_without_collection_name_is_rejected() {
         let conn = test_conn();
-        let err = find_documents(&conn, &doc! { "find": 1_i32, "$db": "app" }).unwrap_err();
-        assert!(err.to_string().contains("requires a collection"));
+        let response = find_documents(&conn, &doc! { "find": 1_i32, "$db": "app" }).unwrap();
+        assert_command_error(&response);
+        assert!(
+            response
+                .get_str("errmsg")
+                .unwrap()
+                .contains("requires a collection")
+        );
     }
 
     #[test]
@@ -972,5 +1238,200 @@ mod tests {
             let response = insert_documents(&conn, &command).unwrap();
             assert_command_error(&response);
         }
+    }
+
+    fn seed_find_documents(conn: &Connection) {
+        insert_documents(
+            conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "name": "Ada",
+                        "age": 37_i32,
+                        "score": 7_i64,
+                        "active": true,
+                        "profile": { "city": "Rome", "$set": "literal" },
+                        "tags": ["math", "logic"],
+                        "nested": [{ "kind": "first" }, { "kind": "second" }],
+                        "nothing": Bson::Null,
+                    },
+                    {
+                        "_id": "u2",
+                        "name": "Grace",
+                        "age": 39_i64,
+                        "score": 9.5,
+                        "active": false,
+                        "profile": { "city": "London" },
+                        "tags": ["systems"],
+                    },
+                    {
+                        "_id": "u3",
+                        "name": "Katherine",
+                        "age": 41.0,
+                        "active": true,
+                        "profile": { "city": "Rome" },
+                        "tags": [],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    }
+
+    fn find_ids(conn: &Connection, filter: Document) -> Vec<String> {
+        first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": filter },
+            )
+            .unwrap(),
+        )
+        .into_iter()
+        .map(|doc| doc.get_str("_id").unwrap().to_string())
+        .collect()
+    }
+
+    #[test]
+    fn find_matcher_supports_field_equality_and_dotted_paths() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada" }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            vec!["u1", "u3"]
+        );
+        assert_eq!(find_ids(&conn, doc! { "active": false }), vec!["u2"]);
+        assert_eq!(find_ids(&conn, doc! { "nothing": Bson::Null }), vec!["u1"]);
+        assert_eq!(find_ids(&conn, doc! { "tags": "logic" }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "nested.kind": "second" }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.$set": "literal" }),
+            vec!["u1"]
+        );
+    }
+
+    #[test]
+    fn matcher_pure_functions_cover_documents_arrays_and_missing_paths() {
+        let document = doc! {
+            "a": { "b": 2_i32 },
+            "arr": [1_i32, 2_i32],
+            "typed": 2_i64,
+        };
+
+        assert!(matches_filter(&document, &doc! { "a": { "b": 2_i32 } }).unwrap());
+        assert!(matches_filter(&document, &doc! { "arr": [1_i32, 2_i32] }).unwrap());
+        assert!(matches_filter(&document, &doc! { "arr": 2_i64 }).unwrap());
+        assert!(matches_filter(&document, &doc! { "typed": 2.0 }).unwrap());
+        assert!(!matches_filter(&document, &doc! { "a.b.c": 1_i32 }).unwrap());
+        assert!(!matches_filter(&document, &doc! { "a.b.c.d.e": 1_i32 }).unwrap());
+    }
+
+    #[test]
+    fn find_matcher_supports_field_operators_and_mixed_numeric_types() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$eq": 37_i64 } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$ne": 39_i32 } }),
+            vec!["u1", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$gte": 39_i32, "$lte": 41_i32 } }),
+            vec!["u2", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "score": { "$gt": 7_i32 } }),
+            vec!["u2"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "name": { "$in": ["Ada", "Katherine"] } }),
+            vec!["u1", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "name": { "$nin": ["Ada", "Grace"] } }),
+            vec!["u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "score": { "$exists": false } }),
+            vec!["u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$not": { "$lt": 39_i32 } } }),
+            vec!["u2", "u3"]
+        );
+    }
+
+    #[test]
+    fn find_matcher_supports_logical_operators() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "$and": [{ "profile.city": "Rome" }, { "active": true }] }
+            ),
+            vec!["u1", "u3"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "$or": [{ "name": "Ada" }, { "name": "Grace" }] }
+            ),
+            vec!["u1", "u2"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "$nor": [{ "profile.city": "Rome" }] }),
+            vec!["u2"]
+        );
+    }
+
+    #[test]
+    fn find_rejects_unsupported_and_malformed_query_operators() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for filter in [
+            doc! { "$where": "this.age > 1" },
+            doc! { "name": { "$regex": "A" } },
+            doc! { "tags": { "$elemMatch": { "$eq": "math" } } },
+            doc! { "tags": { "$all": ["math"] } },
+            doc! { "age": { "$in": "Ada" } },
+            doc! { "age": { "$nin": "Ada" } },
+            doc! { "age": { "$exists": 1_i32 } },
+            doc! { "$and": [] },
+            doc! { "$or": [1_i32] },
+            doc! { "age": { "$not": 5_i32 } },
+            doc! { "age": { "$gte": 1_i32, "literal": 2_i32 } },
+        ] {
+            let response = find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": filter },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn find_rejects_non_document_filter() {
+        let conn = test_conn();
+        let response = find_documents(
+            &conn,
+            &doc! { "find": "users", "$db": "app", "filter": 1_i32 },
+        )
+        .unwrap();
+        assert_command_error(&response);
     }
 }

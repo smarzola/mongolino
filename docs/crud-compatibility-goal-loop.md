@@ -80,7 +80,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and test harness
 - [x] Milestone 1: Insert correctness and write error contracts
-- [ ] Milestone 2: Query matcher for `find`
+- [x] Milestone 2: Query matcher for `find`
 - [ ] Milestone 3: `find` result shaping
 - [ ] Milestone 4: `update` command subset
 - [ ] Milestone 5: `delete` command subset
@@ -194,6 +194,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 2: Query Matcher for `find`
+
+Status note:
+
+- 2026-07-03: Added an in-process BSON matcher for field equality, dotted paths, array traversal, numeric comparisons across `Int32`/`Int64`/`Double`, `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$nin`/`$exists`, `$and`/`$or`/`$nor`, and `$not`, with explicit command errors for unsupported or malformed operators. Verification: `cargo fmt`; `cargo test find`; `cargo test matcher`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 
