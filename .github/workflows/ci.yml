@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Check Rust toolchain
+        run: rustup show
+
+      - name: Check Rust formatting
+        run: cargo fmt -- --check
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Build Rust binary
+        run: cargo build
+
+      - name: Sync Python e2e environment
+        run: uv sync --locked --dev
+
+      - name: Run PyMongo e2e suite
+        run: uv run pytest tests/e2e

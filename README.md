@@ -89,9 +89,29 @@ parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, attempts to change
 ## Development
 
 ```sh
-cargo fmt
+cargo fmt -- --check
 cargo test
+cargo build
 ```
+
+Run the PyMongo end-to-end suite with `uv`:
+
+```sh
+uv sync --locked --dev
+uv run pytest tests/e2e
+```
+
+The e2e suite builds or locates `target/debug/mongolino`, starts it on a
+temporary localhost port with a temporary SQLite file, connects with PyMongo,
+and tears it down after each test. It does not require Docker or an external
+MongoDB service.
+
+`tests/spec_corpus/` contains a small local JSON corpus inspired by MongoDB's
+Unified Test Format and CRUD API spec. It tracks the documented `mongolino`
+subset only and is not an official MongoDB compliance claim.
+
+GitHub Actions runs Rust formatting, Rust tests, a Rust build, locked uv sync,
+and the PyMongo e2e suite on pushes and pull requests.
 
 ## Scope
 

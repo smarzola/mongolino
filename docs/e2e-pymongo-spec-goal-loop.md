@@ -116,7 +116,7 @@ When a milestone is complete:
 - [x] Milestone 1: PyMongo server fixture and handshake smoke
 - [x] Milestone 2: CRUD e2e behavior coverage
 - [x] Milestone 3: Spec-inspired corpus runner
-- [ ] Milestone 4: CI and documentation
+- [x] Milestone 4: CI and documentation
 
 ## Milestone 0: Python/uv Test Tooling Foundation
 
@@ -378,7 +378,7 @@ Commit requirement:
 
 Status note:
 
-- 2026-07-04: Added a local JSON spec-inspired corpus and PyMongo runner for handshake, duplicate-key preservation, projection/operators, update `$set`/`$inc`/upsert, unsupported update operators, delete one/many, unsupported commands, skip metadata, and malformed-runner adversarial checks. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_spec_corpus.py` (`11 passed, 1 skipped`), and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: pending.
+- 2026-07-04: Added a local JSON spec-inspired corpus and PyMongo runner for handshake, duplicate-key preservation, projection/operators, update `$set`/`$inc`/upsert, unsupported update operators, delete one/many, unsupported commands, skip metadata, and malformed-runner adversarial checks. Verification passed with `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e/test_spec_corpus.py` (`11 passed, 1 skipped`), and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: `908c1cd`.
 
 ## Milestone 4: CI and Documentation
 
@@ -434,6 +434,10 @@ uv run pytest tests/e2e
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note:
+
+- 2026-07-04: Added GitHub Actions CI for Rust formatting, Rust tests, Rust build, locked uv sync, and PyMongo e2e tests on push and pull request. Updated README development docs for Rust checks, uv e2e commands, local server behavior, and the local spec-inspired corpus scope. Final verification passed with `cargo fmt -- --check`, `cargo test`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run pytest tests/e2e` (`40 passed, 1 skipped`). Commit: pending.
 
 ## Final Verification
 
