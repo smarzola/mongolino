@@ -346,6 +346,7 @@ fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
         "insert" => insert_documents(conn, command),
         "find" => find_documents(conn, command),
         "update" => update_documents(conn, command),
+        "delete" => delete_documents(conn, command),
         other => Ok(command_error(
             59,
             &format!("command '{other}' is not supported yet"),
@@ -1015,6 +1016,108 @@ fn add_numeric_bson(left: &Bson, right: &Bson) -> std::result::Result<Bson, Stri
             }
         }
     }
+}
+
+fn delete_documents(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("delete") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "delete command requires a collection name",
+            ));
+        }
+    };
+    let deletes = match command.get_array("deletes") {
+        Ok(deletes) if !deletes.is_empty() => deletes,
+        Ok(_) => {
+            return Ok(command_error(
+                9,
+                "delete command requires a non-empty deletes array",
+            ));
+        }
+        Err(_) => return Ok(command_error(9, "delete command requires a deletes array")),
+    };
+    let ordered = match optional_bool(command, "ordered") {
+        Ok(value) => value.unwrap_or(true),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["delete", "deletes", "ordered", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let namespace = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    let mut removed = 0_i32;
+    let mut write_errors = Vec::new();
+
+    for (index, entry) in deletes.iter().enumerate() {
+        match apply_delete_entry(&tx, &namespace, entry) {
+            Ok(count) => removed += count,
+            Err(errmsg) => {
+                write_errors.push(write_error(index as i32, 2, &errmsg));
+                if ordered {
+                    break;
+                }
+            }
+        }
+    }
+
+    tx.commit()?;
+    let mut response = doc! {
+        "n": removed,
+        "ok": 1.0,
+    };
+    if !write_errors.is_empty() {
+        response.insert("writeErrors", write_errors);
+    }
+    Ok(response)
+}
+
+fn apply_delete_entry(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    entry: &Bson,
+) -> std::result::Result<i32, String> {
+    let Bson::Document(entry) = entry else {
+        return Err("delete entries must be documents".to_string());
+    };
+    reject_unsupported_entry_keys(entry, &["q", "limit"])?;
+    let query = entry
+        .get_document("q")
+        .map_err(|_| "delete entry requires q document".to_string())?;
+    let limit = match entry.get("limit") {
+        Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => 0,
+        Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => 1,
+        Some(_) => return Err("delete limit must be 0 or 1".to_string()),
+        None => return Err("delete entry requires limit".to_string()),
+    };
+
+    let mut targets = Vec::new();
+    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+        match matches_filter(&stored.document, query) {
+            Ok(true) => targets.push(stored.id_key),
+            Ok(false) => {}
+            Err(err) => return Err(err.errmsg),
+        }
+        if limit == 1 && !targets.is_empty() {
+            break;
+        }
+    }
+
+    let mut removed = 0_i32;
+    for id_key in targets {
+        removed += tx
+            .execute(
+                "DELETE FROM documents WHERE namespace = ?1 AND id_key = ?2",
+                params![namespace, id_key],
+            )
+            .map_err(|err| err.to_string())? as i32;
+    }
+    Ok(removed)
 }
 
 fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
@@ -2680,6 +2783,151 @@ mod tests {
             let response = update_documents(
                 &conn,
                 &doc! { "update": "users", "$db": "app", "updates": [update] },
+            )
+            .unwrap();
+            assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+            assert!(!write_errors(&response).is_empty());
+        }
+    }
+
+    #[test]
+    fn delete_one_and_delete_many_remove_matched_documents() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let one = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "profile.city": "Rome" }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(one.get_i32("n").unwrap(), 1);
+        assert_eq!(find_ids(&conn, doc! { "profile.city": "Rome" }), vec!["u3"]);
+
+        let many = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "active": false }, "limit": 0_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(many.get_i32("n").unwrap(), 1);
+        assert_eq!(find_ids(&conn, doc! {}), vec!["u3"]);
+    }
+
+    #[test]
+    fn delete_empty_and_repeated_delete_are_noops_with_zero_count() {
+        let conn = test_conn();
+
+        let empty = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "_id": "u1" }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.get_i32("n").unwrap(), 0);
+
+        seed_find_documents(&conn);
+        let first = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "_id": "u1" }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        let second = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "_id": "u1" }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(first.get_i32("n").unwrap(), 1);
+        assert_eq!(second.get_i32("n").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_ordered_and_unordered_batches_handle_partial_failures() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let ordered = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "ordered": true,
+                "deletes": [
+                    { "q": { "$where": "bad" }, "limit": 1_i32 },
+                    { "q": { "_id": "u1" }, "limit": 1_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(ordered.get_i32("n").unwrap(), 0);
+        assert_eq!(write_errors(&ordered)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(find_ids(&conn, doc! { "_id": "u1" }), vec!["u1"]);
+
+        let unordered = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "ordered": false,
+                "deletes": [
+                    { "q": { "$where": "bad" }, "limit": 1_i32 },
+                    { "q": { "_id": "u1" }, "limit": 1_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(unordered.get_i32("n").unwrap(), 1);
+        assert_eq!(write_errors(&unordered)[0].get_i32("index").unwrap(), 0);
+        assert!(find_ids(&conn, doc! { "_id": "u1" }).is_empty());
+    }
+
+    #[test]
+    fn delete_rejects_malformed_and_adversarial_shapes() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for command in [
+            doc! { "delete": "users", "$db": "app" },
+            doc! { "delete": "users", "$db": "app", "deletes": "bad" },
+            doc! { "delete": "users", "$db": "app", "deletes": [] },
+            doc! { "delete": "", "$db": "app", "deletes": [] },
+            doc! { "delete": "users", "$db": "app", "ordered": "yes", "deletes": [] },
+            doc! { "delete": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "deletes": [] },
+        ] {
+            let response = delete_documents(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
+
+        for delete in [
+            doc! { "limit": 1_i32 },
+            doc! { "q": 1_i32, "limit": 1_i32 },
+            doc! { "q": { "_id": "u1" } },
+            doc! { "q": { "_id": "u1" }, "limit": 2_i32 },
+            doc! { "q": { "_id": "u1" }, "limit": -1_i32 },
+            doc! { "q": { "_id": "u1" }, "limit": "1" },
+            doc! { "q": { "$where": "bad" }, "limit": 1_i32 },
+            doc! { "q": { "_id": "u1" }, "limit": 1_i32, "hint": { "_id": 1_i32 } },
+        ] {
+            let response = delete_documents(
+                &conn,
+                &doc! { "delete": "users", "$db": "app", "deletes": [delete] },
             )
             .unwrap();
             assert_eq!(response.get_f64("ok").unwrap(), 1.0);

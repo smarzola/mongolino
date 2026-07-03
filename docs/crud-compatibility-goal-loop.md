@@ -83,7 +83,7 @@ When a milestone is complete:
 - [x] Milestone 2: Query matcher for `find`
 - [x] Milestone 3: `find` result shaping
 - [x] Milestone 4: `update` command subset
-- [ ] Milestone 5: `delete` command subset
+- [x] Milestone 5: `delete` command subset
 - [ ] Milestone 6: Real client verification and compatibility docs
 
 ## Milestone 0: Baseline and Test Harness
@@ -431,6 +431,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 5: `delete` Command Subset
+
+Status note:
+
+- 2026-07-03: Added `delete` command support for `deletes` batches, matcher-backed delete-one (`limit: 1`) and delete-many (`limit: 0`), deterministic delete-one ordering, ordered/unordered writeErrors, repeated-delete no-ops, and malformed/adversarial delete validation. Verification: `cargo fmt`; `cargo test delete`; `cargo test find`; `cargo test update`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 
