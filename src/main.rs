@@ -584,6 +584,29 @@ fn read_i32(bytes: &[u8]) -> Result<i32> {
 mod tests {
     use super::*;
 
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_connection(&conn).unwrap();
+        conn
+    }
+
+    fn first_batch(response: &Document) -> Vec<Document> {
+        response
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .iter()
+            .map(|value| value.as_document().unwrap().clone())
+            .collect()
+    }
+
+    fn assert_command_error(response: &Document) {
+        assert_eq!(response.get_f64("ok").unwrap(), 0.0);
+        assert!(response.contains_key("code"));
+        assert!(response.contains_key("errmsg"));
+    }
+
     #[test]
     fn generated_ids_are_persistable_keys() {
         let mut document = doc! { "name": "Ada" };
@@ -607,9 +630,18 @@ mod tests {
     }
 
     #[test]
+    fn op_msg_rejects_unsupported_section_kind() {
+        let payload = vec![0, 0, 0, 0, 9];
+        let err = parse_op_msg_document(&payload).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported OP_MSG section kind 9")
+        );
+    }
+
+    #[test]
     fn insert_and_find_roundtrip_through_sqlite() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_connection(&conn).unwrap();
+        let conn = test_conn();
         let command = doc! {
             "insert": "users",
             "$db": "app",
@@ -627,12 +659,81 @@ mod tests {
             &doc! { "find": "users", "$db": "app", "filter": { "_id": "u2" } },
         )
         .unwrap();
-        let cursor = find_response.get_document("cursor").unwrap();
-        let batch = cursor.get_array("firstBatch").unwrap();
+        let batch = first_batch(&find_response);
         assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].get_str("name").unwrap(), "Grace");
+    }
+
+    #[test]
+    fn collection_scan_and_batch_size_are_covered() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada" },
+                    { "_id": "u2", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = find_documents(
+            &conn,
+            &doc! { "find": "users", "$db": "app", "batchSize": 1_i32 },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&response).len(), 1);
+    }
+
+    #[test]
+    fn list_databases_reports_namespaces_with_documents() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1" }],
+            },
+        )
+        .unwrap();
+
+        let response = list_databases(&conn).unwrap();
+        assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+        let databases = response.get_array("databases").unwrap();
         assert_eq!(
-            batch[0].as_document().unwrap().get_str("name").unwrap(),
-            "Grace"
+            databases[0].as_document().unwrap().get_str("name").unwrap(),
+            "app"
         );
+    }
+
+    #[test]
+    fn empty_and_unknown_commands_are_command_errors() {
+        let conn = test_conn();
+
+        let empty = handle_command(&conn, &doc! {}).unwrap();
+        assert_command_error(&empty);
+        assert!(empty.get_str("errmsg").unwrap().contains("empty command"));
+
+        let unknown = handle_command(&conn, &doc! { "drop": "users", "$db": "app" }).unwrap();
+        assert_command_error(&unknown);
+        assert!(unknown.get_str("errmsg").unwrap().contains("not supported"));
+    }
+
+    #[test]
+    fn malformed_insert_without_documents_is_rejected() {
+        let conn = test_conn();
+        let err = insert_documents(&conn, &doc! { "insert": "users", "$db": "app" }).unwrap_err();
+        assert!(err.to_string().contains("documents array"));
+    }
+
+    #[test]
+    fn malformed_find_without_collection_name_is_rejected() {
+        let conn = test_conn();
+        let err = find_documents(&conn, &doc! { "find": 1_i32, "$db": "app" }).unwrap_err();
+        assert!(err.to_string().contains("requires a collection"));
     }
 }

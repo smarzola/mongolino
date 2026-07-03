@@ -78,7 +78,7 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Baseline and test harness
+- [x] Milestone 0: Baseline and test harness
 - [ ] Milestone 1: Insert correctness and write error contracts
 - [ ] Milestone 2: Query matcher for `find`
 - [ ] Milestone 3: `find` result shaping
@@ -87,6 +87,10 @@ When a milestone is complete:
 - [ ] Milestone 6: Real client verification and compatibility docs
 
 ## Milestone 0: Baseline and Test Harness
+
+Status note:
+
+- 2026-07-03: Added in-memory SQLite command helpers, cursor batch extraction, command-error assertions, and baseline coverage for insert/find/listDatabases/unknown commands/malformed commands/OP_MSG section rejection. Verification: `cargo fmt`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 
