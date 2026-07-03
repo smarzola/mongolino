@@ -396,42 +396,121 @@ fn list_databases(conn: &Connection) -> Result<Document> {
 
 fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
-    let collection = command.get_str("insert").map_err(|_| {
-        MongolinoError::Protocol("insert command requires a collection name".to_string())
-    })?;
-    let documents = command.get_array("documents").map_err(|_| {
-        MongolinoError::Protocol("insert command requires a documents array".to_string())
-    })?;
+    let collection = match command.get_str("insert") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "insert command requires a collection name",
+            ));
+        }
+    };
+    let documents = match command.get_array("documents") {
+        Ok(documents) if !documents.is_empty() => documents,
+        Ok(_) => {
+            return Ok(command_error(
+                9,
+                "insert command requires a non-empty documents array",
+            ));
+        }
+        Err(_) => {
+            return Ok(command_error(
+                9,
+                "insert command requires a documents array",
+            ));
+        }
+    };
+    let ordered = match optional_bool(command, "ordered") {
+        Ok(value) => value.unwrap_or(true),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["insert", "documents", "ordered", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
     let namespace = namespace(db, collection);
+    let mut prepared = Vec::with_capacity(documents.len());
+
+    for value in documents {
+        let Bson::Document(original) = value else {
+            return Ok(command_error(2, "insert documents must be BSON documents"));
+        };
+        let mut document = original.clone();
+        ensure_document_id(&mut document);
+        let id_key = id_key(&document)?;
+        let mut encoded = Vec::new();
+        document.to_writer(&mut encoded)?;
+        prepared.push((id_key, encoded));
+    }
 
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0_i32;
+    let mut write_errors = Vec::new();
 
     {
         let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO documents(namespace, id_key, bson, updated_at)
+            "INSERT INTO documents(namespace, id_key, bson, updated_at)
              VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
         )?;
 
-        for value in documents {
-            let Bson::Document(original) = value else {
-                return Ok(command_error(2, "insert documents must be BSON documents"));
-            };
-            let mut document = original.clone();
-            ensure_document_id(&mut document);
-
-            let id_key = id_key(&document)?;
-            let mut encoded = Vec::new();
-            document.to_writer(&mut encoded)?;
-            stmt.execute(params![namespace, id_key, encoded])?;
-            inserted += 1;
+        for (index, (id_key, encoded)) in prepared.iter().enumerate() {
+            match stmt.execute(params![namespace, id_key, encoded]) {
+                Ok(_) => inserted += 1,
+                Err(err) if is_sqlite_constraint(&err) => {
+                    write_errors.push(write_error(
+                        index as i32,
+                        11000,
+                        &format!("duplicate key error collection: {namespace} _id: {id_key}"),
+                    ));
+                    if ordered {
+                        break;
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
     }
 
     tx.commit()?;
-    Ok(doc! {
+    let mut response = doc! {
         "n": inserted,
         "ok": 1.0,
+    };
+    if !write_errors.is_empty() {
+        response.insert("writeErrors", write_errors);
+    }
+    Ok(response)
+}
+
+fn optional_bool(command: &Document, key: &str) -> std::result::Result<Option<bool>, String> {
+    match command.get(key) {
+        None => Ok(None),
+        Some(Bson::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+fn reject_unsupported_command_keys(command: &Document, allowed: &[&str]) -> Option<String> {
+    command
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map(|key| format!("{key} is not supported for this command"))
+}
+
+fn is_sqlite_constraint(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(sqlite_err, _)
+            if sqlite_err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+fn write_error(index: i32, code: i32, errmsg: &str) -> Bson {
+    Bson::Document(doc! {
+        "index": index,
+        "code": code,
+        "errmsg": errmsg,
     })
 }
 
@@ -607,6 +686,15 @@ mod tests {
         assert!(response.contains_key("errmsg"));
     }
 
+    fn write_errors(response: &Document) -> Vec<Document> {
+        response
+            .get_array("writeErrors")
+            .unwrap()
+            .iter()
+            .map(|value| value.as_document().unwrap().clone())
+            .collect()
+    }
+
     #[test]
     fn generated_ids_are_persistable_keys() {
         let mut document = doc! { "name": "Ada" };
@@ -726,8 +814,14 @@ mod tests {
     #[test]
     fn malformed_insert_without_documents_is_rejected() {
         let conn = test_conn();
-        let err = insert_documents(&conn, &doc! { "insert": "users", "$db": "app" }).unwrap_err();
-        assert!(err.to_string().contains("documents array"));
+        let response = insert_documents(&conn, &doc! { "insert": "users", "$db": "app" }).unwrap();
+        assert_command_error(&response);
+        assert!(
+            response
+                .get_str("errmsg")
+                .unwrap()
+                .contains("documents array")
+        );
     }
 
     #[test]
@@ -735,5 +829,148 @@ mod tests {
         let conn = test_conn();
         let err = find_documents(&conn, &doc! { "find": 1_i32, "$db": "app" }).unwrap_err();
         assert!(err.to_string().contains("requires a collection"));
+    }
+
+    #[test]
+    fn insert_duplicate_id_reports_write_error_and_preserves_original() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada" }],
+            },
+        )
+        .unwrap();
+
+        let duplicate = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Grace" }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(duplicate.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(duplicate.get_i32("n").unwrap(), 0);
+        assert_eq!(write_errors(&duplicate)[0].get_i32("code").unwrap(), 11000);
+
+        let stored = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(stored[0].get_str("name").unwrap(), "Ada");
+    }
+
+    #[test]
+    fn insert_ordered_duplicate_stops_before_later_documents() {
+        let conn = test_conn();
+        let response = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "ordered": true,
+                "documents": [
+                    { "_id": "u1", "name": "Ada" },
+                    { "_id": "u1", "name": "Duplicate" },
+                    { "_id": "u2", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_i32("n").unwrap(), 1);
+        assert_eq!(write_errors(&response)[0].get_i32("index").unwrap(), 1);
+        assert!(
+            first_batch(&find_documents(&conn, &doc! { "find": "users", "$db": "app" }).unwrap())
+                .iter()
+                .all(|doc| doc.get_str("_id").unwrap() != "u2")
+        );
+    }
+
+    #[test]
+    fn insert_unordered_duplicate_continues_after_errors() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada" }],
+            },
+        )
+        .unwrap();
+
+        let response = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "ordered": false,
+                "documents": [
+                    { "_id": "u2", "name": "Grace" },
+                    { "_id": "u1", "name": "Duplicate" },
+                    { "_id": "u3", "name": "Katherine" },
+                    { "_id": "u2", "name": "Duplicate again" },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_i32("n").unwrap(), 2);
+        let errors = write_errors(&response);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].get_i32("index").unwrap(), 1);
+        assert_eq!(errors[1].get_i32("index").unwrap(), 3);
+        assert_eq!(
+            first_batch(&find_documents(&conn, &doc! { "find": "users", "$db": "app" }).unwrap())
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn insert_generates_id_and_stores_operator_shaped_field_names_as_data() {
+        let conn = test_conn();
+        let response = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [{ "$set": "literal", "a.$bad": true }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_i32("n").unwrap(), 1);
+        let docs =
+            first_batch(&find_documents(&conn, &doc! { "find": "events", "$db": "app" }).unwrap());
+        assert!(docs[0].contains_key("_id"));
+        assert_eq!(docs[0].get_str("$set").unwrap(), "literal");
+        assert!(docs[0].get_bool("a.$bad").unwrap());
+    }
+
+    #[test]
+    fn insert_rejects_malformed_shapes_and_unsupported_options() {
+        let conn = test_conn();
+
+        for command in [
+            doc! { "insert": 1_i32, "$db": "app", "documents": [] },
+            doc! { "insert": "", "$db": "app", "documents": [] },
+            doc! { "insert": "users", "$db": "app", "documents": [] },
+            doc! { "insert": "users", "$db": "app", "documents": [1_i32] },
+            doc! { "insert": "users", "$db": "app", "ordered": "yes", "documents": [{ "_id": "u1" }] },
+            doc! { "insert": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "documents": [{ "_id": "u1" }] },
+        ] {
+            let response = insert_documents(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
     }
 }

@@ -79,7 +79,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Baseline and test harness
-- [ ] Milestone 1: Insert correctness and write error contracts
+- [x] Milestone 1: Insert correctness and write error contracts
 - [ ] Milestone 2: Query matcher for `find`
 - [ ] Milestone 3: `find` result shaping
 - [ ] Milestone 4: `update` command subset
@@ -136,6 +136,10 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: Insert Correctness and Write Error Contracts
+
+Status note:
+
+- 2026-07-03: Replaced replace-on-conflict insert behavior with SQLite uniqueness-preserving inserts, duplicate key writeErrors, ordered/unordered batch handling, generated `_id` storage, and malformed insert validation. Verification: `cargo fmt`; `cargo test insert`; `cargo test`. Commit hash: reported after checkpoint commit.
 
 Problem:
 
