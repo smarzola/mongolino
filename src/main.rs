@@ -1425,7 +1425,11 @@ fn aggregate_pipeline_documents(
                     Ok(group) => group,
                     Err(response) => return Ok(Err(response)),
                 };
-                documents = apply_group_stage(documents, &group, preserve_empty_count);
+                documents =
+                    match apply_group_stage(documents, &group, preserve_empty_count, collation) {
+                        Ok(documents) => documents,
+                        Err(response) => return Ok(Err(response)),
+                    };
             }
             _ => {
                 return Ok(Err(command_error(
@@ -1795,18 +1799,20 @@ fn apply_group_stage(
     documents: Vec<Document>,
     spec: &GroupSpec,
     preserve_empty_count: bool,
-) -> Vec<Document> {
+    collation: &Collation,
+) -> std::result::Result<Vec<Document>, Document> {
     if documents.is_empty() {
-        return if preserve_empty_count {
+        return Ok(if preserve_empty_count {
             vec![doc! { "_id": 1_i32, "n": 0_i64 }]
         } else {
             Vec::new()
-        };
+        });
     }
 
     let mut groups = Vec::<GroupState>::new();
     for document in &documents {
-        let id = spec.id.evaluate(document).unwrap_or(Bson::Null);
+        let context = AggregationExpressionContext::new(document, collation);
+        let id = spec.id.evaluate(&context)?.unwrap_or(Bson::Null);
         let group_index = groups
             .iter()
             .position(|group| aggregation_values_equal(&group.id, &id));
@@ -1826,14 +1832,14 @@ fn apply_group_stage(
         };
         let group = &mut groups[index];
         for (state, accumulator) in group.accumulators.iter_mut().zip(&spec.accumulators) {
-            state.accumulate(accumulator, document);
+            state.accumulate(accumulator, document, collation)?;
         }
     }
 
-    groups
+    Ok(groups
         .into_iter()
         .map(|group| group.into_document(spec))
-        .collect()
+        .collect())
 }
 
 impl AccumulatorState {
@@ -1856,8 +1862,14 @@ impl AccumulatorState {
         }
     }
 
-    fn accumulate(&mut self, spec: &AccumulatorSpec, document: &Document) {
-        let value = spec.expression.evaluate(document);
+    fn accumulate(
+        &mut self,
+        spec: &AccumulatorSpec,
+        document: &Document,
+        collation: &Collation,
+    ) -> std::result::Result<(), Document> {
+        let context = AggregationExpressionContext::new(document, collation);
+        let value = spec.expression.evaluate(&context)?;
         match self {
             Self::Sum { total, saw_double } => {
                 if let Some(value) = value
@@ -1877,7 +1889,7 @@ impl AccumulatorState {
             }
             Self::Min(current) => {
                 let Some(value) = value else {
-                    return;
+                    return Ok(());
                 };
                 if current
                     .as_ref()
@@ -1888,7 +1900,7 @@ impl AccumulatorState {
             }
             Self::Max(current) => {
                 let Some(value) = value else {
-                    return;
+                    return Ok(());
                 };
                 if current
                     .as_ref()
@@ -1918,6 +1930,7 @@ impl AccumulatorState {
                 }
             }
         }
+        Ok(())
     }
 
     fn into_bson(self) -> Bson {
@@ -2417,23 +2430,323 @@ fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result
 #[derive(Clone, Debug, PartialEq)]
 enum AggregationExpression {
     FieldPath(String),
+    Variable(AggregationVariable, Option<String>),
     Literal(Bson),
+    Array(Vec<AggregationExpression>),
     Document(Vec<(String, AggregationExpression)>),
+    Operator(AggregationExpressionOperator),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AggregationVariable {
+    Root,
+    Current,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AggregationExpressionOperator {
+    Literal(Bson),
+    IfNull(Vec<AggregationExpression>),
+    Concat(Vec<AggregationExpression>),
+    ToString(Box<AggregationExpression>),
+    ToLower(Box<AggregationExpression>),
+    ToUpper(Box<AggregationExpression>),
+    Eq(Box<AggregationExpression>, Box<AggregationExpression>),
+    Ne(Box<AggregationExpression>, Box<AggregationExpression>),
+    Gt(Box<AggregationExpression>, Box<AggregationExpression>),
+    Gte(Box<AggregationExpression>, Box<AggregationExpression>),
+    Lt(Box<AggregationExpression>, Box<AggregationExpression>),
+    Lte(Box<AggregationExpression>, Box<AggregationExpression>),
+    And(Vec<AggregationExpression>),
+    Or(Vec<AggregationExpression>),
+    Not(Box<AggregationExpression>),
+    Cond {
+        condition: Box<AggregationExpression>,
+        then_expr: Box<AggregationExpression>,
+        else_expr: Box<AggregationExpression>,
+    },
+    Add(Vec<AggregationExpression>),
+    Subtract(Box<AggregationExpression>, Box<AggregationExpression>),
+    Multiply(Vec<AggregationExpression>),
+    Divide(Box<AggregationExpression>, Box<AggregationExpression>),
+}
+
+struct AggregationExpressionContext<'a> {
+    root: &'a Document,
+    current: &'a Document,
+    collation: &'a Collation,
+}
+
+impl<'a> AggregationExpressionContext<'a> {
+    fn new(document: &'a Document, collation: &'a Collation) -> Self {
+        Self {
+            root: document,
+            current: document,
+            collation,
+        }
+    }
 }
 
 impl AggregationExpression {
-    fn evaluate(&self, document: &Document) -> Option<Bson> {
+    fn evaluate(
+        &self,
+        context: &AggregationExpressionContext<'_>,
+    ) -> std::result::Result<Option<Bson>, Document> {
         match self {
-            Self::FieldPath(path) => get_document_path(document, path).cloned(),
-            Self::Literal(value) => Some(value.clone()),
+            Self::FieldPath(path) => Ok(get_document_path(context.current, path).cloned()),
+            Self::Variable(variable, path) => {
+                let document = match variable {
+                    AggregationVariable::Root => context.root,
+                    AggregationVariable::Current => context.current,
+                };
+                Ok(match path {
+                    None => Some(Bson::Document(document.clone())),
+                    Some(path) => get_document_path(document, path).cloned(),
+                })
+            }
+            Self::Literal(value) => Ok(Some(value.clone())),
+            Self::Array(expressions) => {
+                let mut values = Vec::new();
+                for expression in expressions {
+                    values.push(expression.evaluate(context)?.unwrap_or(Bson::Null));
+                }
+                Ok(Some(Bson::Array(values)))
+            }
             Self::Document(fields) => {
                 let mut out = Document::new();
                 for (field, expression) in fields {
-                    out.insert(field, expression.evaluate(document).unwrap_or(Bson::Null));
+                    out.insert(field, expression.evaluate(context)?.unwrap_or(Bson::Null));
                 }
-                Some(Bson::Document(out))
+                Ok(Some(Bson::Document(out)))
+            }
+            Self::Operator(operator) => operator.evaluate(context),
+        }
+    }
+}
+
+impl AggregationExpressionOperator {
+    fn evaluate(
+        &self,
+        context: &AggregationExpressionContext<'_>,
+    ) -> std::result::Result<Option<Bson>, Document> {
+        match self {
+            Self::Literal(value) => Ok(Some(value.clone())),
+            Self::IfNull(expressions) => {
+                for expression in expressions.iter().take(expressions.len().saturating_sub(1)) {
+                    match expression.evaluate(context)? {
+                        Some(Bson::Null) | None => {}
+                        Some(value) => return Ok(Some(value)),
+                    }
+                }
+                Ok(Some(
+                    expressions
+                        .last()
+                        .expect("$ifNull arity checked")
+                        .evaluate(context)?
+                        .unwrap_or(Bson::Null),
+                ))
+            }
+            Self::Concat(expressions) => {
+                let mut out = String::new();
+                for expression in expressions {
+                    match expression.evaluate(context)?.unwrap_or(Bson::Null) {
+                        Bson::String(value) => out.push_str(&value),
+                        Bson::Null => {}
+                        _ => {
+                            return Err(command_error(
+                                9,
+                                "$concat operands must evaluate to strings or null",
+                            ));
+                        }
+                    }
+                }
+                Ok(Some(Bson::String(out)))
+            }
+            Self::ToString(expression) => Ok(Some(Bson::String(aggregation_to_string(
+                &expression.evaluate(context)?.unwrap_or(Bson::Null),
+            )?))),
+            Self::ToLower(expression) => Ok(Some(Bson::String(
+                aggregation_string_operand(expression, context, "$toLower")?.to_lowercase(),
+            ))),
+            Self::ToUpper(expression) => Ok(Some(Bson::String(
+                aggregation_string_operand(expression, context, "$toUpper")?.to_uppercase(),
+            ))),
+            Self::Eq(left, right) => Ok(Some(Bson::Boolean(aggregation_operands_equal(
+                left, right, context,
+            )?))),
+            Self::Ne(left, right) => Ok(Some(Bson::Boolean(!aggregation_operands_equal(
+                left, right, context,
+            )?))),
+            Self::Gt(left, right) => Ok(Some(Bson::Boolean(aggregation_compare_operands(
+                left,
+                right,
+                context,
+                |ordering| ordering.is_gt(),
+            )?))),
+            Self::Gte(left, right) => Ok(Some(Bson::Boolean(aggregation_compare_operands(
+                left,
+                right,
+                context,
+                |ordering| !ordering.is_lt(),
+            )?))),
+            Self::Lt(left, right) => Ok(Some(Bson::Boolean(aggregation_compare_operands(
+                left,
+                right,
+                context,
+                |ordering| ordering.is_lt(),
+            )?))),
+            Self::Lte(left, right) => Ok(Some(Bson::Boolean(aggregation_compare_operands(
+                left,
+                right,
+                context,
+                |ordering| !ordering.is_gt(),
+            )?))),
+            Self::And(expressions) => {
+                for expression in expressions {
+                    if !aggregation_truthy(&expression.evaluate(context)?.unwrap_or(Bson::Null)) {
+                        return Ok(Some(Bson::Boolean(false)));
+                    }
+                }
+                Ok(Some(Bson::Boolean(true)))
+            }
+            Self::Or(expressions) => {
+                for expression in expressions {
+                    if aggregation_truthy(&expression.evaluate(context)?.unwrap_or(Bson::Null)) {
+                        return Ok(Some(Bson::Boolean(true)));
+                    }
+                }
+                Ok(Some(Bson::Boolean(false)))
+            }
+            Self::Not(expression) => Ok(Some(Bson::Boolean(!aggregation_truthy(
+                &expression.evaluate(context)?.unwrap_or(Bson::Null),
+            )))),
+            Self::Cond {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                if aggregation_truthy(&condition.evaluate(context)?.unwrap_or(Bson::Null)) {
+                    then_expr.evaluate(context)
+                } else {
+                    else_expr.evaluate(context)
+                }
+            }
+            Self::Add(expressions) => {
+                let mut total = 0.0;
+                let mut saw_double = false;
+                for expression in expressions {
+                    let value = expression.evaluate(context)?.unwrap_or(Bson::Null);
+                    let Some((number, is_double)) = numeric_bson_value(&value) else {
+                        return Err(command_error(9, "$add operands must be numeric"));
+                    };
+                    total += number;
+                    saw_double |= is_double;
+                }
+                Ok(Some(numeric_total_to_bson(total, saw_double)))
+            }
+            Self::Subtract(left, right) => {
+                let (left, left_double) = aggregation_numeric_operand(left, context, "$subtract")?;
+                let (right, right_double) =
+                    aggregation_numeric_operand(right, context, "$subtract")?;
+                Ok(Some(numeric_total_to_bson(
+                    left - right,
+                    left_double || right_double,
+                )))
+            }
+            Self::Multiply(expressions) => {
+                let mut total = 1.0;
+                let mut saw_double = false;
+                for expression in expressions {
+                    let (number, is_double) =
+                        aggregation_numeric_operand(expression, context, "$multiply")?;
+                    total *= number;
+                    saw_double |= is_double;
+                }
+                Ok(Some(numeric_total_to_bson(total, saw_double)))
+            }
+            Self::Divide(left, right) => {
+                let (left, _) = aggregation_numeric_operand(left, context, "$divide")?;
+                let (right, _) = aggregation_numeric_operand(right, context, "$divide")?;
+                if right == 0.0 {
+                    return Err(command_error(9, "$divide cannot divide by zero"));
+                }
+                Ok(Some(Bson::Double(left / right)))
             }
         }
+    }
+}
+
+fn aggregation_operands_equal(
+    left: &AggregationExpression,
+    right: &AggregationExpression,
+    context: &AggregationExpressionContext<'_>,
+) -> std::result::Result<bool, Document> {
+    let left = left.evaluate(context)?.unwrap_or(Bson::Null);
+    let right = right.evaluate(context)?.unwrap_or(Bson::Null);
+    Ok(context.collation.values_equal(&left, &right))
+}
+
+fn aggregation_compare_operands(
+    left: &AggregationExpression,
+    right: &AggregationExpression,
+    context: &AggregationExpressionContext<'_>,
+    predicate: impl Fn(std::cmp::Ordering) -> bool,
+) -> std::result::Result<bool, Document> {
+    let left = left.evaluate(context)?.unwrap_or(Bson::Null);
+    let right = right.evaluate(context)?.unwrap_or(Bson::Null);
+    Ok(predicate(context.collation.compare_order(&left, &right)))
+}
+
+fn aggregation_numeric_operand(
+    expression: &AggregationExpression,
+    context: &AggregationExpressionContext<'_>,
+    operator: &str,
+) -> std::result::Result<(f64, bool), Document> {
+    let value = expression.evaluate(context)?.unwrap_or(Bson::Null);
+    numeric_bson_value(&value)
+        .ok_or_else(|| command_error(9, &format!("{operator} operands must be numeric")))
+}
+
+fn aggregation_string_operand(
+    expression: &AggregationExpression,
+    context: &AggregationExpressionContext<'_>,
+    operator: &str,
+) -> std::result::Result<String, Document> {
+    match expression.evaluate(context)?.unwrap_or(Bson::Null) {
+        Bson::String(value) => Ok(value),
+        Bson::Null => Ok(String::new()),
+        _ => Err(command_error(
+            9,
+            &format!("{operator} operand must evaluate to a string or null"),
+        )),
+    }
+}
+
+fn aggregation_to_string(value: &Bson) -> std::result::Result<String, Document> {
+    match value {
+        Bson::Null => Ok(String::new()),
+        Bson::String(value) => Ok(value.clone()),
+        Bson::Boolean(value) => Ok(value.to_string()),
+        Bson::Int32(value) => Ok(value.to_string()),
+        Bson::Int64(value) => Ok(value.to_string()),
+        Bson::Double(value) => Ok(value.to_string()),
+        Bson::ObjectId(value) => Ok(value.to_hex()),
+        Bson::DateTime(value) => Ok(value.to_string()),
+        _ => Err(command_error(
+            9,
+            "$toString does not support this operand type",
+        )),
+    }
+}
+
+fn aggregation_truthy(value: &Bson) -> bool {
+    match value {
+        Bson::Null => false,
+        Bson::Boolean(value) => *value,
+        Bson::Int32(value) => *value != 0,
+        Bson::Int64(value) => *value != 0,
+        Bson::Double(value) => *value != 0.0,
+        _ => true,
     }
 }
 
@@ -2442,7 +2755,20 @@ fn parse_aggregation_expression(
     context: &str,
     allow_document_key_spec: bool,
 ) -> std::result::Result<AggregationExpression, Document> {
+    parse_aggregation_expression_inner(value, context, allow_document_key_spec, true)
+}
+
+fn parse_aggregation_expression_inner(
+    value: &Bson,
+    context: &str,
+    allow_document_expression: bool,
+    allow_array_expression: bool,
+) -> std::result::Result<AggregationExpression, Document> {
     match value {
+        Bson::String(value) if value.starts_with("$$") => {
+            let (variable, path) = parse_aggregation_variable(value, context)?;
+            Ok(AggregationExpression::Variable(variable, path))
+        }
         Bson::String(value) if value.starts_with('$') => {
             let path = parse_aggregation_field_path(value, context)?;
             Ok(AggregationExpression::FieldPath(path))
@@ -2455,34 +2781,263 @@ fn parse_aggregation_expression(
         | Bson::Double(_)
         | Bson::ObjectId(_)
         | Bson::DateTime(_) => Ok(AggregationExpression::Literal(value.clone())),
-        Bson::Document(document) if allow_document_key_spec => {
-            if document.keys().any(|key| key.starts_with('$')) {
-                return Err(command_error(
-                    72,
-                    &format!("{context} does not support expression operators"),
-                ));
-            }
-            let mut fields = Vec::new();
-            for (field, nested) in document {
-                validate_group_key_field_name(field, context)?;
-                fields.push((
-                    field.to_string(),
-                    parse_aggregation_expression(nested, context, false)?,
-                ));
-            }
-            Ok(AggregationExpression::Document(fields))
-        }
-        Bson::Document(_) => Err(command_error(
-            72,
-            &format!("{context} does not support document expressions"),
-        )),
+        Bson::Array(values) if allow_array_expression => values
+            .iter()
+            .map(|value| parse_aggregation_expression_inner(value, context, true, true))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(AggregationExpression::Array),
         Bson::Array(_) => Err(command_error(
             72,
             &format!("{context} does not support array expressions"),
         )),
+        Bson::Document(document) => {
+            parse_aggregation_document_expression(document, context, allow_document_expression)
+        }
         _ => Err(command_error(
             72,
             &format!("{context} expression type is not supported"),
+        )),
+    }
+}
+
+fn parse_aggregation_document_expression(
+    document: &Document,
+    context: &str,
+    allow_document_expression: bool,
+) -> std::result::Result<AggregationExpression, Document> {
+    let dollar_keys = document
+        .keys()
+        .filter(|key| key.starts_with('$'))
+        .collect::<Vec<_>>();
+    if !dollar_keys.is_empty() {
+        if document.len() != 1 {
+            return Err(command_error(
+                9,
+                &format!("{context} expression documents must contain one operator"),
+            ));
+        }
+        let (operator, operand) = document.iter().next().expect("document len checked above");
+        return parse_aggregation_expression_operator(operator, operand, context)
+            .map(AggregationExpression::Operator);
+    }
+    if !allow_document_expression {
+        return Err(command_error(
+            72,
+            &format!("{context} does not support document expressions"),
+        ));
+    }
+
+    let mut fields = Vec::new();
+    for (field, nested) in document {
+        validate_group_key_field_name(field, context)?;
+        fields.push((
+            field.to_string(),
+            parse_aggregation_expression_inner(nested, context, true, true)?,
+        ));
+    }
+    Ok(AggregationExpression::Document(fields))
+}
+
+fn parse_aggregation_expression_operator(
+    operator: &str,
+    operand: &Bson,
+    context: &str,
+) -> std::result::Result<AggregationExpressionOperator, Document> {
+    match operator {
+        "$literal" => Ok(AggregationExpressionOperator::Literal(operand.clone())),
+        "$ifNull" => {
+            let expressions = parse_expression_array_args(operand, context, "$ifNull")?;
+            if expressions.len() < 2 {
+                return Err(command_error(9, "$ifNull requires at least two operands"));
+            }
+            Ok(AggregationExpressionOperator::IfNull(expressions))
+        }
+        "$concat" => Ok(AggregationExpressionOperator::Concat(
+            parse_expression_array_args(operand, context, "$concat")?,
+        )),
+        "$toString" => Ok(AggregationExpressionOperator::ToString(Box::new(
+            parse_single_expression_arg(operand, context, "$toString")?,
+        ))),
+        "$toLower" => Ok(AggregationExpressionOperator::ToLower(Box::new(
+            parse_single_expression_arg(operand, context, "$toLower")?,
+        ))),
+        "$toUpper" => Ok(AggregationExpressionOperator::ToUpper(Box::new(
+            parse_single_expression_arg(operand, context, "$toUpper")?,
+        ))),
+        "$eq" => parse_binary_expression_args(operand, context, "$eq").map(|(left, right)| {
+            AggregationExpressionOperator::Eq(Box::new(left), Box::new(right))
+        }),
+        "$ne" => parse_binary_expression_args(operand, context, "$ne").map(|(left, right)| {
+            AggregationExpressionOperator::Ne(Box::new(left), Box::new(right))
+        }),
+        "$gt" => parse_binary_expression_args(operand, context, "$gt").map(|(left, right)| {
+            AggregationExpressionOperator::Gt(Box::new(left), Box::new(right))
+        }),
+        "$gte" => parse_binary_expression_args(operand, context, "$gte").map(|(left, right)| {
+            AggregationExpressionOperator::Gte(Box::new(left), Box::new(right))
+        }),
+        "$lt" => parse_binary_expression_args(operand, context, "$lt").map(|(left, right)| {
+            AggregationExpressionOperator::Lt(Box::new(left), Box::new(right))
+        }),
+        "$lte" => parse_binary_expression_args(operand, context, "$lte").map(|(left, right)| {
+            AggregationExpressionOperator::Lte(Box::new(left), Box::new(right))
+        }),
+        "$and" => Ok(AggregationExpressionOperator::And(
+            parse_expression_array_args(operand, context, "$and")?,
+        )),
+        "$or" => Ok(AggregationExpressionOperator::Or(
+            parse_expression_array_args(operand, context, "$or")?,
+        )),
+        "$not" => Ok(AggregationExpressionOperator::Not(Box::new(
+            parse_single_expression_array_arg(operand, context, "$not")?,
+        ))),
+        "$cond" => parse_cond_expression(operand, context),
+        "$add" => Ok(AggregationExpressionOperator::Add(
+            parse_expression_array_args(operand, context, "$add")?,
+        )),
+        "$subtract" => {
+            parse_binary_expression_args(operand, context, "$subtract").map(|(left, right)| {
+                AggregationExpressionOperator::Subtract(Box::new(left), Box::new(right))
+            })
+        }
+        "$multiply" => Ok(AggregationExpressionOperator::Multiply(
+            parse_expression_array_args(operand, context, "$multiply")?,
+        )),
+        "$divide" => {
+            parse_binary_expression_args(operand, context, "$divide").map(|(left, right)| {
+                AggregationExpressionOperator::Divide(Box::new(left), Box::new(right))
+            })
+        }
+        _ => Err(command_error(
+            72,
+            &format!("{context} expression operator {operator} is not supported"),
+        )),
+    }
+}
+
+fn parse_expression_array_args(
+    operand: &Bson,
+    context: &str,
+    operator: &str,
+) -> std::result::Result<Vec<AggregationExpression>, Document> {
+    let Bson::Array(values) = operand else {
+        return Err(command_error(
+            9,
+            &format!("{operator} requires an array of operands"),
+        ));
+    };
+    values
+        .iter()
+        .map(|value| parse_aggregation_expression_inner(value, context, true, true))
+        .collect()
+}
+
+fn parse_single_expression_arg(
+    operand: &Bson,
+    context: &str,
+    operator: &str,
+) -> std::result::Result<AggregationExpression, Document> {
+    if let Bson::Array(values) = operand {
+        if values.len() != 1 {
+            return Err(command_error(
+                9,
+                &format!("{operator} requires one operand"),
+            ));
+        }
+        parse_aggregation_expression_inner(&values[0], context, true, true)
+    } else {
+        parse_aggregation_expression_inner(operand, context, true, true)
+    }
+}
+
+fn parse_single_expression_array_arg(
+    operand: &Bson,
+    context: &str,
+    operator: &str,
+) -> std::result::Result<AggregationExpression, Document> {
+    let values = parse_expression_array_args(operand, context, operator)?;
+    if values.len() != 1 {
+        return Err(command_error(
+            9,
+            &format!("{operator} requires one operand"),
+        ));
+    }
+    Ok(values.into_iter().next().expect("len checked above"))
+}
+
+fn parse_binary_expression_args(
+    operand: &Bson,
+    context: &str,
+    operator: &str,
+) -> std::result::Result<(AggregationExpression, AggregationExpression), Document> {
+    let values = parse_expression_array_args(operand, context, operator)?;
+    if values.len() != 2 {
+        return Err(command_error(
+            9,
+            &format!("{operator} requires exactly two operands"),
+        ));
+    }
+    let mut values = values.into_iter();
+    Ok((
+        values.next().expect("len checked above"),
+        values.next().expect("len checked above"),
+    ))
+}
+
+fn parse_cond_expression(
+    operand: &Bson,
+    context: &str,
+) -> std::result::Result<AggregationExpressionOperator, Document> {
+    match operand {
+        Bson::Array(values) => {
+            if values.len() != 3 {
+                return Err(command_error(9, "$cond array form requires three operands"));
+            }
+            Ok(AggregationExpressionOperator::Cond {
+                condition: Box::new(parse_aggregation_expression_inner(
+                    &values[0], context, true, true,
+                )?),
+                then_expr: Box::new(parse_aggregation_expression_inner(
+                    &values[1], context, true, true,
+                )?),
+                else_expr: Box::new(parse_aggregation_expression_inner(
+                    &values[2], context, true, true,
+                )?),
+            })
+        }
+        Bson::Document(document) => {
+            for key in document.keys() {
+                if !matches!(key.as_str(), "if" | "then" | "else") {
+                    return Err(command_error(
+                        72,
+                        &format!("$cond option {key} is not supported"),
+                    ));
+                }
+            }
+            let Some(condition) = document.get("if") else {
+                return Err(command_error(9, "$cond document form requires if"));
+            };
+            let Some(then_expr) = document.get("then") else {
+                return Err(command_error(9, "$cond document form requires then"));
+            };
+            let Some(else_expr) = document.get("else") else {
+                return Err(command_error(9, "$cond document form requires else"));
+            };
+            Ok(AggregationExpressionOperator::Cond {
+                condition: Box::new(parse_aggregation_expression_inner(
+                    condition, context, true, true,
+                )?),
+                then_expr: Box::new(parse_aggregation_expression_inner(
+                    then_expr, context, true, true,
+                )?),
+                else_expr: Box::new(parse_aggregation_expression_inner(
+                    else_expr, context, true, true,
+                )?),
+            })
+        }
+        _ => Err(command_error(
+            9,
+            "$cond requires an array or document operand",
         )),
     }
 }
@@ -2499,6 +3054,33 @@ fn parse_aggregation_field_path(
     };
     validate_aggregation_path(path, context, true)?;
     Ok(path.to_string())
+}
+
+fn parse_aggregation_variable(
+    value: &str,
+    context: &str,
+) -> std::result::Result<(AggregationVariable, Option<String>), Document> {
+    let (variable, rest) = if let Some(rest) = value.strip_prefix("$$ROOT") {
+        (AggregationVariable::Root, rest)
+    } else if let Some(rest) = value.strip_prefix("$$CURRENT") {
+        (AggregationVariable::Current, rest)
+    } else {
+        return Err(command_error(
+            72,
+            &format!("{context} variable {value} is not supported"),
+        ));
+    };
+    if rest.is_empty() {
+        return Ok((variable, None));
+    }
+    let Some(path) = rest.strip_prefix('.') else {
+        return Err(command_error(
+            9,
+            &format!("{context} variable path is malformed"),
+        ));
+    };
+    validate_aggregation_path(path, context, true)?;
+    Ok((variable, Some(path.to_string())))
 }
 
 fn validate_aggregation_path(
@@ -13107,8 +13689,13 @@ mod tests {
             "_id": "u1",
             "team": "red",
             "active": true,
+            "first": "Ada",
+            "last": "Lovelace",
+            "score": 7_i32,
+            "bonus": 2_i64,
             "profile": { "city": "Rome" },
         };
+        let context = AggregationExpressionContext::new(&document, &Collation::Simple);
 
         let field = parse_aggregation_expression(
             &Bson::String("$profile.city".to_string()),
@@ -13117,7 +13704,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            field.evaluate(&document),
+            field.evaluate(&context).unwrap(),
             Some(Bson::String("Rome".to_string()))
         );
 
@@ -13125,7 +13712,7 @@ mod tests {
             parse_aggregation_expression(&Bson::String("literal".to_string()), "$group _id", false)
                 .unwrap();
         assert_eq!(
-            literal.evaluate(&document),
+            literal.evaluate(&context).unwrap(),
             Some(Bson::String("literal".to_string()))
         );
 
@@ -13136,10 +13723,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            key.evaluate(&document),
+            key.evaluate(&context).unwrap(),
             Some(Bson::Document(
                 doc! { "team": "red", "active": true, "missing": Bson::Null }
             ))
+        );
+
+        let variable = parse_aggregation_expression(
+            &Bson::String("$$ROOT.profile.city".to_string()),
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            variable.evaluate(&context).unwrap(),
+            Some(Bson::String("Rome".to_string()))
+        );
+
+        let array = parse_aggregation_expression(
+            &Bson::Array(vec![
+                Bson::String("$team".to_string()),
+                Bson::String("literal".to_string()),
+            ]),
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            array.evaluate(&context).unwrap(),
+            Some(Bson::Array(vec![
+                Bson::String("red".to_string()),
+                Bson::String("literal".to_string())
+            ]))
+        );
+
+        for (expression, expected) in [
+            (
+                doc! { "$concat": ["$first", " ", "$last"] },
+                Bson::String("Ada Lovelace".to_string()),
+            ),
+            (
+                doc! { "$toString": "$score" },
+                Bson::String("7".to_string()),
+            ),
+            (
+                doc! { "$toLower": "LOUD" },
+                Bson::String("loud".to_string()),
+            ),
+            (
+                doc! { "$toUpper": "$team" },
+                Bson::String("RED".to_string()),
+            ),
+            (
+                doc! { "$ifNull": ["$missing", "$team"] },
+                Bson::String("red".to_string()),
+            ),
+            (doc! { "$eq": ["$team", "red"] }, Bson::Boolean(true)),
+            (doc! { "$ne": ["$team", "blue"] }, Bson::Boolean(true)),
+            (doc! { "$gt": ["$score", 3_i32] }, Bson::Boolean(true)),
+            (doc! { "$gte": ["$score", 7_i32] }, Bson::Boolean(true)),
+            (doc! { "$lt": ["$score", 8_i32] }, Bson::Boolean(true)),
+            (doc! { "$lte": ["$score", 7_i32] }, Bson::Boolean(true)),
+            (doc! { "$and": [true, "$active"] }, Bson::Boolean(true)),
+            (doc! { "$or": [false, "$active"] }, Bson::Boolean(true)),
+            (doc! { "$not": ["$missing"] }, Bson::Boolean(true)),
+            (
+                doc! { "$cond": [{ "$eq": ["$team", "red"] }, "yes", "no"] },
+                Bson::String("yes".to_string()),
+            ),
+            (
+                doc! { "$cond": { "if": "$active", "then": "yes", "else": "no" } },
+                Bson::String("yes".to_string()),
+            ),
+            (
+                doc! { "$add": ["$score", "$bonus", 1_i32] },
+                Bson::Int64(10),
+            ),
+            (doc! { "$subtract": ["$score", 2_i32] }, Bson::Int64(5)),
+            (doc! { "$multiply": ["$score", 2_i32] }, Bson::Int64(14)),
+            (doc! { "$divide": ["$score", 2_i32] }, Bson::Double(3.5)),
+        ] {
+            let parsed = parse_aggregation_expression(&Bson::Document(expression), "test", true)
+                .expect("expression should parse");
+            assert_eq!(parsed.evaluate(&context).unwrap(), Some(expected));
+        }
+
+        let ci_context =
+            AggregationExpressionContext::new(&document, &Collation::EnglishCaseInsensitive);
+        let case_eq = parse_aggregation_expression(
+            &Bson::Document(doc! { "$eq": ["$team", "RED"] }),
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            case_eq.evaluate(&ci_context).unwrap(),
+            Some(Bson::Boolean(true))
         );
     }
 
@@ -13147,10 +13826,14 @@ mod tests {
     fn aggregation_expression_rejects_unsupported_shapes() {
         for value in [
             Bson::String("$".to_string()),
-            Bson::String("$$ROOT".to_string()),
+            Bson::String("$$NOW".to_string()),
             Bson::String("$profile..city".to_string()),
-            Bson::Array(vec![Bson::Int32(1)]),
-            Bson::Document(doc! { "$add": [1_i32, 2_i32] }),
+            Bson::Document(doc! { "$add": 1_i32 }),
+            Bson::Document(doc! { "$subtract": [1_i32] }),
+            Bson::Document(doc! { "$divide": [1_i32, 2_i32, 3_i32] }),
+            Bson::Document(doc! { "$cond": { "if": true, "then": 1_i32 } }),
+            Bson::Document(doc! { "$unknown": [1_i32] }),
+            Bson::Document(doc! { "$eq": [1_i32, 1_i32], "$ne": [1_i32, 2_i32] }),
         ] {
             let response = parse_aggregation_expression(&value, "$group _id", false)
                 .expect_err("expression should be rejected");
@@ -13160,12 +13843,25 @@ mod tests {
         for value in [
             Bson::Document(doc! { "nested.field": "$team" }),
             Bson::Document(doc! { "$team": "$team" }),
-            Bson::Document(doc! { "nested": { "team": "$team" } }),
         ] {
             let response = parse_aggregation_expression(&value, "$group _id", true)
                 .expect_err("document key spec should be rejected");
             assert_command_error(&response);
         }
+
+        let zero_document = doc! { "denominator": 0_i32 };
+        let context = AggregationExpressionContext::new(&zero_document, &Collation::Simple);
+        let division = parse_aggregation_expression(
+            &Bson::Document(doc! { "$divide": [10_i32, "$denominator"] }),
+            "test",
+            true,
+        )
+        .unwrap();
+        assert_command_error(
+            &division
+                .evaluate(&context)
+                .expect_err("division by zero should fail"),
+        );
     }
 
     #[test]
@@ -13748,7 +14444,7 @@ mod tests {
                 doc! { "$group": { "_id": "$team", "n": { "$sum": "literal" } } },
             )],
             vec![Bson::Document(
-                doc! { "$group": { "_id": "$team", "n": { "$first": { "$add": [1_i32, 2_i32] } } } },
+                doc! { "$group": { "_id": "$team", "n": { "$first": { "$dateDiff": { "startDate": "$created", "endDate": "$updated", "unit": "day" } } } } },
             )],
         ] {
             let response = aggregate_command(
