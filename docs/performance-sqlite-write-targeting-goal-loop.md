@@ -247,14 +247,17 @@ Acceptance criteria:
 - Milestone status is marked done in this file and committed.
 
 Status 2026-07-04: Done. Single-field unique indexes with present non-null
-scalar values use `index_entries` for conflict lookup while excluding the
-current document on updates. Compound indexes, missing/null values, arrays,
+non-numeric scalar values use `index_entries` for conflict lookup while
+excluding the current document on updates. Numeric values fall back to the Rust
+scan because `index_entries` stores type-tagged values and cannot represent
+cross-type numeric equality. Compound indexes, missing/null values, arrays,
 document values, and multikey shapes retain the scan fallback. Verification
-passed: `cargo fmt -- --check`, `cargo test unique`, `cargo test update`,
-`cargo test find_and_modify`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv
-run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py
+passed for the original uplift: `cargo fmt -- --check`, `cargo test unique`,
+`cargo test update`, `cargo test find_and_modify`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py
 tests/e2e/test_update_operators.py` (unsandboxed), and `cargo test`. Commit:
-`bd50e45`.
+`bd50e45`; numeric fallback fix follows in the adversarial loop.
 
 Likely files:
 

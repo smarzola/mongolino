@@ -2731,13 +2731,7 @@ fn unique_conflict_check_with_index_entries_tx(
 fn is_unique_pushdown_scalar(value: &Bson) -> bool {
     matches!(
         value,
-        Bson::Double(_)
-            | Bson::String(_)
-            | Bson::Boolean(_)
-            | Bson::ObjectId(_)
-            | Bson::Int32(_)
-            | Bson::Int64(_)
-            | Bson::DateTime(_)
+        Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
     )
 }
 
@@ -2764,9 +2758,17 @@ fn unique_key_for_document(
                 ));
             }
         };
-        parts.push(format!("{field}:{}", id_key_from_bson(&value)));
+        parts.push(format!("{field}:{}", unique_key_value(&value)));
     }
     Ok(parts.join("|"))
+}
+
+fn unique_key_value(value: &Bson) -> String {
+    if let Some(number) = numeric_value(value) {
+        let normalized = if number == 0.0 { 0.0 } else { number };
+        return format!("num:{:016x}", normalized.to_bits());
+    }
+    id_key_from_bson(value)
 }
 
 fn rebuild_index_entries_tx(
@@ -8871,6 +8873,106 @@ mod tests {
     }
 
     #[test]
+    fn numeric_unique_conflicts_use_fallback_scan() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "n": 1_i32 },
+                    { "_id": "u2", "n": 2_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "n": 1_i32 }, "name": "n_1", "unique": true }],
+            },
+        )
+        .unwrap();
+
+        let duplicate_insert = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u3", "n": Bson::Int64(1) }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_insert)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let duplicate_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u2" }, "u": { "$set": { "n": 1.0 } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_update)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let duplicate_upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u4" },
+                        "u": { "$set": { "n": Bson::Int64(1) } },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_upsert)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let duplicate_find_and_modify = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u2" },
+                "update": { "$set": { "n": Bson::Int64(1) } },
+            },
+        )
+        .unwrap();
+        assert_command_error(&duplicate_find_and_modify);
+        assert_eq!(duplicate_find_and_modify.get_i32("code").unwrap(), 11000);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u2" } },
+                )
+                .unwrap()
+            )[0]
+            .get_i32("n")
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn unique_conflict_pushdown_uses_index_entries_for_safe_single_field_scalars() {
         let conn = test_conn();
         insert_documents(
@@ -8930,7 +9032,7 @@ mod tests {
             .unwrap()
         );
         assert!(
-            unique_conflict_check_with_index_entries_tx(
+            !unique_conflict_check_with_index_entries_tx(
                 &tx,
                 "app.users",
                 &rank,

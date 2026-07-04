@@ -1,4 +1,5 @@
 import pytest
+from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
@@ -65,6 +66,20 @@ def test_find_one_and_replace_preserves_id_and_duplicate_unique_conflicts(collec
         )
 
     assert collection.find_one({"_id": "j2"})["email"] == "b@example.test"
+
+
+def test_find_one_and_update_rejects_numeric_unique_conflict(collection):
+    collection.insert_many([{"_id": "n1", "n": 1}, {"_id": "n2", "n": 2}])
+    collection.create_index([("n", ASCENDING)], name="n_1", unique=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.find_one_and_update(
+            {"_id": "n2"},
+            {"$set": {"n": Int64(1)}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    assert collection.find_one({"_id": "n2"})["n"] == 2
 
 
 def test_find_one_and_delete_removes_and_returns_sorted_document(collection):

@@ -75,3 +75,12 @@ Report:
 - tests added;
 - verification commands and outcomes;
 - any remaining unique/index limitations.
+
+## Status
+
+Status 2026-07-04: Implemented. Numeric BSON values no longer use the
+type-tagged `index_entries` unique-conflict shortcut. The Rust unique fallback
+now canonicalizes numeric key parts through the same numeric comparison domain
+used by the matcher, so `Int32(1)`, `Int64(1)`, and `Double(1.0)` conflict
+during insert, update, upsert, and findAndModify checks. Non-numeric scalar
+unique pushdown remains enabled.

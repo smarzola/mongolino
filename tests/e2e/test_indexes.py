@@ -1,4 +1,5 @@
 import pytest
+from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
@@ -105,6 +106,22 @@ def test_unique_index_enforces_insert_update_and_upsert(collection):
             {"$set": {"email": "ada@example.test"}},
             upsert=True,
         )
+    assert collection.find_one({"_id": "u4"}) is None
+
+
+def test_numeric_unique_index_conflicts_across_bson_number_types(collection):
+    collection.insert_many([{"_id": "u1", "n": 1}, {"_id": "u2", "n": 2}])
+    collection.create_index([("n", ASCENDING)], name="n_1", unique=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u3", "n": Int64(1)})
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u2"}, {"$set": {"n": 1.0}})
+    assert collection.find_one({"_id": "u2"})["n"] == 2
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u4"}, {"$set": {"n": Int64(1)}}, upsert=True)
     assert collection.find_one({"_id": "u4"}) is None
 
 

@@ -150,9 +150,10 @@ Current behavior has these SQLite-backed fast paths:
 - update, delete, and findAndModify target selection use transaction-local
   candidates for exact `_id` equality and safe indexed scalar equality, then
   still validate every candidate with the Rust matcher before mutating.
-- single-field unique indexes with present non-null scalar values use
-  maintained `index_entries` for duplicate checks; unsupported unique shapes
-  keep the previous scan fallback.
+- single-field unique indexes with present non-null non-numeric scalar values
+  use maintained `index_entries` for duplicate checks; numeric values fall back
+  to the Rust scan so `Int32`, `Int64`, and `Double` equality semantics remain
+  consistent.
 
 The remaining slow local results cluster around full namespace decode:
 
@@ -166,8 +167,8 @@ The remaining slow local results cluster around full namespace decode:
   then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
 - write filters outside the conservative planner, including logical operators,
   multi-predicate filters, unindexed fields, arrays, null/missing semantics,
-  and compound/multikey unique shapes, still use the Rust matcher and scan
-  fallback.
+  numeric unique values, and compound/multikey unique shapes, still use the
+  Rust matcher and scan fallback.
 
 Expect variance between local machines and GitHub-hosted runners. The CI budget
 therefore uses intentionally coarse latency and throughput thresholds. Use JSON
@@ -261,13 +262,15 @@ as a compatibility fallback.
    equality through `(namespace, id_key)` and safe indexed scalar equality
    through `index_entries`. update, delete, and findAndModify still run the
    Rust matcher against narrowed candidates before mutation, and findAndModify
-   sorting remains Rust-side. Safe single-field scalar unique checks use
-   `index_entries` while excluding the current document during updates.
+   sorting remains Rust-side. Safe single-field non-numeric scalar unique
+   checks use `index_entries` while excluding the current document during
+   updates; numeric unique checks fall back because `index_entries` stores
+   type-tagged values.
 
    Fallbacks: logical operators, range operators, `$in`/`$nin`/`$ne`, arrays,
    multi-predicate filters, unindexed fields, null/missing unique semantics,
-   document values, compound indexes, and multikey unique shapes continue
-   through the Rust scan fallback.
+   numeric unique values, document values, compound indexes, and multikey
+   unique shapes continue through the Rust scan fallback.
 
    Measurement: local `update_index_refresh` improved from 30.707 to
    1.147 ms/op.

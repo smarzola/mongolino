@@ -454,6 +454,18 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
             upsert=True,
         )
 
+    numeric = mongo_client["update_operator_numeric_unique"].users
+    numeric.create_index([("n", ASCENDING)], unique=True)
+    numeric.insert_many([{"_id": "n1", "n": 1}, {"_id": "n2", "n": 2}])
+    with pytest.raises(DuplicateKeyError):
+        numeric.update_one({"_id": "n2"}, {"$mul": {"n": 0.5}})
+    with pytest.raises(DuplicateKeyError):
+        numeric.update_one(
+            {"_id": "n3"},
+            {"$setOnInsert": {"n": Int64(1)}},
+            upsert=True,
+        )
+
     indexed = mongo_client["update_operator_index_freshness"].users
     indexed.insert_one({"_id": "u1", "profile": {"city": "Rome"}, "score": 4})
     indexed.create_index([("city", ASCENDING)])
