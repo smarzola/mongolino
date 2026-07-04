@@ -81,6 +81,49 @@ def test_find_one_and_delete_removes_and_returns_sorted_document(collection):
     assert collection.find_one({"_id": "j2"}) is not None
 
 
+def test_find_and_modify_targets_id_indexed_scalar_and_fallback_filters(collection):
+    seed_jobs(collection)
+    collection.create_index([("email", ASCENDING)], name="email_1")
+    collection.create_index([("state", ASCENDING)], name="state_1")
+
+    by_id = collection.find_one_and_update(
+        {"_id": {"$eq": "j1"}},
+        {"$set": {"state": "running"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert by_id["_id"] == "j1"
+    assert by_id["state"] == "running"
+
+    by_index = collection.find_one_and_update(
+        {"email": "b@example.test"},
+        {"$set": {"email": "b2@example.test"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert by_index["_id"] == "j2"
+    assert by_index["email"] == "b2@example.test"
+    assert collection.find_one({"email": "b@example.test"}) is None
+
+    replaced = collection.find_one_and_replace(
+        {"email": "b2@example.test"},
+        {"owner": "b2", "priority": 7, "state": "queued", "email": "b3@example.test"},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert replaced["_id"] == "j2"
+    assert replaced["email"] == "b3@example.test"
+
+    removed = collection.find_one_and_delete({"state": "done"})
+    assert removed["_id"] == "j3"
+    assert collection.find_one({"_id": "j3"}) is None
+
+    fallback = collection.find_one_and_update(
+        {"$or": [{"owner": "missing"}, {"owner": "b2"}]},
+        {"$set": {"state": "fallback"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert fallback["_id"] == "j2"
+    assert fallback["state"] == "fallback"
+
+
 def test_find_one_and_update_upsert_returns_inserted_document(collection):
     result = collection.find_one_and_update(
         {"_id": "counter", "kind": "local"},

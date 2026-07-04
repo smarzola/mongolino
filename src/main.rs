@@ -1935,7 +1935,7 @@ fn find_and_modify_target_tx(
     sort: Option<&[(String, i32)]>,
 ) -> Result<std::result::Result<Option<StoredDocument>, Document>> {
     let mut matches = Vec::new();
-    for stored in stored_documents_for_namespace_tx(tx, namespace)? {
+    for stored in transaction_candidate_documents(tx, namespace, query)? {
         match matches_filter(&stored.document, query) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}

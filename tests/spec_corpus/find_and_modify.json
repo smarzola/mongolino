@@ -31,6 +31,16 @@
       }
     },
     {
+      "name": "create_index",
+      "keys": {
+        "state": 1
+      },
+      "index_name": "state_1",
+      "expect_result": {
+        "name": "state_1"
+      }
+    },
+    {
       "name": "find_one_and_update",
       "filter": {
         "state": "queued"
@@ -81,6 +91,25 @@
       }
     },
     {
+      "name": "find_one_and_update",
+      "filter": {
+        "email": "ada2@example.test"
+      },
+      "update": {
+        "$set": {
+          "state": "indexed-email"
+        }
+      },
+      "return_document": "after",
+      "expect_result": {
+        "_id": "u1",
+        "email": "ada2@example.test",
+        "name": "Ada Lovelace",
+        "score": 5,
+        "state": "indexed-email"
+      }
+    },
+    {
       "name": "find_one_and_delete",
       "filter": {
         "state": "running"
@@ -114,6 +143,31 @@
         "_id": "u3",
         "email": "new@example.test",
         "name": "New",
+        "score": 1
+      }
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "$or": [
+          {
+            "name": "Nobody"
+          },
+          {
+            "email": "new@example.test"
+          }
+        ]
+      },
+      "update": {
+        "$set": {
+          "name": "Fallback New"
+        }
+      },
+      "return_document": "after",
+      "expect_result": {
+        "_id": "u3",
+        "email": "new@example.test",
+        "name": "Fallback New",
         "score": 1
       }
     },
@@ -158,12 +212,12 @@
       "email": "ada2@example.test",
       "name": "Ada Lovelace",
       "score": 5,
-      "state": "queued"
+      "state": "indexed-email"
     },
     {
       "_id": "u3",
       "email": "new@example.test",
-      "name": "New",
+      "name": "Fallback New",
       "score": 1
     }
   ]

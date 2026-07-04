@@ -95,7 +95,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Transaction candidate planner
 - [x] Milestone 1: Update/delete target narrowing
-- [ ] Milestone 2: findAndModify target narrowing
+- [x] Milestone 2: findAndModify target narrowing
 - [ ] Milestone 3: Unique conflict check pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
@@ -166,7 +166,7 @@ passed: `cargo fmt -- --check`, `cargo test update`, `cargo test delete`,
 --locked pytest tests/e2e/test_crud.py tests/e2e/test_indexes.py`
 (unsandboxed after sandbox localhost bind denial), `cargo test`, and extra
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
-tests/e2e/test_spec_corpus.py`. Commit: pending.
+tests/e2e/test_spec_corpus.py`. Commit: `05ed6dc`.
 
 Likely files:
 
@@ -202,6 +202,16 @@ Acceptance criteria:
 - Pre-image/post-image, projection, upsert, delete, duplicate-key, validation, and index-entry freshness behavior do not regress.
 - Add focused tests for `_id` and indexed scalar findAndModify update/delete/replace where practical.
 - Milestone status is marked done in this file and committed.
+
+Status 2026-07-04: Done. `find_and_modify_target_tx` now narrows safe
+transaction candidates before Rust matcher validation and existing Rust-side
+sort. Added PyMongo and spec corpus coverage for `_id`, indexed scalar
+update/delete/replace, and fallback findAndModify filters. Verification passed:
+`cargo fmt -- --check`, `cargo test find_and_modify`, `cargo test planner`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_find_and_modify.py` (unsandboxed after sandbox localhost bind
+denial), `cargo test`, and extra `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+uv run --locked pytest tests/e2e/test_spec_corpus.py`. Commit: pending.
 
 Likely files:
 
