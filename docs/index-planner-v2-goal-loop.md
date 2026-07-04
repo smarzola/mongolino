@@ -215,8 +215,7 @@ cargo test index
 Status 2026-07-04: Added planner v2 plan/diagnostic types plus conservative
 exact, equality-prefix, range, unsupported-operator, and membership fallback
 classification tests. Verification passed with `cargo fmt -- --check`,
-`cargo test planner`, and `cargo test index`. Commit: reported in goal-loop
-status after commit creation.
+`cargo test planner`, and `cargo test index`. Commit: `1976798`.
 
 ## Milestone 1: Equality-Prefix Candidate Narrowing
 
@@ -278,7 +277,7 @@ Verification passed with `cargo fmt -- --check`, `cargo test planner`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
 tests/e2e/test_indexes.py tests/e2e/test_crud.py
 tests/e2e/test_find_and_modify.py` after the sandboxed e2e run failed to bind
-localhost. Commit: reported in goal-loop status after commit creation.
+localhost. Commit: `cb3353a`.
 
 ## Milestone 2: Safe Range Scans And Count Pushdown
 
@@ -340,7 +339,7 @@ range`, `cargo test planner`, `cargo test count`, `cargo build`, and
 unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
 pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py
 tests/e2e/test_spec_corpus.py` after the sandboxed e2e run failed to bind
-localhost. Commit: reported in goal-loop status after commit creation.
+localhost. Commit: `aec12a1`.
 
 ## Milestone 3: Hint Command Semantics
 
@@ -400,8 +399,7 @@ bad write hints rejected before mutation. Verification passed with `cargo fmt
 unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
 pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py
 tests/e2e/test_find_and_modify.py` after the sandboxed e2e path had previously
-failed to bind localhost. Commit: reported in goal-loop status after commit
-creation.
+failed to bind localhost. Commit: `0d62d75`.
 
 ## Milestone 4: Explain Diagnostics
 
@@ -461,8 +459,7 @@ explicitly unsupported. Verification passed with `cargo fmt -- --check`,
 `cargo test explain`, `cargo test planner`, `cargo build`, and unsandboxed
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
 tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py` because the sandboxed
-e2e path cannot bind localhost. Commit: reported in goal-loop status after
-commit creation.
+e2e path cannot bind localhost. Commit: `2737d37`.
 
 ## Milestone 5: Sort-Aware Read Planning
 
@@ -519,7 +516,7 @@ Verification passed with `cargo fmt -- --check`, `cargo test sort`, `cargo test
 planner`, `cargo build`, and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
 uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py
 tests/e2e/test_spec_corpus.py` because the sandboxed e2e path cannot bind
-localhost. Commit: reported in goal-loop status after commit creation.
+localhost. Commit: `7e4b248`.
 
 ## Milestone 6: Benchmarks, Docs, And Final Verification
 
@@ -582,7 +579,19 @@ test`, `cargo build`, `cargo run --bin mongolino-bench -- --profile smoke
 --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
 --dev`, and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
 --locked pytest tests/e2e` because the sandboxed e2e path cannot bind
-localhost. Commit: reported in goal-loop status after commit creation.
+localhost. Commit: `9ed5de1`.
+
+Parent review 2026-07-04: No blocking semantic issues found. Re-ran
+adversarial review over candidate narrowing, range-key encoding, hint behavior,
+explain behavior, sort pushdown, and no-mutation error paths. Additional
+verification passed with `cargo fmt -- --check`, `cargo test planner`, `cargo
+test range`, `cargo test hint`, `cargo test explain`, `cargo test sort`,
+`cargo test`, `cargo build`, `cargo run --bin mongolino-bench -- --profile ci
+--check-budget`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock
+--check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
+--dev`, and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+--locked pytest tests/e2e`, which passed with 181 tests. Parent review commit:
+pending.
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
