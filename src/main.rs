@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -2229,7 +2229,7 @@ fn sql_count_index_entries(
     key_value: &str,
 ) -> Result<i64> {
     Ok(conn.query_row(
-        "SELECT COUNT(*) FROM index_entries WHERE namespace = ?1 AND index_name = ?2 AND key_value = ?3",
+        "SELECT COUNT(DISTINCT id_key) FROM index_entries WHERE namespace = ?1 AND index_name = ?2 AND key_value = ?3",
         params![namespace, index_name, key_value],
         |row| row.get(0),
     )?)
@@ -2998,7 +2998,7 @@ fn document_belongs_to_index(
         && spec
             .key
             .keys()
-            .any(|field| get_document_path(document, field).is_none())
+            .any(|field| values_at_path(document, field).is_empty())
     {
         return Ok(false);
     }
@@ -3124,20 +3124,27 @@ fn insert_index_entry_for_document_tx(
             params![namespace, spec.name, id_key],
         )?;
     }
-    let Some(key_value) = planner_key_for_document(spec, document) else {
-        return Ok(());
-    };
-    tx.execute(
-        "INSERT OR IGNORE INTO index_entries(namespace, index_name, key_value, id_key) VALUES (?1, ?2, ?3, ?4)",
-        params![namespace, spec.name, key_value, id_key],
-    )?;
+    for key_value in planner_keys_for_document(spec, document) {
+        tx.execute(
+            "INSERT OR IGNORE INTO index_entries(namespace, index_name, key_value, id_key) VALUES (?1, ?2, ?3, ?4)",
+            params![namespace, spec.name, key_value, id_key],
+        )?;
+    }
     Ok(())
 }
 
 fn index_has_multikey_omission(spec: &IndexSpec, document: &Document) -> bool {
-    spec.key
-        .keys()
-        .any(|field| indexed_path_contains_array(document, field))
+    if is_compound_index(spec) {
+        return spec
+            .key
+            .keys()
+            .any(|field| indexed_path_contains_array(document, field));
+    }
+    let Some(field) = single_field_index_name(spec) else {
+        return false;
+    };
+    indexed_path_contains_array(document, field)
+        && supported_single_field_multikey_values(document, field).is_none()
 }
 
 fn indexed_path_contains_array(document: &Document, path: &str) -> bool {
@@ -3186,14 +3193,46 @@ fn index_entries_safe_for_planner_tx(
 }
 
 fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
+    planner_keys_for_document(spec, document).into_iter().next()
+}
+
+fn planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<String> {
     if let Some(field) = single_field_index_name(spec) {
-        let value = get_document_path(document, field)?;
-        if matches!(value, Bson::Array(_)) {
-            return None;
+        if indexed_path_contains_array(document, field) {
+            return supported_single_field_multikey_values(document, field)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| id_key_from_bson(&value))
+                .collect();
         }
-        return Some(id_key_from_bson(value));
+        return get_document_path(document, field)
+            .map(|value| vec![id_key_from_bson(value)])
+            .unwrap_or_default();
     }
     compound_key_from_document(spec, document, is_compound_planner_scalar)
+        .into_iter()
+        .collect()
+}
+
+fn supported_single_field_multikey_values(document: &Document, field: &str) -> Option<Vec<Bson>> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for value in values_at_path(document, field) {
+        let candidates: Vec<&Bson> = match value {
+            Bson::Array(items) => items.iter().collect(),
+            value => vec![value],
+        };
+        for candidate in candidates {
+            if !is_multikey_planner_scalar(candidate) {
+                return None;
+            }
+            let key = id_key_from_bson(candidate);
+            if seen.insert(key) {
+                values.push(candidate.clone());
+            }
+        }
+    }
+    Some(values)
 }
 
 fn single_field_index_name(spec: &IndexSpec) -> Option<&str> {
@@ -3369,6 +3408,13 @@ fn exact_equality_filter_part<'a>(filter: &'a Document, field: &str) -> Option<&
 }
 
 fn is_compound_planner_scalar(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
+    )
+}
+
+fn is_multikey_planner_scalar(value: &Bson) -> bool {
     matches!(
         value,
         Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
@@ -4381,7 +4427,7 @@ fn indexed_candidate_documents_tx(
 ) -> Result<Vec<StoredDocument>> {
     let mut stmt = tx.prepare(
         r#"
-        SELECT d.id_key, d.bson
+        SELECT DISTINCT d.id_key, d.bson, d.created_at
           FROM index_entries e
           JOIN documents d
             ON d.namespace = e.namespace
@@ -5979,7 +6025,7 @@ fn indexed_candidate_documents_by_key(
 ) -> Result<Option<Vec<Document>>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT d.bson
+        SELECT DISTINCT d.id_key, d.bson, d.created_at
           FROM index_entries e
           JOIN documents d
             ON d.namespace = e.namespace
@@ -5992,7 +6038,7 @@ fn indexed_candidate_documents_by_key(
     )?;
     let documents = stmt
         .query_map(params![namespace, index_name, key_value], |row| {
-            row.get::<_, Vec<u8>>(0)
+            row.get::<_, Vec<u8>>(1)
         })?
         .map(|row| decode_document(row?))
         .collect::<Result<Vec<_>>>()?;
@@ -7219,7 +7265,7 @@ mod tests {
         let conn = test_conn();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "name": "Ada", "tags": ["math"] }] },
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "name": "Ada", "tags": ["math"], "scores": [1_i32] }] },
         )
         .unwrap();
         create_indexes(
@@ -7230,6 +7276,7 @@ mod tests {
                 "indexes": [
                     { "key": { "name": 1_i32 }, "name": "name_1" },
                     { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                    { "key": { "scores": 1_i32 }, "name": "scores_1" },
                 ],
             },
         )
@@ -7241,7 +7288,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries_before_drop, 1);
+        assert_eq!(entries_before_drop, 2);
         let omissions_before_drop: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
@@ -9545,7 +9592,7 @@ mod tests {
             &doc! {
                 "insert": "users",
                 "$db": "app",
-                "documents": [{ "_id": "u1", "tags": ["math"] }],
+                "documents": [{ "_id": "u1", "scores": [1_i32] }],
             },
         )
         .unwrap();
@@ -9554,7 +9601,7 @@ mod tests {
             &doc! {
                 "createIndexes": "users",
                 "$db": "app",
-                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+                "indexes": [{ "key": { "scores": 1_i32 }, "name": "scores_1" }],
             },
         )
         .unwrap();
@@ -10616,7 +10663,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_falls_back_when_single_field_index_omits_array_values() {
+    fn planner_uses_single_field_multikey_entries_for_scalar_arrays() {
         let conn = test_conn();
         seed_find_documents(&conn);
         create_indexes(
@@ -10632,17 +10679,25 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!index_entries_safe_for_planner(&conn, "app.users", "tags_1").unwrap());
-        assert!(!index_entries_safe_for_planner(&conn, "app.users", "nested_kind_1").unwrap());
-        assert!(
+        assert!(index_entries_safe_for_planner(&conn, "app.users", "tags_1").unwrap());
+        assert!(index_entries_safe_for_planner(&conn, "app.users", "nested_kind_1").unwrap());
+        assert_eq!(
             indexed_candidate_documents(&conn, "app.users", &doc! { "tags": "math" })
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1"]
         );
-        assert!(
+        assert_eq!(
             indexed_candidate_documents(&conn, "app.users", &doc! { "nested.kind": "second" })
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1"]
         );
         assert_eq!(find_ids(&conn, doc! { "tags": "math" }), vec!["u1"]);
         assert_eq!(
@@ -10651,6 +10706,56 @@ mod tests {
         );
         assert_eq!(
             plan_count(&conn, "app.users", &doc! { "tags": "math" }).unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "tags_1".to_string(),
+                key_value: "str:math".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn multikey_entries_deduplicate_repeated_array_values_and_reject_numeric_arrays() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "tags": ["math", "math", "logic"], "scores": [1_i32, 2_i32] },
+                    { "_id": "u2", "tags": "math", "scores": 1_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                    { "key": { "scores": 1_i32 }, "name": "scores_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let math_entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'tags_1' AND key_value = 'str:math'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(math_entries, 2);
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! { "tags": "math" }, 0, None).unwrap(),
+            Some(2)
+        );
+        assert!(!index_entries_safe_for_planner(&conn, "app.users", "scores_1").unwrap());
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "scores": 1_i32 }).unwrap(),
             CountPlan::Fallback
         );
     }
@@ -10867,7 +10972,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_reuses_index_after_last_array_omission_is_removed() {
+    fn planner_keeps_multikey_index_usable_after_array_is_replaced() {
         let conn = test_conn();
         insert_documents(
             &conn,
@@ -10890,10 +10995,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
+        assert!(index_entries_safe_for_planner(&conn, "app.users", "tag_1").unwrap());
+        assert_eq!(
             indexed_candidate_documents(&conn, "app.users", &doc! { "tag": "math" })
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u2"]
         );
 
         update_documents(

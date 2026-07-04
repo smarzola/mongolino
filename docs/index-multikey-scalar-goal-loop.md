@@ -142,7 +142,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Multikey entry model and deduplication
+- [x] Milestone 0: Multikey entry model and deduplication
 - [ ] Milestone 1: Entry maintenance and mutation freshness
 - [ ] Milestone 2: Read/count/write planner pushdown
 - [ ] Milestone 3: Unique and unsupported multikey semantics
@@ -180,6 +180,12 @@ cargo fmt -- --check
 cargo test planner
 cargo test index
 ```
+
+Status 2026-07-04: implemented distinct supported scalar multikey entry
+generation for single-field indexes, dotted array leaf extraction, distinct SQL
+candidate/count lookups, and numeric-array fallback sentinels. Verified with
+`cargo fmt -- --check`, `cargo test planner`, and `cargo test index`. Commit:
+pending.
 
 ## Milestone 1: Entry Maintenance And Mutation Freshness
 
