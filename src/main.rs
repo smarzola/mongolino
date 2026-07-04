@@ -9894,6 +9894,117 @@ mod tests {
     }
 
     #[test]
+    fn partial_unique_index_enforces_only_matching_members() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "same@example.test", "active": false },
+                    { "_id": "u2", "email": "same@example.test" },
+                    { "_id": "u3", "email": "same@example.test", "active": true },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{
+                    "key": { "email": 1_i32 },
+                    "name": "email_active_partial",
+                    "unique": true,
+                    "partialFilterExpression": { "active": true },
+                }],
+            },
+        )
+        .unwrap();
+
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'email_active_partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries, 1);
+
+        let inactive = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u4", "email": "same@example.test", "active": false }],
+            },
+        )
+        .unwrap();
+        assert!(!inactive.contains_key("writeErrors"));
+        let duplicate_active = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u5", "email": "same@example.test", "active": true }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_active)[0].get_i32("code").unwrap(),
+            11000
+        );
+    }
+
+    #[test]
+    fn partial_filter_membership_supports_eq_exists_and_and() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "a@example.test", "active": true, "handle": "ada" },
+                    { "_id": "u2", "email": "b@example.test", "active": true },
+                    { "_id": "u3", "email": "c@example.test", "active": false, "handle": "grace" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{
+                    "key": { "email": 1_i32 },
+                    "name": "email_active_handle_partial",
+                    "unique": true,
+                    "partialFilterExpression": {
+                        "$and": [
+                            { "active": { "$eq": true } },
+                            { "handle": { "$exists": true } },
+                        ],
+                    },
+                }],
+            },
+        )
+        .unwrap();
+
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'email_active_handle_partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
     fn numeric_unique_conflicts_use_fallback_scan() {
         let conn = test_conn();
         insert_documents(

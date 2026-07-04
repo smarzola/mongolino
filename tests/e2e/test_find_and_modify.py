@@ -113,6 +113,43 @@ def test_find_and_modify_refreshes_sparse_unique_membership(collection):
     assert "email" not in removed
 
 
+def test_find_and_modify_preserves_partial_unique_membership(collection):
+    collection.insert_many(
+        [
+            {"_id": "j1", "email": "same@example.test", "active": True},
+            {"_id": "j2", "email": "same@example.test", "active": False},
+        ]
+    )
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_partial",
+        unique=True,
+        partialFilterExpression={"active": True},
+    )
+
+    with pytest.raises(DuplicateKeyError):
+        collection.find_one_and_update(
+            {"_id": "j2"},
+            {"$set": {"active": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+    assert collection.find_one({"_id": "j2"})["active"] is False
+
+    updated = collection.find_one_and_update(
+        {"_id": "j2"},
+        {"$set": {"email": "other@example.test", "active": True}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["active"] is True
+
+    removed = collection.find_one_and_update(
+        {"_id": "j2"},
+        {"$set": {"active": False}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert removed["active"] is False
+
+
 def test_find_one_and_delete_removes_and_returns_sorted_document(collection):
     seed_jobs(collection)
 

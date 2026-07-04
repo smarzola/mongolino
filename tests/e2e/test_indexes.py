@@ -304,6 +304,47 @@ def test_unique_compound_sparse_requires_all_fields(collection, mongolino_server
         collection.insert_one({"_id": "u7", "email": "ada@example.test", "role": "admin"})
 
 
+def test_unique_partial_index_membership_and_supported_predicates(collection, mongolino_server):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test", "active": False},
+            {"_id": "u2", "email": "same@example.test"},
+            {"_id": "u3", "email": "same@example.test", "active": True},
+            {"_id": "u4", "email": "other@example.test", "active": True, "handle": "other"},
+        ]
+    )
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_partial",
+        unique=True,
+        partialFilterExpression={"active": True},
+    )
+    collection.create_index(
+        [("handle", ASCENDING)],
+        name="handle_active_partial",
+        unique=True,
+        partialFilterExpression={
+            "$and": [{"active": {"$eq": True}}, {"handle": {"$exists": True}}]
+        },
+    )
+
+    namespace = f"{collection.database.name}.{collection.name}"
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 2
+    assert index_entry_count(mongolino_server.db_path, namespace, "handle_active_partial") == 1
+
+    collection.insert_one({"_id": "u5", "email": "same@example.test", "active": False})
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u6", "email": "same@example.test", "active": True})
+
+    collection.update_one({"_id": "u5"}, {"$set": {"email": "new@example.test", "active": True}})
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 3
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u2"}, {"$set": {"active": True}})
+
+    collection.update_one({"_id": "u5"}, {"$set": {"active": False}})
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 2
+
+
 def test_unique_unordered_bulk_partial_success_and_drop_index(collection):
     collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
 

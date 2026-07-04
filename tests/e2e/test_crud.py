@@ -265,6 +265,42 @@ def test_update_targets_compound_indexed_filters(collection):
     assert fallback_numeric.matched_count == 0
 
 
+def test_update_preserves_partial_unique_membership(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test", "active": True},
+            {"_id": "u2", "email": "same@example.test", "active": False},
+            {"_id": "u3", "email": "other@example.test", "active": False},
+        ]
+    )
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_partial",
+        unique=True,
+        partialFilterExpression={"active": True},
+    )
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u2"}, {"$set": {"active": True}})
+    assert collection.find_one({"_id": "u2"})["active"] is False
+
+    collection.update_one({"_id": "u2"}, {"$set": {"email": "unique@example.test", "active": True}})
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one(
+            {"_id": "u4"},
+            {"$set": {"email": "unique@example.test", "active": True}},
+            upsert=True,
+        )
+
+    collection.update_one({"_id": "u2"}, {"$set": {"active": False}})
+    collection.update_one(
+        {"_id": "u4"},
+        {"$set": {"email": "unique@example.test", "active": True}},
+        upsert=True,
+    )
+    assert collection.find_one({"_id": "u4"})["active"] is True
+
+
 def test_update_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
     collection.insert_many(
         [

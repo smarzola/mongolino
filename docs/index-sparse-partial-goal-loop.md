@@ -146,7 +146,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Metadata model and parser
 - [x] Milestone 1: Sparse membership and unique semantics
-- [ ] Milestone 2: Partial filter subset and unique semantics
+- [x] Milestone 2: Partial filter subset and unique semantics
 - [ ] Milestone 3: Planner-safe sparse/partial pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
@@ -281,6 +281,13 @@ cargo test unique
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py tests/e2e/test_find_and_modify.py
 cargo test
 ```
+
+Status 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test partial`,
+`cargo test unique`, `cargo test`, `cargo build`, and
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_indexes.py tests/e2e/test_crud.py
+tests/e2e/test_find_and_modify.py` (unsandboxed for localhost bind). Commit:
+this milestone commit.
 
 ## Milestone 3: Planner-Safe Sparse/Partial Pushdown
 
