@@ -297,7 +297,7 @@ Verification passed: `cargo fmt -- --check`, `cargo test`, `cargo build`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
-tests/e2e` (unsandboxed). Commit: pending.
+tests/e2e` (unsandboxed). Commit: `dc0e916`.
 
 Verification:
 
