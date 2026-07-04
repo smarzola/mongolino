@@ -591,7 +591,7 @@ test range`, `cargo test hint`, `cargo test explain`, `cargo test sort`,
 --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
 --dev`, and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
 --locked pytest tests/e2e`, which passed with 181 tests. Parent review commit:
-pending.
+`a40ea8e`.
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
