@@ -102,13 +102,15 @@ When a milestone is complete:
 
 - [x] Milestone 0: Update modifier architecture and path validation
 - [x] Milestone 1: Scalar modifiers and upsert-only behavior
-- [ ] Milestone 2: Array modifiers
+- [x] Milestone 2: Array modifiers
 - [ ] Milestone 3: Invariant hardening across validation, indexes, and findAndModify
 - [ ] Milestone 4: PyMongo/spec corpus, README, and final verification
 
 Milestone 0 status, 2026-07-04: refactored modifier parsing into structured storage and centralized update path validation while keeping existing `$set`, `$unset`, and `$inc` behavior unchanged. Verification passed: `cargo fmt -- --check`; `cargo test update`; `cargo test find_and_modify`; `cargo test validation`; `cargo test`; `cargo build`. Commit hash reported after commit creation.
 
 Milestone 1 status, 2026-07-04: implemented `$rename`, `$min`, `$max`, `$mul`, and `$setOnInsert` through shared `update` and `findAndModify` update application, with Rust and PyMongo coverage plus scalar spec-corpus cases. Verification passed: `cargo fmt -- --check`; `cargo test update`; `cargo test find_and_modify`; `cargo test validation`; `cargo test`. Verification blocked by sandbox localhost permissions: `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py` failed during fixture setup with `PermissionError: [Errno 1] Operation not permitted` on `sock.bind(("127.0.0.1", 0))`. Commit hash reported after commit creation.
+
+Milestone 2 status, 2026-07-04: implemented `$push` with scalar and `$each`, `$addToSet` with scalar and `$each`, `$pop`, `$pull` equality plus existing matcher predicates, and `$pullAll`, while keeping `$position`, `$slice`, `$sort`, positional paths, scalar parents, and malformed operands as explicit write errors. Verification passed: `cargo fmt -- --check`; `cargo test update`; `cargo test`. Verification blocked by sandbox localhost permissions: `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py` failed during fixture setup with `PermissionError: [Errno 1] Operation not permitted` on `sock.bind(("127.0.0.1", 0))`. Commit hash reported after commit creation.
 
 ## Milestone 0: Update Modifier Architecture and Path Validation
 

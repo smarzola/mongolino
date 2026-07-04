@@ -1,0 +1,219 @@
+{
+  "name": "update array operators",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "active": true,
+      "tags": [
+        "math"
+      ],
+      "batch": [],
+      "unique": [
+        "math"
+      ],
+      "numbers": [
+        1,
+        2,
+        3
+      ],
+      "scores": [
+        1,
+        3,
+        5
+      ],
+      "docs": [
+        {
+          "kind": "a"
+        },
+        {
+          "kind": "b"
+        }
+      ],
+      "letters": [
+        "x",
+        "y",
+        "z"
+      ]
+    },
+    {
+      "_id": "u2",
+      "active": true
+    }
+  ],
+  "operations": [
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$push": {
+          "tags": "logic",
+          "batch": {
+            "$each": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        "$addToSet": {
+          "unique": {
+            "$each": [
+              "math",
+              "logic"
+            ]
+          }
+        },
+        "$pop": {
+          "numbers": 1
+        },
+        "$pull": {
+          "scores": {
+            "$gte": 3
+          },
+          "docs": {
+            "kind": "a"
+          }
+        },
+        "$pullAll": {
+          "letters": [
+            "x",
+            "z"
+          ]
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_many",
+      "filter": {
+        "active": true
+      },
+      "update": {
+        "$push": {
+          "events": "seen"
+        }
+      },
+      "expect_result": {
+        "matched_count": 2,
+        "modified_count": 2
+      }
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$pullAll": {
+          "events": [
+            "missing"
+          ]
+        }
+      },
+      "return_document": "after",
+      "expect_documents": {
+        "_id": "u1",
+        "active": true,
+        "tags": [
+          "math",
+          "logic"
+        ],
+        "batch": [
+          "a",
+          "b"
+        ],
+        "unique": [
+          "math",
+          "logic"
+        ],
+        "numbers": [
+          1,
+          2
+        ],
+        "scores": [
+          1
+        ],
+        "docs": [
+          {
+            "kind": "b"
+          }
+        ],
+        "letters": [
+          "y"
+        ],
+        "events": [
+          "seen"
+        ]
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$push": {
+          "tags": {
+            "$each": [
+              "x"
+            ],
+            "$sort": 1
+          }
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "$push option $sort is not supported"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "active": true,
+      "tags": [
+        "math",
+        "logic"
+      ],
+      "batch": [
+        "a",
+        "b"
+      ],
+      "unique": [
+        "math",
+        "logic"
+      ],
+      "numbers": [
+        1,
+        2
+      ],
+      "scores": [
+        1
+      ],
+      "docs": [
+        {
+          "kind": "b"
+        }
+      ],
+      "letters": [
+        "y"
+      ],
+      "events": [
+        "seen"
+      ]
+    },
+    {
+      "_id": "u2",
+      "active": true,
+      "events": [
+        "seen"
+      ]
+    }
+  ]
+}

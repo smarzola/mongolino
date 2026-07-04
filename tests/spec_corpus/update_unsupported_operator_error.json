@@ -1,5 +1,5 @@
 {
-  "name": "update unsupported operator failure",
+  "name": "update unsupported push option failure",
   "source": "crud",
   "status": "supported",
   "setup": [
@@ -16,12 +16,17 @@
       },
       "update": {
         "$push": {
-          "tags": "new"
+          "tags": {
+            "$each": [
+              "new"
+            ],
+            "$position": 0
+          }
         }
       },
       "expect_error": {
         "type": "WriteError",
-        "contains": "unsupported update operator $push"
+        "contains": "$push option $position is not supported"
       }
     }
   ],

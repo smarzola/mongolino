@@ -15,13 +15,16 @@ def test_unsupported_query_operator_is_explicit_error(collection):
     assert "unsupported query operator $regex" in str(excinfo.value)
 
 
-def test_unsupported_update_operator_is_write_error(collection):
+def test_unsupported_push_option_is_write_error(collection):
     collection.insert_one({"_id": "u1", "tags": []})
 
     with pytest.raises(WriteError) as excinfo:
-        collection.update_one({"_id": "u1"}, {"$push": {"tags": "new"}})
+        collection.update_one(
+            {"_id": "u1"},
+            {"$push": {"tags": {"$each": ["new"], "$position": 0}}},
+        )
 
-    assert "unsupported update operator $push" in str(excinfo.value)
+    assert "$push option $position is not supported" in str(excinfo.value)
     assert collection.find_one({"_id": "u1"}) == {"_id": "u1", "tags": []}
 
 

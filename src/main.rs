@@ -3026,6 +3026,26 @@ fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String>
                 append_update_paths(operator, operand, &mut paths)?;
                 modifiers.set_on_insert = operand.clone();
             }
+            "$push" => {
+                append_push_paths(operator, operand, &mut paths)?;
+                modifiers.push = operand.clone();
+            }
+            "$addToSet" => {
+                append_add_to_set_paths(operator, operand, &mut paths)?;
+                modifiers.add_to_set = operand.clone();
+            }
+            "$pop" => {
+                append_pop_paths(operator, operand, &mut paths)?;
+                modifiers.pop = operand.clone();
+            }
+            "$pull" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                modifiers.pull = operand.clone();
+            }
+            "$pullAll" => {
+                append_pull_all_paths(operator, operand, &mut paths)?;
+                modifiers.pull_all = operand.clone();
+            }
             _ => return Err(format!("unsupported update operator {operator}")),
         }
     }
@@ -3063,6 +3083,85 @@ fn append_rename_paths(
         paths.push(destination.to_string());
     }
     Ok(())
+}
+
+fn append_push_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for (path, operand) in document {
+        validate_update_path(operator, path)?;
+        parse_each_operand("$push", operand)?;
+        paths.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn append_add_to_set_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for (path, operand) in document {
+        validate_update_path(operator, path)?;
+        parse_each_operand("$addToSet", operand)?;
+        paths.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn append_pop_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for (path, operand) in document {
+        validate_update_path(operator, path)?;
+        match operand {
+            Bson::Int32(1) | Bson::Int64(1) | Bson::Int32(-1) | Bson::Int64(-1) => {}
+            _ => return Err("$pop operands must be 1 or -1".to_string()),
+        }
+        paths.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn append_pull_all_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for (path, operand) in document {
+        validate_update_path(operator, path)?;
+        if !matches!(operand, Bson::Array(_)) {
+            return Err("$pullAll operands must be arrays".to_string());
+        }
+        paths.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn parse_each_operand(operator: &str, operand: &Bson) -> std::result::Result<Vec<Bson>, String> {
+    match operand {
+        Bson::Document(document) if document.keys().any(|key| key.starts_with('$')) => {
+            if document.keys().any(|key| !key.starts_with('$')) {
+                return Err(format!(
+                    "{operator} option documents cannot mix literal fields"
+                ));
+            }
+            for key in document.keys() {
+                if key != "$each" {
+                    return Err(format!("{operator} option {key} is not supported"));
+                }
+            }
+            let Some(Bson::Array(values)) = document.get("$each") else {
+                return Err(format!("{operator} $each must be an array"));
+            };
+            Ok(values.clone())
+        }
+        _ => Ok(vec![operand.clone()]),
+    }
 }
 
 fn validate_update_path(operator: &str, path: &str) -> std::result::Result<(), String> {
@@ -3142,6 +3241,21 @@ fn apply_update_to_document_for_context(
             }
             for (path, operand) in &modifiers.mul {
                 mul_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.push {
+                push_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.add_to_set {
+                add_to_set_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.pop {
+                pop_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.pull {
+                pull_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.pull_all {
+                pull_all_update_path(&mut document, path, operand)?;
             }
             Ok(document)
         }
@@ -3272,6 +3386,29 @@ fn take_update_path(
     Ok(current.remove(last))
 }
 
+fn get_update_path_checked<'a>(
+    document: &'a Document,
+    path: &str,
+) -> std::result::Result<Option<&'a Bson>, String> {
+    let mut parts = path.split('.');
+    let Some(first) = parts.next() else {
+        return Err("update path must not be empty".to_string());
+    };
+    let Some(mut current) = document.get(first) else {
+        return Ok(None);
+    };
+    for part in parts {
+        let Bson::Document(nested) = current else {
+            return Err(format!("cannot traverse scalar parent {part}"));
+        };
+        let Some(next) = nested.get(part) else {
+            return Ok(None);
+        };
+        current = next;
+    }
+    Ok(Some(current))
+}
+
 fn rename_update_path(
     document: &mut Document,
     source: &str,
@@ -3348,6 +3485,127 @@ fn mul_update_path(
             set_update_path(document, path, updated)
         }
         Some(_) => Err("$mul can only apply to numeric fields".to_string()),
+    }
+}
+
+fn push_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let mut values = match get_update_path_checked(document, path)?.cloned() {
+        None => Vec::new(),
+        Some(Bson::Array(values)) => values,
+        Some(_) => return Err("$push can only apply to array fields".to_string()),
+    };
+    values.extend(parse_each_operand("$push", operand)?);
+    set_update_path(document, path, Bson::Array(values))
+}
+
+fn add_to_set_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let mut values = match get_update_path_checked(document, path)?.cloned() {
+        None => Vec::new(),
+        Some(Bson::Array(values)) => values,
+        Some(_) => return Err("$addToSet can only apply to array fields".to_string()),
+    };
+    for value in parse_each_operand("$addToSet", operand)? {
+        if values
+            .iter()
+            .all(|existing| !update_values_equal(existing, &value))
+        {
+            values.push(value);
+        }
+    }
+    set_update_path(document, path, Bson::Array(values))
+}
+
+fn pop_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let Some(existing) = get_update_path_checked(document, path)?.cloned() else {
+        return Ok(());
+    };
+    let Bson::Array(mut values) = existing else {
+        return Err("$pop can only apply to array fields".to_string());
+    };
+    match operand {
+        Bson::Int32(1) | Bson::Int64(1) => {
+            values.pop();
+        }
+        Bson::Int32(-1) | Bson::Int64(-1) => {
+            if !values.is_empty() {
+                values.remove(0);
+            }
+        }
+        _ => return Err("$pop operands must be 1 or -1".to_string()),
+    }
+    set_update_path(document, path, Bson::Array(values))
+}
+
+fn pull_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let Some(existing) = get_update_path_checked(document, path)?.cloned() else {
+        return Ok(());
+    };
+    let Bson::Array(values) = existing else {
+        return Err("$pull can only apply to array fields".to_string());
+    };
+    let mut retained = Vec::new();
+    for value in values {
+        if !pull_matches(&value, operand)? {
+            retained.push(value);
+        }
+    }
+    set_update_path(document, path, Bson::Array(retained))
+}
+
+fn pull_all_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let Bson::Array(needles) = operand else {
+        return Err("$pullAll operands must be arrays".to_string());
+    };
+    let Some(existing) = get_update_path_checked(document, path)?.cloned() else {
+        return Ok(());
+    };
+    let Bson::Array(values) = existing else {
+        return Err("$pullAll can only apply to array fields".to_string());
+    };
+    let retained = values
+        .into_iter()
+        .filter(|value| {
+            needles
+                .iter()
+                .all(|needle| !update_values_equal(value, needle))
+        })
+        .collect::<Vec<_>>();
+    set_update_path(document, path, Bson::Array(retained))
+}
+
+fn pull_matches(value: &Bson, condition: &Bson) -> std::result::Result<bool, String> {
+    if let Bson::Document(document) = condition
+        && document.keys().any(|key| key.starts_with('$'))
+    {
+        return matches_operator_document(&[value], document).map_err(|err| err.errmsg);
+    }
+    Ok(update_values_equal(value, condition))
+}
+
+fn update_values_equal(candidate: &Bson, expected: &Bson) -> bool {
+    match (numeric_value(candidate), numeric_value(expected)) {
+        (Some(left), Some(right)) => left == right,
+        _ => candidate == expected,
     }
 }
 
@@ -4663,6 +4921,21 @@ mod tests {
             .iter()
             .map(|value| value.as_document().unwrap().clone())
             .collect()
+    }
+
+    fn bson_strings(values: &[&str]) -> Vec<Bson> {
+        values
+            .iter()
+            .map(|value| Bson::String((*value).to_string()))
+            .collect()
+    }
+
+    fn bson_ints(values: &[i32]) -> Vec<Bson> {
+        values.iter().copied().map(Bson::Int32).collect()
+    }
+
+    fn bson_documents(values: Vec<Document>) -> Vec<Bson> {
+        values.into_iter().map(Bson::Document).collect()
     }
 
     #[test]
@@ -7808,6 +8081,203 @@ mod tests {
     }
 
     #[test]
+    fn update_array_modifiers_support_practical_subset() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "active": true,
+                        "tags": ["math"],
+                        "batch": [],
+                        "unique": ["math"],
+                        "numbers": [1_i32, 2_i32, 3_i32],
+                        "scores": [1_i32, 3_i32, 5_i32],
+                        "docs": [{ "kind": "a" }, { "kind": "b" }],
+                        "letters": ["x", "y", "z"],
+                    },
+                    { "_id": "u2", "active": true },
+                ],
+            },
+        )
+        .unwrap();
+
+        let single = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u1" },
+                        "u": {
+                            "$push": { "tags": "logic", "batch": { "$each": ["a", "b"] } },
+                            "$addToSet": { "unique": { "$each": ["math", "logic"] } },
+                            "$pop": { "numbers": 1_i32 },
+                            "$pull": { "scores": { "$gte": 3_i32 }, "docs": { "kind": "a" } },
+                            "$pullAll": { "letters": ["x", "z"] },
+                        },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(single.get_i32("nModified").unwrap(), 1);
+
+        let multi = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "active": true },
+                        "u": { "$push": { "events": "seen" } },
+                        "multi": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(multi.get_i32("n").unwrap(), 2);
+        assert_eq!(multi.get_i32("nModified").unwrap(), 2);
+
+        let docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            docs[0].get_array("tags").unwrap(),
+            &bson_strings(&["math", "logic"])
+        );
+        assert_eq!(
+            docs[0].get_array("batch").unwrap(),
+            &bson_strings(&["a", "b"])
+        );
+        assert_eq!(
+            docs[0].get_array("unique").unwrap(),
+            &bson_strings(&["math", "logic"])
+        );
+        assert_eq!(docs[0].get_array("numbers").unwrap(), &bson_ints(&[1, 2]));
+        assert_eq!(docs[0].get_array("scores").unwrap(), &bson_ints(&[1]));
+        assert_eq!(
+            docs[0].get_array("docs").unwrap(),
+            &bson_documents(vec![doc! { "kind": "b" }])
+        );
+        assert_eq!(docs[0].get_array("letters").unwrap(), &bson_strings(&["y"]));
+        assert_eq!(
+            docs[0].get_array("events").unwrap(),
+            &bson_strings(&["seen"])
+        );
+        assert_eq!(
+            docs[1].get_array("events").unwrap(),
+            &bson_strings(&["seen"])
+        );
+    }
+
+    #[test]
+    fn find_and_modify_uses_array_modifiers() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "tags": ["math"],
+                        "unique": ["math"],
+                        "numbers": [1_i32, 2_i32],
+                        "scores": [1_i32, 4_i32],
+                        "letters": ["x", "y"],
+                    }
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": {
+                    "$push": { "tags": { "$each": ["logic", "systems"] } },
+                    "$addToSet": { "unique": { "$each": ["math", "logic"] } },
+                    "$pop": { "numbers": -1_i32 },
+                    "$pull": { "scores": { "$gt": 2_i32 } },
+                    "$pullAll": { "letters": ["x"] },
+                },
+                "new": true,
+            },
+        )
+        .unwrap();
+
+        let value = response.get_document("value").unwrap();
+        assert_eq!(
+            value.get_array("tags").unwrap(),
+            &bson_strings(&["math", "logic", "systems"])
+        );
+        assert_eq!(
+            value.get_array("unique").unwrap(),
+            &bson_strings(&["math", "logic"])
+        );
+        assert_eq!(value.get_array("numbers").unwrap(), &bson_ints(&[2]));
+        assert_eq!(value.get_array("scores").unwrap(), &bson_ints(&[1]));
+        assert_eq!(value.get_array("letters").unwrap(), &bson_strings(&["y"]));
+    }
+
+    #[test]
+    fn update_array_modifiers_reject_unsupported_and_adversarial_shapes() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "tags": [], "name": "Ada", "profile": "flat" }],
+            },
+        )
+        .unwrap();
+
+        for update in [
+            doc! { "$push": { "tags": { "$each": ["x"], "$position": 0_i32 } } },
+            doc! { "$push": { "tags": { "$slice": 1_i32 } } },
+            doc! { "$push": { "tags": { "$sort": 1_i32 } } },
+            doc! { "$push": { "tags": { "$each": "x" } } },
+            doc! { "$addToSet": { "tags": { "$each": "x" } } },
+            doc! { "$pop": { "tags": 0_i32 } },
+            doc! { "$pullAll": { "tags": "x" } },
+            doc! { "$push": { "name": "x" } },
+            doc! { "$pull": { "name": "Ada" } },
+            doc! { "$push": { "profile.tags": "x" } },
+            doc! { "$push": { "tags.$": "x" } },
+        ] {
+            let response = update_documents(
+                &conn,
+                &doc! {
+                    "update": "users",
+                    "$db": "app",
+                    "updates": [{ "q": { "_id": "u1" }, "u": update }],
+                },
+            )
+            .unwrap();
+            assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+            assert!(!write_errors(&response).is_empty());
+        }
+    }
+
+    #[test]
     fn update_inc_handles_mixed_integer_precision_and_overflow() {
         let conn = test_conn();
         insert_documents(
@@ -8043,8 +8513,8 @@ mod tests {
 
         for update in [
             doc! { "$bit": { "age": { "and": 1_i32 } } },
-            doc! { "$push": { "tags": "logic" } },
-            doc! { "$pull": { "tags": "logic" } },
+            doc! { "$currentDate": { "updatedAt": true } },
+            doc! { "$setWindowFields": { "x": 1_i32 } },
         ] {
             let err = classify_update(&update).unwrap_err();
             assert!(err.contains("unsupported update operator"), "{err}");
@@ -8076,8 +8546,8 @@ mod tests {
             doc! { "q": { "_id": "u1" }, "u": {} },
             doc! { "q": { "_id": "u1" }, "u": { "$set": { "name": "x" }, "plain": true } },
             doc! { "q": { "_id": "u1" }, "u": { "$bit": { "age": { "and": 1_i32 } } } },
-            doc! { "q": { "_id": "u1" }, "u": { "$push": { "tags": "x" } } },
-            doc! { "q": { "_id": "u1" }, "u": { "$pull": { "tags": "x" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$push": { "tags": { "$position": 0_i32 } } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$pullAll": { "tags": "x" } } },
             doc! { "q": { "_id": "u1" }, "u": { "_id": "other", "name": "x" } },
             doc! { "q": { "_id": "u1" }, "u": { "$inc": { "name": 1_i32 } } },
             doc! { "q": { "_id": "u1" }, "u": { "$inc": { "age": "x" } } },
