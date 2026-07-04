@@ -62,10 +62,10 @@ The fix is complete only when:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Add failing `$addToSet` whole-value equality tests
-- [ ] Milestone 1: Switch `$addToSet` uniqueness to aggregation equality
-- [ ] Milestone 2: Harden scalar, array, document, and numeric cases
-- [ ] Milestone 3: Final verification and commit
+- [x] Milestone 0: Add failing `$addToSet` whole-value equality tests
+- [x] Milestone 1: Switch `$addToSet` uniqueness to aggregation equality
+- [x] Milestone 2: Harden scalar, array, document, and numeric cases
+- [x] Milestone 3: Final verification and commit
 
 ## Milestone 0: Add Failing Tests
 
@@ -150,3 +150,39 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 Commit requirement:
 
 - Commit with a focused message such as `Fix aggregation addToSet equality`.
+
+## Status Note
+
+Completed on 2026-07-04.
+
+Fix commit:
+
+- `59b349bfc7c2fe6669e020a6d92b48b29b2fb962` (`Fix aggregation addToSet equality`)
+
+Commands run:
+
+```bash
+cargo fmt
+python3 -m json.tool tests/spec_corpus/aggregation_pipeline.json
+cargo fmt -- --check
+cargo test aggregate
+git diff --check
+cargo test
+cargo build
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+```
+
+Results:
+
+- `cargo fmt -- --check`: passed.
+- `cargo test aggregate`: passed, 12 tests.
+- `git diff --check`: passed.
+- `cargo test`: passed, 107 tests.
+- `cargo build`: passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`: passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`: passed.
+- First `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` sandboxed run failed before server startup because localhost binding is blocked in the sandbox: `PermissionError: [Errno 1] Operation not permitted` at `sock.bind(("127.0.0.1", 0))` in `tests/e2e/conftest.py:103`.
+- Second `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` run outside the sandbox passed: 119 passed, 1 skipped.
