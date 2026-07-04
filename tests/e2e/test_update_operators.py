@@ -1,7 +1,7 @@
 import pytest
 from bson.int64 import Int64
-from pymongo import ReturnDocument
-from pymongo.errors import WriteError
+from pymongo import ASCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError, WriteError
 
 
 pytestmark = pytest.mark.e2e
@@ -235,3 +235,107 @@ def test_array_update_operator_errors_preserve_documents(collection):
         "name": "Ada",
         "profile": "flat",
     }
+
+
+def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_client):
+    db = mongo_client["update_operator_invariants"]
+    collection = db.create_collection(
+        "users",
+        validator={
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"bsonType": "string"},
+                    "age": {"bsonType": "number"},
+                },
+            }
+        },
+    )
+    collection.insert_one({"_id": "u1", "name": "Ada", "age": 37})
+
+    with pytest.raises(WriteError) as invalid:
+        collection.update_one({"_id": "u1"}, {"$rename": {"age": "name"}})
+    assert invalid.value.code == 121
+    assert collection.find_one({"_id": "u1"})["name"] == "Ada"
+
+    bypassed = db.command(
+        {
+            "update": "users",
+            "bypassDocumentValidation": True,
+            "updates": [{"q": {"_id": "u1"}, "u": {"$rename": {"age": "name"}}}],
+        }
+    )
+    assert bypassed["nModified"] == 1
+    assert collection.find_one({"_id": "u1"})["name"] == 37
+
+    unique = mongo_client["update_operator_unique"].users
+    unique.create_index([("email", ASCENDING)], unique=True)
+    unique.create_index([("rank", ASCENDING)], unique=True)
+    unique.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test", "rank": 1},
+            {"_id": "u2", "altEmail": "ada@example.test", "rank": 5},
+        ]
+    )
+    with pytest.raises(DuplicateKeyError):
+        unique.update_one({"_id": "u2"}, {"$rename": {"altEmail": "email"}})
+    with pytest.raises(DuplicateKeyError):
+        unique.update_one({"_id": "u2"}, {"$min": {"rank": 1}})
+    with pytest.raises(DuplicateKeyError):
+        unique.update_one(
+            {"_id": "u3"},
+            {"$setOnInsert": {"email": "ada@example.test"}},
+            upsert=True,
+        )
+
+    indexed = mongo_client["update_operator_index_freshness"].users
+    indexed.insert_one({"_id": "u1", "profile": {"city": "Rome"}, "score": 4})
+    indexed.create_index([("city", ASCENDING)])
+    indexed.create_index([("score", ASCENDING)])
+    indexed.update_one(
+        {"_id": "u1"},
+        {"$rename": {"profile.city": "city"}, "$mul": {"score": 3}},
+    )
+    assert indexed.find_one({"city": "Rome"})["_id"] == "u1"
+    assert indexed.find_one({"profile.city": "Rome"}) is None
+    assert indexed.find_one({"score": 12})["_id"] == "u1"
+    assert indexed.find_one({"score": 4}) is None
+
+
+def test_new_update_modifier_batch_ordering(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "name": "Ada", "tags": []},
+            {"_id": "u2", "name": "Grace", "tags": []},
+        ]
+    )
+
+    ordered = collection.database.command(
+        {
+            "update": collection.name,
+            "ordered": True,
+            "updates": [
+                {"q": {"_id": "u1"}, "u": {"$push": {"name": "bad"}}},
+                {"q": {"_id": "u2"}, "u": {"$rename": {"name": "displayName"}}},
+            ],
+        }
+    )
+    assert ordered["n"] == 0
+    assert ordered["writeErrors"][0]["index"] == 0
+    assert collection.find_one({"displayName": "Grace"}) is None
+
+    unordered = collection.database.command(
+        {
+            "update": collection.name,
+            "ordered": False,
+            "updates": [
+                {"q": {"_id": "u1"}, "u": {"$push": {"name": "bad"}}},
+                {"q": {"_id": "u2"}, "u": {"$rename": {"name": "displayName"}}},
+            ],
+        }
+    )
+    assert unordered["n"] == 1
+    assert unordered["nModified"] == 1
+    assert unordered["writeErrors"][0]["index"] == 0
+    assert collection.find_one({"displayName": "Grace"})["_id"] == "u2"

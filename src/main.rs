@@ -6198,6 +6198,157 @@ mod tests {
     }
 
     #[test]
+    fn validation_and_unique_indexes_apply_after_new_update_modifiers() {
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada", "age": 37_i32 }],
+            },
+        )
+        .unwrap();
+
+        let invalid = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$rename": { "age": "name" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&invalid)[0].get_i32("code").unwrap(), 121);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+                )
+                .unwrap()
+            )[0]
+            .get_str("name")
+            .unwrap(),
+            "Ada"
+        );
+
+        let bypassed = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$rename": { "age": "name" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(bypassed.get_i32("nModified").unwrap(), 1);
+
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
+                    { "key": { "rank": 1_i32 }, "name": "rank_1", "unique": true }
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada", "email": "ada@example.test", "rank": 1_i32 },
+                    { "_id": "u2", "name": "Grace", "altEmail": "ada@example.test", "rank": 5_i32 },
+                ],
+            },
+        )
+        .unwrap();
+
+        for update in [
+            doc! { "$rename": { "altEmail": "email" } },
+            doc! { "$min": { "rank": 1_i32 } },
+        ] {
+            let duplicate = update_documents(
+                &conn,
+                &doc! {
+                    "update": "users",
+                    "$db": "app",
+                    "bypassDocumentValidation": true,
+                    "updates": [{ "q": { "_id": "u2" }, "u": update }],
+                },
+            )
+            .unwrap();
+            assert_eq!(write_errors(&duplicate)[0].get_i32("code").unwrap(), 11000);
+        }
+
+        let duplicate_upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "updates": [
+                    {
+                        "q": { "_id": "u4" },
+                        "u": { "$setOnInsert": { "email": "ada@example.test" } },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_upsert)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1", "unique": true }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1" }],
+            },
+        )
+        .unwrap();
+        let array_rejected_by_unique_index = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$push": { "tags": "new" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&array_rejected_by_unique_index)[0]
+                .get_i32("code")
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn count_command_respects_filter_skip_and_limit() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -8235,6 +8386,150 @@ mod tests {
         assert_eq!(value.get_array("numbers").unwrap(), &bson_ints(&[2]));
         assert_eq!(value.get_array("scores").unwrap(), &bson_ints(&[1]));
         assert_eq!(value.get_array("letters").unwrap(), &bson_strings(&["y"]));
+    }
+
+    #[test]
+    fn new_modifiers_refresh_index_entries_and_find_and_modify_images() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "profile": { "city": "Rome" },
+                        "score": 4_i32,
+                        "tags": ["math"],
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "city": 1_i32 }, "name": "city_1" },
+                    { "key": { "score": 1_i32 }, "name": "score_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let pre_image = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": {
+                    "$rename": { "profile.city": "city" },
+                    "$mul": { "score": 3_i32 },
+                    "$push": { "tags": "logic" },
+                },
+            },
+        )
+        .unwrap();
+        let value = pre_image.get_document("value").unwrap();
+        assert_eq!(
+            value
+                .get_document("profile")
+                .unwrap()
+                .get_str("city")
+                .unwrap(),
+            "Rome"
+        );
+        assert_eq!(value.get_i32("score").unwrap(), 4);
+        assert_eq!(value.get_array("tags").unwrap(), &bson_strings(&["math"]));
+
+        assert_eq!(find_ids(&conn, doc! { "city": "Rome" }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            Vec::<String>::new()
+        );
+        assert_eq!(find_ids(&conn, doc! { "score": 12_i32 }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "score": 4_i32 }),
+            Vec::<String>::new()
+        );
+
+        let post_image = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$pull": { "tags": "math" }, "$max": { "score": 20_i32 } },
+                "new": true,
+            },
+        )
+        .unwrap();
+        let value = post_image.get_document("value").unwrap();
+        assert_eq!(value.get_i32("score").unwrap(), 20);
+        assert_eq!(value.get_array("tags").unwrap(), &bson_strings(&["logic"]));
+        assert_eq!(find_ids(&conn, doc! { "score": 20_i32 }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "score": 12_i32 }),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn new_modifier_batch_failures_preserve_ordered_and_unordered_semantics() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada", "tags": [] },
+                    { "_id": "u2", "name": "Grace", "tags": [] },
+                ],
+            },
+        )
+        .unwrap();
+
+        let ordered = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "ordered": true,
+                "updates": [
+                    { "q": { "_id": "u1" }, "u": { "$push": { "name": "bad" } } },
+                    { "q": { "_id": "u2" }, "u": { "$rename": { "name": "displayName" } } },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(ordered.get_i32("n").unwrap(), 0);
+        assert_eq!(write_errors(&ordered)[0].get_i32("index").unwrap(), 0);
+        assert!(find_ids(&conn, doc! { "displayName": "Grace" }).is_empty());
+
+        let unordered = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "ordered": false,
+                "updates": [
+                    { "q": { "_id": "u1" }, "u": { "$push": { "name": "bad" } } },
+                    { "q": { "_id": "u2" }, "u": { "$rename": { "name": "displayName" } } },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(unordered.get_i32("n").unwrap(), 1);
+        assert_eq!(unordered.get_i32("nModified").unwrap(), 1);
+        assert_eq!(write_errors(&unordered)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(find_ids(&conn, doc! { "displayName": "Grace" }), vec!["u2"]);
     }
 
     #[test]
