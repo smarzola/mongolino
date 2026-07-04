@@ -208,7 +208,7 @@ Status note:
   invalid hint/update/validator paths. Verification run: `cargo fmt --
   --check`, `cargo test ttl`, `cargo test update`, `cargo test delete`,
   `cargo test find_and_modify`, `cargo test validation`. Implementation
-  commit: pending checkpoint.
+  commit: `287158d`.
 
 Likely files:
 
