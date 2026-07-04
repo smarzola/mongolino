@@ -227,6 +227,9 @@ fn ensure_index_metadata_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !columns.iter().any(|column| column == "collation_bson") {
+        conn.execute("ALTER TABLE indexes ADD COLUMN collation_bson BLOB", [])?;
+    }
     Ok(())
 }
 
@@ -990,17 +993,32 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
         &[
-            "count", "query", "skip", "limit", "hint", "explain", "$db", "lsid",
+            "count",
+            "query",
+            "skip",
+            "limit",
+            "hint",
+            "explain",
+            "$db",
+            "lsid",
+            "collation",
         ],
     ) {
         return Ok(command_error(72, &errmsg));
     }
+    let collation = match Collation::parse_optional(command, "collation") {
+        Ok(collation) => collation,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
     let filter = match command.get("query") {
         None => Document::new(),
         Some(Bson::Document(filter)) => filter.clone(),
         Some(_) => return Ok(command_error(9, "count query must be a document")),
     };
     if let Err(err) = validate_filter_shape(&filter) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
+    if let Err(err) = validate_filter_for_collation(&filter, &collation) {
         return Ok(command_error(err.code, &err.errmsg));
     }
     let skip = match optional_i64(command, "skip") {
@@ -1030,7 +1048,7 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
     if explain {
-        return match planner_v2_plan_for_count(conn, &ns, &filter, hint.as_ref()) {
+        return match planner_v2_plan_for_count(conn, &ns, &filter, hint.as_ref(), &collation) {
             Ok(plan) => Ok(explain_response(
                 "count",
                 &ns,
@@ -1043,20 +1061,21 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     }
     sweep_ttl_namespace(conn, &ns)?;
     let count = if let Some(hint) = hint.as_ref() {
-        let documents = match candidate_documents_with_hint(conn, &ns, &filter, Some(hint)) {
-            Ok(documents) => documents,
-            Err(errmsg) => return Ok(command_error(2, &errmsg)),
-        };
-        match count_matching_documents(documents, &filter, skip, limit) {
+        let documents =
+            match candidate_documents_with_hint(conn, &ns, &filter, Some(hint), &collation) {
+                Ok(documents) => documents,
+                Err(errmsg) => return Ok(command_error(2, &errmsg)),
+            };
+        match count_matching_documents(documents, &filter, skip, limit, &collation) {
             Ok(count) => count,
             Err(err) => return Ok(command_error(err.code, &err.errmsg)),
         }
     } else {
-        match pushed_down_count(conn, &ns, &filter, skip, limit)? {
+        match pushed_down_count_with_collation(conn, &ns, &filter, skip, limit, &collation)? {
             Some(count) => count,
             None => {
                 let documents = documents_for_namespace(conn, &ns)?;
-                match count_matching_documents(documents, &filter, skip, limit) {
+                match count_matching_documents(documents, &filter, skip, limit, &collation) {
                     Ok(count) => count,
                     Err(err) => return Ok(command_error(err.code, &err.errmsg)),
                 }
@@ -1081,11 +1100,16 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(key) if !key.is_empty() => key,
         _ => return Ok(command_error(9, "distinct requires a non-empty key")),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["distinct", "key", "query", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["distinct", "key", "query", "collation", "$db", "lsid"],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
+    let collation = match Collation::parse_optional(command, "collation") {
+        Ok(collation) => collation,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
     let filter = match command.get("query") {
         None => Document::new(),
         Some(Bson::Document(filter)) => filter.clone(),
@@ -1094,18 +1118,20 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
     if let Err(err) = validate_filter_shape(&filter) {
         return Ok(command_error(err.code, &err.errmsg));
     }
+    if let Err(err) = validate_filter_for_collation(&filter, &collation) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
 
     let mut values = Vec::<Bson>::new();
     let ns = namespace(db, collection);
     sweep_ttl_namespace(conn, &ns)?;
     for document in documents_for_namespace(conn, &ns)? {
-        match matches_filter(&document, &filter) {
+        match matches_filter_with_collation(&document, &filter, &collation) {
             Ok(true) => {
                 for value in distinct_values_at_path(&document, key) {
-                    if !values
-                        .iter()
-                        .any(|existing| bson_values_equal(existing, &value))
-                    {
+                    if !values.iter().any(|existing| {
+                        bson_values_equal_with_collation(existing, &value, &collation)
+                    }) {
                         values.push(value);
                     }
                 }
@@ -1114,7 +1140,7 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
             Err(err) => return Ok(command_error(err.code, &err.errmsg)),
         }
     }
-    values.sort_by(compare_bson_order);
+    values.sort_by(|left, right| compare_bson_order_with_collation(left, right, &collation));
     Ok(doc! { "values": values, "ok": 1.0 })
 }
 
@@ -1141,10 +1167,21 @@ fn aggregate_command_with_state(
     };
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
-        &["aggregate", "pipeline", "cursor", "$db", "lsid"],
+        &[
+            "aggregate",
+            "pipeline",
+            "cursor",
+            "collation",
+            "$db",
+            "lsid",
+        ],
     ) {
         return Ok(command_error(72, &errmsg));
     }
+    let collation = match Collation::parse_optional(command, "collation") {
+        Ok(collation) => collation,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
     let batch_size = match parse_aggregate_cursor(command) {
         Ok(batch_size) => batch_size,
         Err(response) => return Ok(response),
@@ -1156,9 +1193,12 @@ fn aggregate_command_with_state(
     if let Err(response) = validate_aggregate_pipeline_shape(pipeline) {
         return Ok(response);
     }
+    if let Err(response) = validate_aggregate_pipeline_for_collation(pipeline, &collation) {
+        return Ok(response);
+    }
     let ns = namespace(db, collection);
     sweep_ttl_namespace(conn, &ns)?;
-    if let Some(documents) = aggregate_match_count_pushdown(conn, &ns, pipeline)? {
+    if let Some(documents) = aggregate_match_count_pushdown(conn, &ns, pipeline, &collation)? {
         let documents = match documents {
             Ok(documents) => documents,
             Err(response) => return Ok(response),
@@ -1173,7 +1213,7 @@ fn aggregate_command_with_state(
             false,
         ));
     }
-    let documents = match aggregate_pipeline_documents(conn, &ns, pipeline)? {
+    let documents = match aggregate_pipeline_documents(conn, &ns, pipeline, &collation)? {
         Ok(documents) => documents,
         Err(response) => return Ok(response),
     };
@@ -1219,11 +1259,14 @@ fn aggregate_match_count_pushdown(
     conn: &Connection,
     namespace: &str,
     pipeline: &[Bson],
+    collation: &Collation,
 ) -> Result<Option<std::result::Result<Vec<Document>, Document>>> {
     let Some((filter, field)) = parse_match_count_pipeline(pipeline) else {
         return Ok(None);
     };
-    let Some(count) = pushed_down_count(conn, namespace, filter, 0, None)? else {
+    let Some(count) =
+        pushed_down_count_with_collation(conn, namespace, filter, 0, None, collation)?
+    else {
         return Ok(None);
     };
     let documents = if count == 0 {
@@ -1275,6 +1318,7 @@ fn aggregate_pipeline_documents(
     conn: &Connection,
     namespace: &str,
     pipeline: &[Bson],
+    collation: &Collation,
 ) -> Result<std::result::Result<Vec<Document>, Document>> {
     let mut documents = documents_for_namespace(conn, namespace)?;
 
@@ -1297,7 +1341,8 @@ fn aggregate_pipeline_documents(
                 let Bson::Document(filter) = operand else {
                     return Ok(Err(command_error(9, "$match requires a document")));
                 };
-                documents = match shape_documents(documents, filter, None, 0, None, None) {
+                documents = match shape_documents(documents, filter, None, 0, None, None, collation)
+                {
                     Ok(documents) => documents,
                     Err(err) => return Ok(Err(command_error(err.code, &err.errmsg))),
                 };
@@ -1310,7 +1355,7 @@ fn aggregate_pipeline_documents(
                     Ok(sort) => sort,
                     Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
                 };
-                sort_documents(&mut documents, &sort);
+                sort_documents_with_collation(&mut documents, &sort, collation);
             }
             "$skip" => {
                 let skip = match non_negative_stage_usize(operand, "$skip") {
@@ -1467,6 +1512,21 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
         }
     }
 
+    Ok(())
+}
+
+fn validate_aggregate_pipeline_for_collation(
+    pipeline: &[Bson],
+    collation: &Collation,
+) -> std::result::Result<(), Document> {
+    for stage in pipeline {
+        if let Bson::Document(stage) = stage
+            && let Some(Bson::Document(filter)) = stage.get("$match")
+            && let Err(err) = validate_filter_for_collation(filter, collation)
+        {
+            return Err(command_error(err.code, &err.errmsg));
+        }
+    }
     Ok(())
 }
 
@@ -1934,6 +1994,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "fields",
             "projection",
             "hint",
+            "collation",
             "$db",
             "lsid",
         ],
@@ -1971,6 +2032,13 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
     if let Err(err) = validate_filter_shape(&query) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
+    let collation = match Collation::parse_optional(command, "collation") {
+        Ok(collation) => collation,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
+    if let Err(err) = validate_filter_for_collation(&query, &collation) {
         return Ok(command_error(err.code, &err.errmsg));
     }
 
@@ -2012,7 +2080,12 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     let namespace = namespace(db, collection);
     let hint = match parse_optional_hint(command) {
         Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &namespace)?, hint) {
-            Ok(hint) => Some(hint),
+            Ok(hint) => {
+                if let Err(errmsg) = validate_hint_collation(&hint, &collation, &query) {
+                    return Ok(command_error(2, &errmsg));
+                }
+                Some(hint)
+            }
             Err(errmsg) => return Ok(command_error(2, &errmsg)),
         },
         Ok(None) => None,
@@ -2032,6 +2105,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             &query,
             sort.as_deref(),
             hint.as_ref(),
+            &collation,
             update.as_ref().expect("update parsed above"),
             upsert,
             &options,
@@ -2041,7 +2115,14 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     }
     sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
     let outcome = if remove {
-        apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref(), hint.as_ref())?
+        apply_find_and_modify_remove(
+            &tx,
+            &namespace,
+            &query,
+            sort.as_deref(),
+            hint.as_ref(),
+            &collation,
+        )?
     } else {
         apply_find_and_modify_update(
             &tx,
@@ -2049,6 +2130,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             &query,
             sort.as_deref(),
             hint.as_ref(),
+            &collation,
             update.as_ref().expect("update parsed above"),
             upsert,
             return_new,
@@ -2101,11 +2183,14 @@ fn apply_find_and_modify_remove(
     query: &Document,
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
-    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
-        Ok(target) => target,
-        Err(response) => return Ok(Err(response)),
-    }) else {
+    let Some(target) =
+        (match find_and_modify_target_tx(tx, namespace, query, sort, hint, collation)? {
+            Ok(target) => target,
+            Err(response) => return Ok(Err(response)),
+        })
+    else {
         return Ok(Ok(FindAndModifyOutcome {
             value: None,
             n: 0,
@@ -2133,15 +2218,18 @@ fn apply_find_and_modify_update(
     query: &Document,
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
     update: &UpdateSpec,
     upsert: bool,
     return_new: bool,
     options: &CollectionOptions,
 ) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
-    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
-        Ok(target) => target,
-        Err(response) => return Ok(Err(response)),
-    }) else {
+    let Some(target) =
+        (match find_and_modify_target_tx(tx, namespace, query, sort, hint, collation)? {
+            Ok(target) => target,
+            Err(response) => return Ok(Err(response)),
+        })
+    else {
         if !upsert {
             return Ok(Ok(FindAndModifyOutcome {
                 value: None,
@@ -2231,14 +2319,17 @@ fn find_and_modify_update_preflight_error(
     query: &Document,
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
     update: &UpdateSpec,
     upsert: bool,
     options: &CollectionOptions,
 ) -> Result<Option<Document>> {
-    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
-        Ok(target) => target,
-        Err(response) => return Ok(Some(response)),
-    }) else {
+    let Some(target) =
+        (match find_and_modify_target_tx(tx, namespace, query, sort, hint, collation)? {
+            Ok(target) => target,
+            Err(response) => return Ok(Some(response)),
+        })
+    else {
         if !upsert {
             return Ok(None);
         }
@@ -2276,28 +2367,35 @@ fn find_and_modify_target_tx(
     query: &Document,
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> Result<std::result::Result<Option<StoredDocument>, Document>> {
     let mut matches = Vec::new();
-    let candidates = match transaction_candidate_documents_with_hint(tx, namespace, query, hint) {
-        Ok(candidates) => candidates,
-        Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
-    };
+    let candidates =
+        match transaction_candidate_documents_with_hint(tx, namespace, query, hint, collation) {
+            Ok(candidates) => candidates,
+            Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
+        };
     for stored in candidates {
-        match matches_filter(&stored.document, query) {
+        match matches_filter_with_collation(&stored.document, query, collation) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}
             Err(err) => return Ok(Err(command_error(err.code, &err.errmsg))),
         }
     }
     if let Some(sort) = sort {
-        sort_stored_documents(&mut matches, sort);
+        sort_stored_documents(&mut matches, sort, collation);
     }
     Ok(Ok(matches.into_iter().next()))
 }
 
-fn sort_stored_documents(documents: &mut [StoredDocument], sort: &[(String, i32)]) {
-    documents
-        .sort_by(|left, right| compare_documents_for_sort(&left.document, &right.document, sort));
+fn sort_stored_documents(
+    documents: &mut [StoredDocument],
+    sort: &[(String, i32)],
+    collation: &Collation,
+) {
+    documents.sort_by(|left, right| {
+        compare_documents_for_sort(&left.document, &right.document, sort, collation)
+    });
 }
 
 fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result<usize, Document> {
@@ -2476,11 +2574,12 @@ fn count_matching_documents(
     filter: &Document,
     skip: usize,
     limit: Option<usize>,
+    collation: &Collation,
 ) -> MatchResult<i64> {
     let mut matched = 0_i64;
     let mut skipped = 0_usize;
     for document in documents {
-        match matches_filter(&document, filter) {
+        match matches_filter_with_collation(&document, filter, collation) {
             Ok(true) if skipped < skip => skipped += 1,
             Ok(true) => {
                 matched += 1;
@@ -2502,7 +2601,18 @@ fn pushed_down_count(
     skip: usize,
     limit: Option<usize>,
 ) -> Result<Option<i64>> {
-    let total = match plan_count(conn, namespace, filter)? {
+    pushed_down_count_with_collation(conn, namespace, filter, skip, limit, &Collation::Simple)
+}
+
+fn pushed_down_count_with_collation(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    skip: usize,
+    limit: Option<usize>,
+    collation: &Collation,
+) -> Result<Option<i64>> {
+    let total = match plan_count_with_collation(conn, namespace, filter, collation)? {
         CountPlan::Empty => sql_count_documents(conn, namespace)?,
         CountPlan::IdEquality(id_key) => sql_count_id_equality(conn, namespace, &id_key)?,
         CountPlan::IndexedEquality {
@@ -2595,6 +2705,188 @@ fn apply_count_skip_limit(total: i64, skip: usize, limit: Option<usize>) -> i64 
         Some(limit) => after_skip.min(limit as i64),
         None => after_skip,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Collation {
+    Simple,
+    EnglishCaseInsensitive,
+}
+
+impl Collation {
+    fn parse_optional(command: &Document, key: &str) -> std::result::Result<Self, String> {
+        match command.get(key) {
+            None => Ok(Self::Simple),
+            Some(value) => Self::parse_bson(value),
+        }
+    }
+
+    fn parse_bson(value: &Bson) -> std::result::Result<Self, String> {
+        let Bson::Document(document) = value else {
+            return Err("collation must be a document".to_string());
+        };
+        Self::parse_document(document)
+    }
+
+    fn parse_document(document: &Document) -> std::result::Result<Self, String> {
+        if document.is_empty() {
+            return Err("collation requires locale".to_string());
+        }
+        for key in document.keys() {
+            if !matches!(key.as_str(), "locale" | "strength") {
+                return Err(format!("collation option {key} is not supported"));
+            }
+        }
+        let locale = match document.get("locale") {
+            Some(Bson::String(locale)) if !locale.is_empty() => locale.as_str(),
+            Some(Bson::String(_)) => return Err("collation locale must not be empty".to_string()),
+            Some(_) => return Err("collation locale must be a string".to_string()),
+            None => return Err("collation requires locale".to_string()),
+        };
+        match locale {
+            "simple" => {
+                if document.contains_key("strength") {
+                    return Err("simple collation does not support strength".to_string());
+                }
+                Ok(Self::Simple)
+            }
+            "en" | "en_US" => match document.get("strength") {
+                Some(Bson::Int32(2) | Bson::Int64(2)) => Ok(Self::EnglishCaseInsensitive),
+                Some(_) => Err("English collation requires strength 2".to_string()),
+                None => Err("English collation requires strength 2".to_string()),
+            },
+            _ => Err(format!("collation locale {locale} is not supported")),
+        }
+    }
+
+    fn to_document(&self) -> Document {
+        match self {
+            Self::Simple => doc! { "locale": "simple" },
+            Self::EnglishCaseInsensitive => doc! { "locale": "en", "strength": 2_i32 },
+        }
+    }
+
+    fn is_simple(&self) -> bool {
+        matches!(self, Self::Simple)
+    }
+
+    fn string_key(&self, value: &str) -> String {
+        match self {
+            Self::Simple => value.to_string(),
+            Self::EnglishCaseInsensitive => value.to_lowercase(),
+        }
+    }
+
+    fn id_key_from_bson(&self, value: &Bson) -> String {
+        match (self, value) {
+            (Self::EnglishCaseInsensitive, Bson::String(value)) => {
+                format!("str-ci:{}", self.string_key(value))
+            }
+            _ => id_key_from_bson(value),
+        }
+    }
+
+    fn values_equal(&self, candidate: &Bson, expected: &Bson) -> bool {
+        if let Bson::Array(values) = candidate {
+            if !matches!(expected, Bson::Array(_)) {
+                return values
+                    .iter()
+                    .any(|value| self.values_equal(value, expected));
+            }
+        }
+
+        match (numeric_value(candidate), numeric_value(expected)) {
+            (Some(left), Some(right)) => return left == right,
+            _ => {}
+        }
+        match (candidate, expected) {
+            (Bson::String(left), Bson::String(right)) => {
+                self.string_key(left) == self.string_key(right)
+            }
+            _ => candidate == expected,
+        }
+    }
+
+    fn compare_order(&self, left: &Bson, right: &Bson) -> std::cmp::Ordering {
+        match (numeric_value(left), numeric_value(right)) {
+            (Some(left), Some(right)) => {
+                return left
+                    .partial_cmp(&right)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+            }
+            _ => {}
+        }
+
+        let left_rank = bson_type_rank(left);
+        let right_rank = bson_type_rank(right);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| match (left, right) {
+                (Bson::String(left), Bson::String(right)) => {
+                    self.string_key(left).cmp(&self.string_key(right))
+                }
+                _ => format!("{left:?}").cmp(&format!("{right:?}")),
+            })
+    }
+}
+
+fn validate_filter_for_collation(filter: &Document, collation: &Collation) -> MatchResult<()> {
+    if collation.is_simple() {
+        return Ok(());
+    }
+    validate_filter_for_non_simple_collation(filter)
+}
+
+fn validate_filter_for_non_simple_collation(filter: &Document) -> MatchResult<()> {
+    for (key, condition) in filter {
+        if key.starts_with('$') {
+            let Bson::Array(clauses) = condition else {
+                continue;
+            };
+            for clause in clauses {
+                if let Bson::Document(clause) = clause {
+                    validate_filter_for_non_simple_collation(clause)?;
+                }
+            }
+        } else {
+            validate_field_condition_for_non_simple_collation(condition)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_condition_for_non_simple_collation(condition: &Bson) -> MatchResult<()> {
+    if !is_operator_document(condition) {
+        return Ok(());
+    }
+    let Bson::Document(operators) = condition else {
+        return Ok(());
+    };
+    for (operator, operand) in operators {
+        match operator.as_str() {
+            "$gt" | "$gte" | "$lt" | "$lte" if matches!(operand, Bson::String(_)) => {
+                return Err(match_error(
+                    72,
+                    "string range predicates with non-simple collation are not supported",
+                ));
+            }
+            "$not" => validate_field_condition_for_non_simple_collation(operand)?,
+            "$elemMatch" => {
+                if let Bson::Document(predicate) = operand {
+                    if predicate
+                        .keys()
+                        .all(|key| is_scalar_elem_match_operator(key))
+                    {
+                        validate_field_condition_for_non_simple_collation(operand)?;
+                    } else {
+                        validate_filter_for_non_simple_collation(predicate)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -2751,6 +3043,30 @@ fn resolve_hint(
     }
 }
 
+fn validate_hint_collation(
+    hint: &ResolvedHint,
+    collation: &Collation,
+    filter: &Document,
+) -> std::result::Result<(), String> {
+    match hint {
+        ResolvedHint::Id => {
+            if let Some(value) = exact_equality_filter_value(filter, "_id")
+                && !id_equality_safe_for_collation(value, collation)
+            {
+                return Err(
+                    "hint _id_ is incompatible with non-simple string collation".to_string()
+                );
+            }
+            Ok(())
+        }
+        ResolvedHint::Index(index) if index.collation == *collation => Ok(()),
+        ResolvedHint::Index(index) => Err(format!(
+            "hint index {} collation is incompatible with this query",
+            index.name
+        )),
+    }
+}
+
 fn planner_diagnostic(
     scan_strategy: PlannerScanStrategy,
     index: Option<&IndexSpec>,
@@ -2855,18 +3171,21 @@ fn planner_v2_plan_for_query(
     namespace: &str,
     filter: &Document,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<PlannerV2Plan, String> {
     if let Some(hint) = hint {
-        return hinted_planner_v2_plan(conn, namespace, filter, hint);
+        return hinted_planner_v2_plan(conn, namespace, filter, hint, collation);
     }
     if filter.is_empty() {
         return Ok(collection_scan_plan("empty filter"));
     }
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
-        return Ok(PlannerV2Plan::IdEquality {
-            id_key: id_key_from_bson(value),
-            diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
-        });
+        if id_equality_safe_for_collation(value, collation) {
+            return Ok(PlannerV2Plan::IdEquality {
+                id_key: id_key_from_bson(value),
+                diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+            });
+        }
     }
     if filter.keys().any(|key| key.starts_with('$')) {
         return Ok(collection_scan_plan(
@@ -2878,6 +3197,10 @@ fn planner_v2_plan_for_query(
     for index in
         planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
     {
+        if index.collation != *collation {
+            fallback_reason = format!("index {} has incompatible collation", index.name);
+            continue;
+        }
         if !filter_implies_index_membership(&index, filter) {
             fallback_reason = format!(
                 "filter does not safely imply index {} membership",
@@ -2908,9 +3231,10 @@ fn planner_v2_plan_for_find(
     filter: &Document,
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<PlannerV2Plan, String> {
     if let Some(sort) = sort
-        && let Some(sort_plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint)?
+        && let Some(sort_plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint, collation)?
     {
         return Ok(PlannerV2Plan::IndexSort {
             index_name: sort_plan.index.name.clone(),
@@ -2923,7 +3247,7 @@ fn planner_v2_plan_for_find(
             ),
         });
     }
-    planner_v2_plan_for_query(conn, namespace, filter, hint)
+    planner_v2_plan_for_query(conn, namespace, filter, hint, collation)
 }
 
 fn planner_v2_plan_for_count(
@@ -2931,22 +3255,28 @@ fn planner_v2_plan_for_count(
     namespace: &str,
     filter: &Document,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<PlannerV2Plan, String> {
     if hint.is_some() {
-        return planner_v2_plan_for_query(conn, namespace, filter, hint);
+        return planner_v2_plan_for_query(conn, namespace, filter, hint, collation);
     }
     if filter.is_empty() {
         return Ok(collection_scan_plan("empty filter"));
     }
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
-        return Ok(PlannerV2Plan::IdEquality {
-            id_key: id_key_from_bson(value),
-            diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
-        });
+        if id_equality_safe_for_collation(value, collation) {
+            return Ok(PlannerV2Plan::IdEquality {
+                id_key: id_key_from_bson(value),
+                diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+            });
+        }
     }
     for index in
         planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
     {
+        if index.collation != *collation {
+            continue;
+        }
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -2975,6 +3305,9 @@ fn planner_v2_plan_for_count(
     for index in
         planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
     {
+        if index.collation != *collation || !collation.is_simple() {
+            continue;
+        }
         let Some(range) = range_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -3010,18 +3343,30 @@ fn hinted_planner_v2_plan(
     namespace: &str,
     filter: &Document,
     hint: &ResolvedHint,
+    collation: &Collation,
 ) -> std::result::Result<PlannerV2Plan, String> {
     match hint {
         ResolvedHint::Id => {
             let Some(value) = exact_equality_filter_value(filter, "_id") else {
                 return Err("hint _id_ is incompatible with this filter".to_string());
             };
+            if !id_equality_safe_for_collation(value, collation) {
+                return Err(
+                    "hint _id_ is incompatible with non-simple string collation".to_string()
+                );
+            }
             Ok(PlannerV2Plan::IdEquality {
                 id_key: id_key_from_bson(value),
                 diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
             })
         }
         ResolvedHint::Index(index) => {
+            if index.collation != *collation {
+                return Err(format!(
+                    "hint index {} collation is incompatible with this query",
+                    index.name
+                ));
+            }
             if !filter_implies_index_membership(index, filter) {
                 return Err(format!(
                     "hint index {} is unsafe for this filter membership",
@@ -3057,7 +3402,9 @@ fn planner_v2_plan_for_index_shape(index: &IndexSpec, filter: &Document) -> Opti
             ),
         });
     }
-    if let Some(range) = range_planner_key_for_filter(index, filter) {
+    if index.collation.is_simple()
+        && let Some(range) = range_planner_key_for_filter(index, filter)
+    {
         return Some(PlannerV2Plan::IndexRange {
             index_name: index.name.clone(),
             index_key: index.key.clone(),
@@ -3182,13 +3529,27 @@ fn planner_scan_strategy_name(strategy: &PlannerScanStrategy) -> &'static str {
 }
 
 fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<CountPlan> {
+    plan_count_with_collation(conn, namespace, filter, &Collation::Simple)
+}
+
+fn plan_count_with_collation(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    collation: &Collation,
+) -> Result<CountPlan> {
     if filter.is_empty() {
         return Ok(CountPlan::Empty);
     }
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
-        return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
+        if id_equality_safe_for_collation(value, collation) {
+            return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
+        }
     }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        if index.collation != *collation {
+            continue;
+        }
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -3206,6 +3567,9 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
         });
     }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        if index.collation != *collation || !collation.is_simple() {
+            continue;
+        }
         let Some(range) = range_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -3233,7 +3597,10 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     }
     let Some(index) = indexes_for_namespace(conn, namespace)?
         .into_iter()
-        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
+        .find(|index| {
+            index.collation == *collation
+                && single_field_index_name(index).is_some_and(|indexed| indexed == field)
+        })
     else {
         return Ok(CountPlan::Fallback);
     };
@@ -3247,7 +3614,7 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     }
     Ok(CountPlan::IndexedEquality {
         index_name: index.name,
-        key_value: id_key_from_bson(value),
+        key_value: index.collation.id_key_from_bson(value),
     })
 }
 
@@ -3313,6 +3680,7 @@ struct IndexSpec {
     sparse: bool,
     partial_filter: Option<Document>,
     expire_after_seconds: Option<i64>,
+    collation: Collation,
 }
 
 fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
@@ -3362,6 +3730,7 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
                 && existing.sparse == spec.sparse
                 && existing.partial_filter == spec.partial_filter
                 && existing.expire_after_seconds == spec.expire_after_seconds
+                && existing.collation == spec.collation
             {
                 continue;
             }
@@ -3434,6 +3803,9 @@ fn list_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         }
         if let Some(expire_after_seconds) = spec.expire_after_seconds {
             document.insert("expireAfterSeconds", expire_after_seconds);
+        }
+        if !spec.collation.is_simple() {
+            document.insert("collation", spec.collation.to_document());
         }
         batch.push(Bson::Document(document));
     }
@@ -3525,6 +3897,7 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
             "sparse",
             "partialFilterExpression",
             "expireAfterSeconds",
+            "collation",
         ],
     ) {
         return Err(command_error(72, &errmsg));
@@ -3571,6 +3944,20 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
         None => None,
         Some(value) => Some(parse_expire_after_seconds(value)?),
     };
+    let collation = Collation::parse_optional(index, "collation")
+        .map_err(|errmsg| command_error(72, &errmsg))?;
+    if !collation.is_simple() && partial_filter.is_some() {
+        return Err(command_error(
+            72,
+            "collation indexes with partialFilterExpression are not supported",
+        ));
+    }
+    if !collation.is_simple() && expire_after_seconds.is_some() {
+        return Err(command_error(
+            72,
+            "TTL indexes with non-simple collation are not supported",
+        ));
+    }
     if expire_after_seconds.is_some() {
         validate_ttl_index_spec(&key, &name, sparse, partial_filter.as_ref())?;
     }
@@ -3586,6 +3973,7 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
         sparse,
         partial_filter,
         expire_after_seconds,
+        collation,
     })
 }
 
@@ -3778,7 +4166,7 @@ fn insert_index_tx(
     spec: &IndexSpec,
 ) -> std::result::Result<(), rusqlite::Error> {
     tx.execute(
-        "INSERT INTO indexes(namespace, name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO indexes(namespace, name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds, collation_bson) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             namespace,
             spec.name,
@@ -3790,6 +4178,9 @@ fn insert_index_tx(
                 .map(encode_document)
                 .transpose()?,
             spec.expire_after_seconds,
+            (!spec.collation.is_simple())
+                .then(|| encode_document(&spec.collation.to_document()))
+                .transpose()?,
         ],
     )?;
     Ok(())
@@ -3814,7 +4205,7 @@ fn index_by_name_tx(
     name: &str,
 ) -> Result<Option<IndexSpec>> {
     tx.query_row(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 AND name = ?2",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds, collation_bson FROM indexes WHERE namespace = ?1 AND name = ?2",
         params![namespace, name],
         |row| {
             let name = row.get::<_, String>(0)?;
@@ -3826,6 +4217,7 @@ fn index_by_name_tx(
                 .map(decode_document_sql)
                 .transpose()?;
             let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
+            let collation = decode_collation_sql(row.get::<_, Option<Vec<u8>>>(6)?)?;
             Ok(IndexSpec {
                 name,
                 key,
@@ -3833,6 +4225,7 @@ fn index_by_name_tx(
                 sparse,
                 partial_filter,
                 expire_after_seconds,
+                collation,
             })
         },
     )
@@ -3842,7 +4235,7 @@ fn index_by_name_tx(
 
 fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<IndexSpec>> {
     let mut stmt = conn.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds, collation_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -3854,6 +4247,7 @@ fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<Index
             .map(decode_document_sql)
             .transpose()?;
         let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
+        let collation = decode_collation_sql(row.get::<_, Option<Vec<u8>>>(6)?)?;
         Ok(IndexSpec {
             name,
             key,
@@ -3861,6 +4255,7 @@ fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<Index
             sparse,
             partial_filter,
             expire_after_seconds,
+            collation,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -3880,7 +4275,7 @@ fn unique_indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds, collation_bson FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -3892,6 +4287,7 @@ fn unique_indexes_for_namespace_tx(
             .map(decode_document_sql)
             .transpose()?;
         let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
+        let collation = decode_collation_sql(row.get::<_, Option<Vec<u8>>>(6)?)?;
         Ok(IndexSpec {
             name,
             key,
@@ -3899,6 +4295,7 @@ fn unique_indexes_for_namespace_tx(
             sparse,
             partial_filter,
             expire_after_seconds,
+            collation,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -3988,7 +4385,7 @@ fn unique_conflict_check_with_index_entries_tx(
             [value] if is_unique_pushdown_scalar(value) => *value,
             _ => return Ok(false),
         };
-        id_key_from_bson(value)
+        index.collation.id_key_from_bson(value)
     } else {
         let Some(key_value) =
             compound_key_from_document(index, document, is_unique_pushdown_scalar)
@@ -4086,17 +4483,20 @@ fn unique_key_for_document(
                 ));
             }
         };
-        parts.push(format!("{field}:{}", unique_key_value(&value)));
+        parts.push(format!(
+            "{field}:{}",
+            unique_key_value_with_collation(&value, &index.collation)
+        ));
     }
     Ok(parts.join("|"))
 }
 
-fn unique_key_value(value: &Bson) -> String {
+fn unique_key_value_with_collation(value: &Bson, collation: &Collation) -> String {
     if let Some(number) = numeric_value(value) {
         let normalized = if number == 0.0 { 0.0 } else { number };
         return format!("num:{:016x}", normalized.to_bits());
     }
-    id_key_from_bson(value)
+    collation.id_key_from_bson(value)
 }
 
 fn rebuild_index_entries_tx(
@@ -4253,13 +4653,15 @@ fn planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<Strin
             return supported_single_field_multikey_values(document, field)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|value| id_key_from_bson(&value))
+                .map(|value| spec.collation.id_key_from_bson(&value))
                 .collect();
         }
         return get_document_path(document, field)
             .map(|value| {
-                let mut keys = vec![id_key_from_bson(value)];
-                if let Some(range_key) = range_planner_key_value(&[], value) {
+                let mut keys = vec![spec.collation.id_key_from_bson(value)];
+                if let Some(range_key) =
+                    range_planner_key_value_for_collation(&[], value, &spec.collation)
+                {
                     keys.push(range_key);
                 }
                 keys
@@ -4280,14 +4682,16 @@ fn compound_planner_keys_for_document(spec: &IndexSpec, document: &Document) -> 
         let Some(value) = get_document_path(document, field) else {
             break;
         };
-        if let Some(range_key) = range_planner_key_value(&prefix_parts, value) {
+        if let Some(range_key) =
+            range_planner_key_value_for_collation(&prefix_parts, value, &spec.collation)
+        {
             keys.push(range_key);
         }
         if !is_compound_planner_scalar(value) {
             break;
         }
         if position + 1 < key_len {
-            prefix_parts.push(id_key_from_bson(value));
+            prefix_parts.push(spec.collation.id_key_from_bson(value));
             keys.push(encode_compound_prefix_planner_key(&prefix_parts));
         }
     }
@@ -4352,7 +4756,7 @@ fn compound_key_from_document(
         if !is_safe_value(value) {
             return None;
         }
-        parts.push(id_key_from_bson(value));
+        parts.push(spec.collation.id_key_from_bson(value));
     }
     Some(encode_compound_planner_key(&parts))
 }
@@ -4367,7 +4771,7 @@ fn compound_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Optio
         if !is_compound_planner_scalar(value) {
             return None;
         }
-        parts.push(id_key_from_bson(value));
+        parts.push(spec.collation.id_key_from_bson(value));
     }
     Some(encode_compound_planner_key(&parts))
 }
@@ -4403,11 +4807,14 @@ fn range_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<R
             if !is_compound_planner_scalar(value) {
                 return None;
             }
-            equality_parts.push(id_key_from_bson(value));
+            equality_parts.push(spec.collation.id_key_from_bson(value));
             continue;
         }
 
         let condition = filter.get(field)?;
+        if !spec.collation.is_simple() && condition_has_string_range(condition) {
+            return None;
+        }
         let (lower, upper) = range_bounds_for_condition(condition)?;
         return Some(RangePlannerKey {
             field: field.to_string(),
@@ -4418,6 +4825,16 @@ fn range_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<R
         });
     }
     None
+}
+
+fn condition_has_string_range(condition: &Bson) -> bool {
+    let Bson::Document(operators) = condition else {
+        return false;
+    };
+    operators.iter().any(|(operator, value)| {
+        matches!(operator.as_str(), "$gt" | "$gte" | "$lt" | "$lte")
+            && matches!(value, Bson::String(_))
+    })
 }
 
 fn range_bounds_for_condition(
@@ -4485,7 +4902,7 @@ fn planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<String>
         if !is_compound_planner_scalar(value) {
             return None;
         }
-        return Some(id_key_from_bson(value));
+        return Some(spec.collation.id_key_from_bson(value));
     }
     compound_planner_key_for_filter(spec, filter)
 }
@@ -4668,7 +5085,14 @@ fn encode_range_planner_prefix(equality_parts: &[String]) -> String {
     key
 }
 
-fn range_planner_key_value(equality_parts: &[String], range_value: &Bson) -> Option<String> {
+fn range_planner_key_value_for_collation(
+    equality_parts: &[String],
+    range_value: &Bson,
+    collation: &Collation,
+) -> Option<String> {
+    if !collation.is_simple() && matches!(range_value, Bson::String(_)) {
+        return None;
+    }
     let (_, sortable) = sortable_range_value_key(range_value)?;
     Some(format!(
         "{}{}",
@@ -4696,7 +5120,7 @@ fn indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds, collation_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -4708,6 +5132,7 @@ fn indexes_for_namespace_tx(
             .map(decode_document_sql)
             .transpose()?;
         let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
+        let collation = decode_collation_sql(row.get::<_, Option<Vec<u8>>>(6)?)?;
         Ok(IndexSpec {
             name,
             key,
@@ -4715,6 +5140,7 @@ fn indexes_for_namespace_tx(
             sparse,
             partial_filter,
             expire_after_seconds,
+            collation,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -5559,21 +5985,24 @@ fn validate_update_entry_shape_tx(
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint"])?;
+    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint", "collation"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "update entry requires q document".to_string())?;
     validate_filter_shape(query).map_err(|err| err.errmsg)?;
+    let collation = Collation::parse_optional(entry, "collation")?;
+    validate_filter_for_collation(query, &collation).map_err(|err| err.errmsg)?;
     let update = entry
         .get_document("u")
         .map_err(|_| "update entry requires u document".to_string())?;
     optional_bool_doc(entry, "upsert")?;
     optional_bool_doc(entry, "multi")?;
     if let Some(hint) = parse_optional_hint(entry)? {
-        resolve_hint(
+        let resolved = resolve_hint(
             indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
             hint,
         )?;
+        validate_hint_collation(&resolved, &collation, query)?;
     }
     classify_update(update)?;
     Ok(())
@@ -5588,7 +6017,7 @@ fn apply_update_entry(
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint"])?;
+    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint", "collation"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "update entry requires q document".to_string())?;
@@ -5597,6 +6026,7 @@ fn apply_update_entry(
         .map_err(|_| "update entry requires u document".to_string())?;
     let upsert = optional_bool_doc(entry, "upsert")?.unwrap_or(false);
     let multi = optional_bool_doc(entry, "multi")?.unwrap_or(false);
+    let collation = Collation::parse_optional(entry, "collation")?;
     let hint = match parse_optional_hint(entry)? {
         Some(hint) => Some(resolve_hint(
             indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
@@ -5607,8 +6037,10 @@ fn apply_update_entry(
     let update = classify_update(update)?;
 
     let mut matches = Vec::new();
-    for stored in transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref())? {
-        match matches_filter(&stored.document, query) {
+    for stored in
+        transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref(), &collation)?
+    {
+        match matches_filter_with_collation(&stored.document, query, &collation) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}
             Err(err) => return Err(err.errmsg),
@@ -5746,12 +6178,26 @@ fn plan_transaction_candidates(
     namespace: &str,
     filter: &Document,
 ) -> Result<TransactionCandidatePlan> {
+    plan_transaction_candidates_with_collation(tx, namespace, filter, &Collation::Simple)
+}
+
+fn plan_transaction_candidates_with_collation(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+    collation: &Collation,
+) -> Result<TransactionCandidatePlan> {
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
-        return Ok(TransactionCandidatePlan::IdEquality(id_key_from_bson(
-            value,
-        )));
+        if id_equality_safe_for_collation(value, collation) {
+            return Ok(TransactionCandidatePlan::IdEquality(id_key_from_bson(
+                value,
+            )));
+        }
     }
     for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
+        if index.collation != *collation {
+            continue;
+        }
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -5768,6 +6214,9 @@ fn plan_transaction_candidates(
         });
     }
     for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
+        if index.collation != *collation || !collation.is_simple() {
+            continue;
+        }
         let Some(range) = range_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -5783,6 +6232,9 @@ fn plan_transaction_candidates(
         });
     }
     for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
+        if index.collation != *collation {
+            continue;
+        }
         let Some((_, key_value)) = prefix_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -5805,7 +6257,16 @@ fn transaction_candidate_documents(
     namespace: &str,
     filter: &Document,
 ) -> Result<Vec<StoredDocument>> {
-    match plan_transaction_candidates(tx, namespace, filter)? {
+    transaction_candidate_documents_with_collation(tx, namespace, filter, &Collation::Simple)
+}
+
+fn transaction_candidate_documents_with_collation(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+    collation: &Collation,
+) -> Result<Vec<StoredDocument>> {
+    match plan_transaction_candidates_with_collation(tx, namespace, filter, collation)? {
         TransactionCandidatePlan::IdEquality(id_key) => {
             Ok(stored_document_by_id_key_tx(tx, namespace, &id_key)?
                 .into_iter()
@@ -5838,22 +6299,27 @@ fn transaction_candidate_documents_with_hint(
     namespace: &str,
     filter: &Document,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<Vec<StoredDocument>, String> {
     match hint {
-        None => {
-            transaction_candidate_documents(tx, namespace, filter).map_err(|err| err.to_string())
-        }
+        None => transaction_candidate_documents_with_collation(tx, namespace, filter, collation)
+            .map_err(|err| err.to_string()),
         Some(ResolvedHint::Id) => {
             let Some(value) = exact_equality_filter_value(filter, "_id") else {
                 return Err("hint _id_ is incompatible with this filter".to_string());
             };
+            if !id_equality_safe_for_collation(value, collation) {
+                return Err(
+                    "hint _id_ is incompatible with non-simple string collation".to_string()
+                );
+            }
             stored_document_by_id_key_tx(tx, namespace, &id_key_from_bson(value))
                 .map(|document| document.into_iter().collect())
                 .map_err(|err| err.to_string())
         }
-        Some(ResolvedHint::Index(index)) => {
-            hinted_transaction_candidate_documents_for_index(tx, namespace, filter, index)
-        }
+        Some(ResolvedHint::Index(index)) => hinted_transaction_candidate_documents_for_index(
+            tx, namespace, filter, index, collation,
+        ),
     }
 }
 
@@ -5862,7 +6328,14 @@ fn hinted_transaction_candidate_documents_for_index(
     namespace: &str,
     filter: &Document,
     index: &IndexSpec,
+    collation: &Collation,
 ) -> std::result::Result<Vec<StoredDocument>, String> {
+    if index.collation != *collation {
+        return Err(format!(
+            "hint index {} collation is incompatible with this query",
+            index.name
+        ));
+    }
     if !filter_implies_index_membership(index, filter) {
         return Err(format!(
             "hint index {} is unsafe for this filter membership",
@@ -5881,7 +6354,9 @@ fn hinted_transaction_candidate_documents_for_index(
         return indexed_candidate_documents_tx(tx, namespace, &index.name, &key_value)
             .map_err(|err| err.to_string());
     }
-    if let Some(range) = range_planner_key_for_filter(index, filter) {
+    if collation.is_simple()
+        && let Some(range) = range_planner_key_for_filter(index, filter)
+    {
         return indexed_candidate_documents_tx_by_range(tx, namespace, &index.name, &range)
             .map_err(|err| err.to_string());
     }
@@ -6924,11 +7399,13 @@ fn validate_delete_entry_shape_tx(
     let Bson::Document(entry) = entry else {
         return Err("delete entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "limit", "hint"])?;
+    reject_unsupported_entry_keys(entry, &["q", "limit", "hint", "collation"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "delete entry requires q document".to_string())?;
     validate_filter_shape(query).map_err(|err| err.errmsg)?;
+    let collation = Collation::parse_optional(entry, "collation")?;
+    validate_filter_for_collation(query, &collation).map_err(|err| err.errmsg)?;
     match entry.get("limit") {
         Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => {}
         Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {}
@@ -6936,10 +7413,11 @@ fn validate_delete_entry_shape_tx(
         None => return Err("delete entry requires limit".to_string()),
     }
     if let Some(hint) = parse_optional_hint(entry)? {
-        resolve_hint(
+        let resolved = resolve_hint(
             indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
             hint,
         )?;
+        validate_hint_collation(&resolved, &collation, query)?;
     }
     Ok(())
 }
@@ -6952,7 +7430,7 @@ fn apply_delete_entry(
     let Bson::Document(entry) = entry else {
         return Err("delete entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "limit", "hint"])?;
+    reject_unsupported_entry_keys(entry, &["q", "limit", "hint", "collation"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "delete entry requires q document".to_string())?;
@@ -6969,10 +7447,13 @@ fn apply_delete_entry(
         )?),
         None => None,
     };
+    let collation = Collation::parse_optional(entry, "collation")?;
 
     let mut targets = Vec::new();
-    for stored in transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref())? {
-        match matches_filter(&stored.document, query) {
+    for stored in
+        transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref(), &collation)?
+    {
+        match matches_filter_with_collation(&stored.document, query, &collation) {
             Ok(true) => targets.push(stored.id_key),
             Ok(false) => {}
             Err(err) => return Err(err.errmsg),
@@ -7033,11 +7514,19 @@ fn find_documents_with_state(
             "singleBatch",
             "hint",
             "explain",
+            "collation",
             "$db",
             "lsid",
         ],
     ) {
         return Ok(command_error(72, &errmsg));
+    }
+    let collation = match Collation::parse_optional(command, "collation") {
+        Ok(collation) => collation,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
+    if let Err(err) = validate_filter_for_collation(&filter, &collation) {
+        return Ok(command_error(err.code, &err.errmsg));
     }
     if let Err(errmsg) = optional_bool(command, "singleBatch") {
         return Ok(command_error(9, &errmsg));
@@ -7085,7 +7574,14 @@ fn find_documents_with_state(
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
     if explain {
-        return match planner_v2_plan_for_find(conn, &ns, &filter, sort.as_deref(), hint.as_ref()) {
+        return match planner_v2_plan_for_find(
+            conn,
+            &ns,
+            &filter,
+            sort.as_deref(),
+            hint.as_ref(),
+            &collation,
+        ) {
             Ok(plan) => Ok(explain_response(
                 "find",
                 &ns,
@@ -7105,6 +7601,7 @@ fn find_documents_with_state(
         && projection.is_none()
         && batch_size > 0
         && let Some(id_filter) = simple_id_equality_filter(&filter)
+        && id_equality_safe_for_collation(id_filter, &collation)
     {
         let wanted_id = id_key_from_bson(id_filter);
         if let Some(document) = conn
@@ -7137,6 +7634,7 @@ fn find_documents_with_state(
         limit,
         projection.as_ref(),
         hint.as_ref(),
+        &collation,
     ) {
         Ok(docs) => docs,
         Err(err) => return Ok(command_error(err.code, &err.errmsg)),
@@ -7543,19 +8041,25 @@ fn parse_sort_document(sort: &Document) -> std::result::Result<Vec<(String, i32)
     Ok(spec)
 }
 
-fn sort_documents(documents: &mut [Document], sort: &[(String, i32)]) {
-    documents.sort_by(|left, right| compare_documents_for_sort(left, right, sort));
+fn sort_documents_with_collation(
+    documents: &mut [Document],
+    sort: &[(String, i32)],
+    collation: &Collation,
+) {
+    documents.sort_by(|left, right| compare_documents_for_sort(left, right, sort, collation));
 }
 
 fn compare_documents_for_sort(
     left: &Document,
     right: &Document,
     sort: &[(String, i32)],
+    collation: &Collation,
 ) -> std::cmp::Ordering {
     for (field, direction) in sort {
         let ordering = compare_optional_bson(
             get_document_path(left, field),
             get_document_path(right, field),
+            collation,
         );
         if !ordering.is_eq() {
             return if *direction == 1 {
@@ -7565,33 +8069,32 @@ fn compare_documents_for_sort(
             };
         }
     }
-    compare_optional_bson(left.get("_id"), right.get("_id"))
+    compare_optional_bson(left.get("_id"), right.get("_id"), collation)
 }
 
-fn compare_optional_bson(left: Option<&Bson>, right: Option<&Bson>) -> std::cmp::Ordering {
+fn compare_optional_bson(
+    left: Option<&Bson>,
+    right: Option<&Bson>,
+    collation: &Collation,
+) -> std::cmp::Ordering {
     match (left, right) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(left), Some(right)) => compare_bson_order(left, right),
+        (Some(left), Some(right)) => compare_bson_order_with_collation(left, right, collation),
     }
 }
 
 fn compare_bson_order(left: &Bson, right: &Bson) -> std::cmp::Ordering {
-    match (numeric_value(left), numeric_value(right)) {
-        (Some(left), Some(right)) => {
-            return left
-                .partial_cmp(&right)
-                .unwrap_or(std::cmp::Ordering::Equal);
-        }
-        _ => {}
-    }
+    compare_bson_order_with_collation(left, right, &Collation::Simple)
+}
 
-    let left_rank = bson_type_rank(left);
-    let right_rank = bson_type_rank(right);
-    left_rank
-        .cmp(&right_rank)
-        .then_with(|| format!("{left:?}").cmp(&format!("{right:?}")))
+fn compare_bson_order_with_collation(
+    left: &Bson,
+    right: &Bson,
+    collation: &Collation,
+) -> std::cmp::Ordering {
+    collation.compare_order(left, right)
 }
 
 fn bson_type_rank(value: &Bson) -> i32 {
@@ -7617,12 +8120,28 @@ fn simple_id_equality_filter(filter: &Document) -> Option<&Bson> {
     }
 }
 
+fn id_equality_safe_for_collation(value: &Bson, collation: &Collation) -> bool {
+    collation.is_simple() || !matches!(value, Bson::String(_))
+}
+
 fn indexed_candidate_documents(
     conn: &Connection,
     namespace: &str,
     filter: &Document,
 ) -> Result<Option<Vec<Document>>> {
+    indexed_candidate_documents_with_collation(conn, namespace, filter, &Collation::Simple)
+}
+
+fn indexed_candidate_documents_with_collation(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    collation: &Collation,
+) -> Result<Option<Vec<Document>>> {
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        if index.collation != *collation {
+            continue;
+        }
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -7635,6 +8154,9 @@ fn indexed_candidate_documents(
         return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
     }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        if index.collation != *collation || !collation.is_simple() {
+            continue;
+        }
         let Some(range) = range_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -7647,6 +8169,9 @@ fn indexed_candidate_documents(
         return indexed_candidate_documents_by_range(conn, namespace, &index.name, &range);
     }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        if index.collation != *collation {
+            continue;
+        }
         let Some((_, key_value)) = prefix_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -7681,18 +8206,24 @@ fn hinted_candidate_documents(
     namespace: &str,
     filter: &Document,
     hint: &ResolvedHint,
+    collation: &Collation,
 ) -> std::result::Result<Vec<Document>, String> {
     match hint {
         ResolvedHint::Id => {
             let Some(value) = exact_equality_filter_value(filter, "_id") else {
                 return Err("hint _id_ is incompatible with this filter".to_string());
             };
+            if !id_equality_safe_for_collation(value, collation) {
+                return Err(
+                    "hint _id_ is incompatible with non-simple string collation".to_string()
+                );
+            }
             stored_document_by_id_key(conn, namespace, &id_key_from_bson(value))
                 .map(|document| document.into_iter().collect())
                 .map_err(|err| err.to_string())
         }
         ResolvedHint::Index(index) => {
-            hinted_candidate_documents_for_index(conn, namespace, filter, index)
+            hinted_candidate_documents_for_index(conn, namespace, filter, index, collation)
         }
     }
 }
@@ -7702,7 +8233,14 @@ fn hinted_candidate_documents_for_index(
     namespace: &str,
     filter: &Document,
     index: &IndexSpec,
+    collation: &Collation,
 ) -> std::result::Result<Vec<Document>, String> {
+    if index.collation != *collation {
+        return Err(format!(
+            "hint index {} collation is incompatible with this query",
+            index.name
+        ));
+    }
     if !filter_implies_index_membership(index, filter) {
         return Err(format!(
             "hint index {} is unsafe for this filter membership",
@@ -7722,7 +8260,9 @@ fn hinted_candidate_documents_for_index(
             .map_err(|err| err.to_string())?
             .ok_or_else(|| format!("hint index {} could not be scanned", index.name));
     }
-    if let Some(range) = range_planner_key_for_filter(index, filter) {
+    if collation.is_simple()
+        && let Some(range) = range_planner_key_for_filter(index, filter)
+    {
         return indexed_candidate_documents_by_range(conn, namespace, &index.name, &range)
             .map_err(|err| err.to_string())?
             .ok_or_else(|| format!("hint index {} could not be range scanned", index.name));
@@ -7803,7 +8343,11 @@ fn sort_pushdown_plan(
     filter: &Document,
     sort: &[(String, i32)],
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<Option<SortPushdownPlan>, String> {
+    if !collation.is_simple() {
+        return Ok(None);
+    }
     if sort.len() != 1 {
         return Ok(None);
     }
@@ -7816,6 +8360,9 @@ fn sort_pushdown_plan(
         }
     };
     for index in indexes {
+        if !index.collation.is_simple() {
+            continue;
+        }
         if index.sparse || index.partial_filter.is_some() {
             continue;
         }
@@ -7990,8 +8537,9 @@ fn candidate_documents(
     conn: &Connection,
     namespace: &str,
     filter: &Document,
+    collation: &Collation,
 ) -> Result<Vec<Document>> {
-    match indexed_candidate_documents(conn, namespace, filter)? {
+    match indexed_candidate_documents_with_collation(conn, namespace, filter, collation)? {
         Some(documents) => Ok(documents),
         None => documents_for_namespace(conn, namespace),
     }
@@ -8002,10 +8550,13 @@ fn candidate_documents_with_hint(
     namespace: &str,
     filter: &Document,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<Vec<Document>, String> {
     match hint {
-        Some(hint) => hinted_candidate_documents(conn, namespace, filter, hint),
-        None => candidate_documents(conn, namespace, filter).map_err(|err| err.to_string()),
+        Some(hint) => hinted_candidate_documents(conn, namespace, filter, hint, collation),
+        None => {
+            candidate_documents(conn, namespace, filter, collation).map_err(|err| err.to_string())
+        }
     }
 }
 
@@ -8018,18 +8569,35 @@ fn query_documents_with_hint(
     limit: Option<usize>,
     projection: Option<&ProjectionSpec>,
     hint: Option<&ResolvedHint>,
+    collation: &Collation,
 ) -> std::result::Result<Vec<Document>, MatchError> {
     if let Some(sort) = sort
-        && let Some(plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint)
+        && let Some(plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint, collation)
             .map_err(|err| match_error(2, err))?
     {
         let source_documents = indexed_candidate_documents_by_sort(conn, namespace, &plan)
             .map_err(|err| match_error(2, err.to_string()))?;
-        return shape_documents(source_documents, filter, None, skip, limit, projection);
+        return shape_documents(
+            source_documents,
+            filter,
+            None,
+            skip,
+            limit,
+            projection,
+            collation,
+        );
     }
-    let source_documents = candidate_documents_with_hint(conn, namespace, filter, hint)
+    let source_documents = candidate_documents_with_hint(conn, namespace, filter, hint, collation)
         .map_err(|err| match_error(2, err))?;
-    shape_documents(source_documents, filter, sort, skip, limit, projection)
+    shape_documents(
+        source_documents,
+        filter,
+        sort,
+        skip,
+        limit,
+        projection,
+        collation,
+    )
 }
 
 fn shape_documents(
@@ -8039,16 +8607,17 @@ fn shape_documents(
     skip: usize,
     limit: Option<usize>,
     projection: Option<&ProjectionSpec>,
+    collation: &Collation,
 ) -> MatchResult<Vec<Document>> {
     let mut docs = Vec::new();
     for document in source_documents {
-        if matches_filter(&document, filter)? {
+        if matches_filter_with_collation(&document, filter, collation)? {
             docs.push(document);
         }
     }
 
     if let Some(sort) = sort {
-        sort_documents(&mut docs, sort);
+        sort_documents_with_collation(&mut docs, sort, collation);
     }
     if skip > 0 {
         docs = docs.into_iter().skip(skip).collect();
@@ -8082,12 +8651,20 @@ fn match_error(code: i32, errmsg: impl Into<String>) -> MatchError {
 }
 
 fn matches_filter(document: &Document, filter: &Document) -> MatchResult<bool> {
+    matches_filter_with_collation(document, filter, &Collation::Simple)
+}
+
+fn matches_filter_with_collation(
+    document: &Document,
+    filter: &Document,
+    collation: &Collation,
+) -> MatchResult<bool> {
     for (key, condition) in filter {
         if key.starts_with('$') {
-            if !matches_logical_operator(document, key, condition)? {
+            if !matches_logical_operator(document, key, condition, collation)? {
                 return Ok(false);
             }
-        } else if !matches_field_condition(document, key, condition)? {
+        } else if !matches_field_condition(document, key, condition, collation)? {
             return Ok(false);
         }
     }
@@ -8265,6 +8842,7 @@ fn matches_logical_operator(
     document: &Document,
     operator: &str,
     operand: &Bson,
+    collation: &Collation,
 ) -> MatchResult<bool> {
     if !matches!(operator, "$and" | "$or" | "$nor") {
         return Err(match_error(
@@ -8292,7 +8870,7 @@ fn matches_logical_operator(
                 format!("{operator} entries must be documents"),
             ));
         };
-        results.push(matches_filter(document, clause)?);
+        results.push(matches_filter_with_collation(document, clause, collation)?);
     }
 
     match operator {
@@ -8307,13 +8885,14 @@ fn matches_field_condition(
     document: &Document,
     field: &str,
     condition: &Bson,
+    collation: &Collation,
 ) -> MatchResult<bool> {
     let values = values_at_path(document, field);
     if is_operator_document(condition) {
         let Bson::Document(operators) = condition else {
             unreachable!("operator document checked above");
         };
-        return matches_operator_document(&values, operators);
+        return matches_operator_document_with_collation(&values, operators, collation);
     }
     if matches!(condition, Bson::RegularExpression(_)) {
         return matches_regex_predicate(&values, condition, None);
@@ -8321,10 +8900,18 @@ fn matches_field_condition(
 
     Ok(values
         .iter()
-        .any(|candidate| bson_values_equal(candidate, condition)))
+        .any(|candidate| bson_values_equal_with_collation(candidate, condition, collation)))
 }
 
 fn matches_operator_document(values: &[&Bson], operators: &Document) -> MatchResult<bool> {
+    matches_operator_document_with_collation(values, operators, &Collation::Simple)
+}
+
+fn matches_operator_document_with_collation(
+    values: &[&Bson],
+    operators: &Document,
+    collation: &Collation,
+) -> MatchResult<bool> {
     if operators.keys().any(|key| !key.starts_with('$')) {
         return Err(match_error(
             2,
@@ -8342,7 +8929,7 @@ fn matches_operator_document(values: &[&Bson], operators: &Document) -> MatchRes
         let matched = if operator == "$regex" {
             matches_regex_predicate(values, operand, operators.get("$options"))?
         } else {
-            matches_operator_predicate(values, operator, operand)?
+            matches_operator_predicate(values, operator, operand, collation)?
         };
         if !matched {
             return Ok(false);
@@ -8355,14 +8942,15 @@ fn matches_operator_predicate(
     values: &[&Bson],
     operator: &str,
     operand: &Bson,
+    collation: &Collation,
 ) -> MatchResult<bool> {
     match operator {
         "$eq" => Ok(values
             .iter()
-            .any(|candidate| bson_values_equal(candidate, operand))),
+            .any(|candidate| bson_values_equal_with_collation(candidate, operand, collation))),
         "$ne" => Ok(values
             .iter()
-            .all(|candidate| !bson_values_equal(candidate, operand))),
+            .all(|candidate| !bson_values_equal_with_collation(candidate, operand, collation))),
         "$gt" => Ok(values
             .iter()
             .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_gt()))),
@@ -8382,7 +8970,7 @@ fn matches_operator_predicate(
             Ok(values.iter().any(|candidate| {
                 needles
                     .iter()
-                    .any(|needle| bson_values_equal(candidate, needle))
+                    .any(|needle| bson_values_equal_with_collation(candidate, needle, collation))
             }))
         }
         "$nin" => {
@@ -8392,7 +8980,7 @@ fn matches_operator_predicate(
             Ok(values.iter().all(|candidate| {
                 needles
                     .iter()
-                    .all(|needle| !bson_values_equal(candidate, needle))
+                    .all(|needle| !bson_values_equal_with_collation(candidate, needle, collation))
             }))
         }
         "$exists" => {
@@ -8405,12 +8993,14 @@ fn matches_operator_predicate(
             let Bson::Document(nested) = operand else {
                 return Err(match_error(2, "$not requires a document"));
             };
-            Ok(!matches_operator_document(values, nested)?)
+            Ok(!matches_operator_document_with_collation(
+                values, nested, collation,
+            )?)
         }
         "$type" => matches_type_predicate(values, operand),
         "$size" => matches_size_predicate(values, operand),
-        "$all" => matches_all_predicate(values, operand),
-        "$elemMatch" => matches_elem_match_predicate(values, operand),
+        "$all" => matches_all_predicate(values, operand, collation),
+        "$elemMatch" => matches_elem_match_predicate(values, operand, collation),
         _ => Err(match_error(
             2,
             format!("unsupported query operator {operator}"),
@@ -8529,7 +9119,11 @@ fn parse_non_negative_i32(value: &Bson, operator: &str) -> MatchResult<i32> {
     Ok(size)
 }
 
-fn matches_all_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+fn matches_all_predicate(
+    values: &[&Bson],
+    operand: &Bson,
+    collation: &Collation,
+) -> MatchResult<bool> {
     let Bson::Array(required) = operand else {
         return Err(match_error(2, "$all requires an array"));
     };
@@ -8556,16 +9150,16 @@ fn matches_all_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> 
                 Some(elem_match) => {
                     let mut matched = false;
                     for candidate_value in candidate_values {
-                        if matches_elem_match_value(candidate_value, elem_match)? {
+                        if matches_elem_match_value(candidate_value, elem_match, collation)? {
                             matched = true;
                             break;
                         }
                     }
                     matched
                 }
-                None => candidate_values
-                    .iter()
-                    .any(|candidate_value| bson_values_equal(candidate_value, required_value)),
+                None => candidate_values.iter().any(|candidate_value| {
+                    bson_values_equal_with_collation(candidate_value, required_value, collation)
+                }),
             };
             if !matched {
                 all_matched = false;
@@ -8586,7 +9180,11 @@ fn elem_match_operand(value: &Bson) -> Option<&Bson> {
     }
 }
 
-fn matches_elem_match_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+fn matches_elem_match_predicate(
+    values: &[&Bson],
+    operand: &Bson,
+    collation: &Collation,
+) -> MatchResult<bool> {
     let Bson::Document(predicate) = operand else {
         return Err(match_error(2, "$elemMatch requires a document"));
     };
@@ -8598,7 +9196,7 @@ fn matches_elem_match_predicate(values: &[&Bson], operand: &Bson) -> MatchResult
             continue;
         };
         for candidate_value in candidate_values {
-            if matches_elem_match_value(candidate_value, operand)? {
+            if matches_elem_match_value(candidate_value, operand, collation)? {
                 return Ok(true);
             }
         }
@@ -8606,7 +9204,11 @@ fn matches_elem_match_predicate(values: &[&Bson], operand: &Bson) -> MatchResult
     Ok(false)
 }
 
-fn matches_elem_match_value(value: &Bson, operand: &Bson) -> MatchResult<bool> {
+fn matches_elem_match_value(
+    value: &Bson,
+    operand: &Bson,
+    collation: &Collation,
+) -> MatchResult<bool> {
     let Bson::Document(predicate) = operand else {
         return Err(match_error(2, "$elemMatch requires a document"));
     };
@@ -8619,9 +9221,9 @@ fn matches_elem_match_value(value: &Bson, operand: &Bson) -> MatchResult<bool> {
                 .keys()
                 .all(|key| is_scalar_elem_match_operator(key)) =>
         {
-            matches_filter(document, predicate)
+            matches_filter_with_collation(document, predicate, collation)
         }
-        _ => matches_operator_document(&[value], predicate),
+        _ => matches_operator_document_with_collation(&[value], predicate, collation),
     }
 }
 
@@ -8739,18 +9341,15 @@ fn values_at_path_parts<'a>(value: &'a Bson, parts: &[&str]) -> Vec<&'a Bson> {
 }
 
 fn bson_values_equal(candidate: &Bson, expected: &Bson) -> bool {
-    if let Bson::Array(values) = candidate {
-        if !matches!(expected, Bson::Array(_)) {
-            return values
-                .iter()
-                .any(|value| bson_values_equal(value, expected));
-        }
-    }
+    bson_values_equal_with_collation(candidate, expected, &Collation::Simple)
+}
 
-    match (numeric_value(candidate), numeric_value(expected)) {
-        (Some(left), Some(right)) => left == right,
-        _ => candidate == expected,
-    }
+fn bson_values_equal_with_collation(
+    candidate: &Bson,
+    expected: &Bson,
+    collation: &Collation,
+) -> bool {
+    collation.values_equal(candidate, expected)
 }
 
 fn compare_bson(
@@ -8831,6 +9430,20 @@ fn encode_document(document: &Document) -> std::result::Result<Vec<u8>, rusqlite
 fn decode_document_sql(bytes: Vec<u8>) -> std::result::Result<Document, rusqlite::Error> {
     Document::from_reader(&mut Cursor::new(bytes)).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(err))
+    })
+}
+
+fn decode_collation_sql(bytes: Option<Vec<u8>>) -> std::result::Result<Collation, rusqlite::Error> {
+    let Some(bytes) = bytes else {
+        return Ok(Collation::Simple);
+    };
+    let document = decode_document_sql(bytes)?;
+    Collation::parse_document(&document).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::other(err)),
+        )
     })
 }
 
@@ -8993,6 +9606,131 @@ mod tests {
 
     fn bson_documents(values: Vec<Document>) -> Vec<Bson> {
         values.into_iter().map(Bson::Document).collect()
+    }
+
+    #[test]
+    fn collation_parser_accepts_supported_subset_and_rejects_unsupported_shapes() {
+        assert_eq!(
+            Collation::parse_bson(&Bson::Document(doc! { "locale": "simple" })).unwrap(),
+            Collation::Simple
+        );
+        assert_eq!(
+            Collation::parse_bson(&Bson::Document(doc! { "locale": "en", "strength": 2_i32 }))
+                .unwrap(),
+            Collation::EnglishCaseInsensitive
+        );
+        assert_eq!(
+            Collation::parse_bson(&Bson::Document(
+                doc! { "locale": "en_US", "strength": 2_i64 }
+            ))
+            .unwrap(),
+            Collation::EnglishCaseInsensitive
+        );
+
+        for value in [
+            Bson::String("bad".to_string()),
+            Bson::Document(doc! {}),
+            Bson::Document(doc! { "locale": "simple", "strength": 2_i32 }),
+            Bson::Document(doc! { "locale": "en" }),
+            Bson::Document(doc! { "locale": "en", "strength": 1_i32 }),
+            Bson::Document(doc! { "locale": "sv", "strength": 2_i32 }),
+            Bson::Document(doc! { "locale": "en", "strength": 2_i32, "numericOrdering": true }),
+            Bson::Document(doc! { "locale": "en", "strength": 2_i32, "caseLevel": false }),
+        ] {
+            assert!(Collation::parse_bson(&value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn collation_comparison_preserves_binary_and_supports_case_insensitive_strings() {
+        let simple = Collation::Simple;
+        let ci = Collation::EnglishCaseInsensitive;
+
+        assert!(!bson_values_equal_with_collation(
+            &Bson::String("Ada".to_string()),
+            &Bson::String("ada".to_string()),
+            &simple,
+        ));
+        assert!(bson_values_equal_with_collation(
+            &Bson::String("Ada".to_string()),
+            &Bson::String("ada".to_string()),
+            &ci,
+        ));
+        assert!(bson_values_equal_with_collation(
+            &Bson::Array(bson_strings(&["Ada", "Grace"])),
+            &Bson::String("ada".to_string()),
+            &ci,
+        ));
+        assert!(bson_values_equal_with_collation(
+            &Bson::Int32(1),
+            &Bson::Double(1.0),
+            &ci,
+        ));
+        assert!(!bson_values_equal_with_collation(
+            &Bson::String("resume".to_string()),
+            &Bson::String("resume\u{301}".to_string()),
+            &ci,
+        ));
+
+        assert!(
+            compare_bson_order_with_collation(
+                &Bson::String("Ada".to_string()),
+                &Bson::String("ada".to_string()),
+                &ci,
+            )
+            .is_eq()
+        );
+        assert!(
+            compare_bson_order_with_collation(
+                &Bson::String("Ada".to_string()),
+                &Bson::String("Grace".to_string()),
+                &ci,
+            )
+            .is_lt()
+        );
+    }
+
+    #[test]
+    fn collation_matcher_and_sort_use_case_insensitive_subset() {
+        let ci = Collation::EnglishCaseInsensitive;
+        let document = doc! {
+            "_id": "u1",
+            "name": "Ada",
+            "tags": ["Math", "Logic"],
+            "nested": [{ "city": "ROME" }],
+        };
+
+        for filter in [
+            doc! { "name": "ada" },
+            doc! { "name": { "$eq": "ADA" } },
+            doc! { "name": { "$in": ["grace", "ada"] } },
+            doc! { "name": { "$ne": "grace" } },
+            doc! { "tags": { "$all": ["math", "logic"] } },
+            doc! { "nested": { "$elemMatch": { "city": "rome" } } },
+            doc! { "$or": [{ "name": "grace" }, { "name": "ada" }] },
+        ] {
+            assert!(
+                matches_filter_with_collation(&document, &filter, &ci).unwrap(),
+                "{filter:?}"
+            );
+        }
+
+        assert!(!matches_filter(&document, &doc! { "name": "ada" }).unwrap());
+        assert!(validate_filter_for_collation(&doc! { "name": { "$gt": "a" } }, &ci).is_err());
+
+        let mut documents = vec![
+            doc! { "_id": "b", "name": "ada" },
+            doc! { "_id": "a", "name": "Ada" },
+            doc! { "_id": "c", "name": "Grace" },
+        ];
+        sort_documents_with_collation(&mut documents, &[("name".to_string(), 1)], &ci);
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.get_str("_id").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]
@@ -10722,6 +11460,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         let document = doc! {
             "_id": "u1",
@@ -10741,6 +11480,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         assert_eq!(
             planner_key_for_document(&reversed, &document),
@@ -10767,6 +11507,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
 
         assert_eq!(
@@ -10808,6 +11549,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         let compound = IndexSpec {
             name: "city_active_created_1".to_string(),
@@ -10816,6 +11558,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         let created = IndexSpec {
             name: "created_1".to_string(),
@@ -10824,6 +11567,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
 
         assert!(matches!(
@@ -10884,6 +11628,7 @@ mod tests {
             sparse: true,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         let partial = IndexSpec {
             name: "email_active_partial".to_string(),
@@ -10892,6 +11637,7 @@ mod tests {
             sparse: false,
             partial_filter: Some(doc! { "active": true }),
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
         let tags = IndexSpec {
             name: "tags_1".to_string(),
@@ -10900,6 +11646,7 @@ mod tests {
             sparse: false,
             partial_filter: None,
             expire_after_seconds: None,
+            collation: Collation::Simple,
         };
 
         assert!(matches!(

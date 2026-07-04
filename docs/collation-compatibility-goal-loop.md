@@ -190,7 +190,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Collation parser and comparison model
+- [x] Milestone 0: Collation parser and comparison model
 - [ ] Milestone 1: Collation-aware read matching, sorting, and distinct
 - [ ] Milestone 2: Collation-aware write target selection and no-mutation errors
 - [ ] Milestone 3: Index metadata, unique enforcement, and safe planning
@@ -235,6 +235,12 @@ cargo test collation
 cargo test matcher
 cargo test sort
 ```
+
+Status 2026-07-04: Complete. Added the internal collation parser/model,
+case-insensitive equality/order helpers, matcher/sort threading, and
+collation-aware index key metadata scaffolding. Verified with
+`cargo fmt -- --check`, `cargo test collation`, `cargo test matcher`, and
+`cargo test sort`. Commit: pending.
 
 ## Milestone 1: Collation-Aware Read Matching, Sorting, And Distinct
 
