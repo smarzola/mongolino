@@ -141,7 +141,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Catalog metadata and validator parser
-- [ ] Milestone 1: Create/listCollections/collMod validation metadata
+- [x] Milestone 1: Create/listCollections/collMod validation metadata
 - [ ] Milestone 2: Insert/update/findAndModify enforcement and bypass
 - [ ] Milestone 3: PyMongo e2e, spec corpus, docs, and final hardening
 
@@ -236,6 +236,10 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. `cargo fmt -- --check`, `cargo test validation`, `cargo build`, and `cargo test` passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit hash reported after commit.
 
 ## Milestone 2: Write Enforcement and bypassDocumentValidation
 

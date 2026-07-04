@@ -518,6 +518,7 @@ fn handle_command_with_state(
         "endSessions" => Ok(doc! { "ok": 1.0 }),
         "create" => create_collection(conn, command),
         "listCollections" => list_collections(conn, command),
+        "collMod" => coll_mod(conn, command),
         "drop" => drop_collection(conn, command),
         "dropDatabase" => drop_database(conn, command),
         "count" => count_documents_command(conn, command),
@@ -598,12 +599,26 @@ fn create_collection(conn: &Connection, command: &Document) -> Result<Document> 
             ));
         }
     };
-    if let Some(errmsg) = reject_unsupported_command_keys(command, &["create", "$db", "lsid"]) {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "create",
+            "validator",
+            "validationLevel",
+            "validationAction",
+            "$db",
+            "lsid",
+        ],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
+    let options = match collection_options_from_command(command) {
+        Ok(options) => options,
+        Err(errmsg) => return Ok(command_error(72, &errmsg)),
+    };
 
     let ns = namespace(db, collection);
-    match insert_collection_catalog(conn, db, collection) {
+    match insert_collection_catalog_with_options(conn, db, collection, &options.document) {
         Ok(()) => Ok(doc! { "ok": 1.0 }),
         Err(err) if is_sqlite_constraint(&err) || collection_exists(conn, &ns)? => {
             Ok(command_error(48, "collection already exists"))
@@ -681,7 +696,9 @@ fn list_collections(conn: &Connection, command: &Document) -> Result<Document> {
                 "type": "collection",
             };
             if !name_only {
-                doc.insert("options", Bson::Document(Document::new()));
+                let options =
+                    collection_options_document(conn, &namespace(db, &name)).unwrap_or_default();
+                doc.insert("options", Bson::Document(options));
                 doc.insert("info", Bson::Document(doc! { "readOnly": false }));
                 doc.insert(
                     "idIndex",
@@ -700,6 +717,71 @@ fn list_collections(conn: &Connection, command: &Document) -> Result<Document> {
         },
         "ok": 1.0,
     })
+}
+
+fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("collMod") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "collMod command requires a collection name",
+            ));
+        }
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "collMod",
+            "validator",
+            "validationLevel",
+            "validationAction",
+            "$db",
+            "lsid",
+        ],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+    if !command.contains_key("validator")
+        && !command.contains_key("validationLevel")
+        && !command.contains_key("validationAction")
+    {
+        return Ok(command_error(
+            9,
+            "collMod requires validator, validationLevel, or validationAction",
+        ));
+    }
+
+    let ns = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    if !collection_exists_tx(&tx, &ns)? {
+        return Ok(command_error(26, "collection does not exist"));
+    }
+    let mut options = collection_options_tx(&tx, &ns)?.document;
+    if let Some(value) = command.get("validator") {
+        match value {
+            Bson::Document(validator) if validator.is_empty() => {
+                options.remove("validator");
+            }
+            Bson::Document(validator) => {
+                options.insert("validator", Bson::Document(validator.clone()));
+            }
+            _ => return Ok(command_error(72, "validator must be a document")),
+        }
+    }
+    if let Some(value) = command.get("validationLevel") {
+        options.insert("validationLevel", value.clone());
+    }
+    if let Some(value) = command.get("validationAction") {
+        options.insert("validationAction", value.clone());
+    }
+    if let Err(errmsg) = parse_collection_options(options.clone()) {
+        return Ok(command_error(72, &errmsg));
+    }
+    set_collection_options_tx(&tx, &ns, &options)?;
+    tx.commit()?;
+    Ok(doc! { "ok": 1.0 })
 }
 
 fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
@@ -1943,6 +2025,22 @@ fn parse_collection_options(options: Document) -> std::result::Result<Collection
     })
 }
 
+fn collection_options_from_command(
+    command: &Document,
+) -> std::result::Result<CollectionOptions, String> {
+    let mut options = Document::new();
+    if let Some(value) = command.get("validator") {
+        options.insert("validator", value.clone());
+    }
+    if let Some(value) = command.get("validationLevel") {
+        options.insert("validationLevel", value.clone());
+    }
+    if let Some(value) = command.get("validationAction") {
+        options.insert("validationAction", value.clone());
+    }
+    parse_collection_options(options)
+}
+
 fn collection_options(conn: &Connection, namespace: &str) -> Result<CollectionOptions> {
     let Some(bytes) = conn
         .query_row(
@@ -2247,10 +2345,24 @@ fn insert_collection_catalog(
     db: &str,
     collection: &str,
 ) -> std::result::Result<(), rusqlite::Error> {
+    insert_collection_catalog_with_options(conn, db, collection, &Document::new())
+}
+
+fn insert_collection_catalog_with_options(
+    conn: &Connection,
+    db: &str,
+    collection: &str,
+    options: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
     let ns = namespace(db, collection);
+    let encoded = if options.is_empty() {
+        None
+    } else {
+        Some(encode_document(options)?)
+    };
     conn.execute(
-        "INSERT INTO collections(namespace, db, name) VALUES (?1, ?2, ?3)",
-        params![ns, db, collection],
+        "INSERT INTO collections(namespace, db, name, options_bson) VALUES (?1, ?2, ?3, ?4)",
+        params![ns, db, collection, encoded],
     )?;
     Ok(())
 }
@@ -2271,6 +2383,18 @@ fn ensure_collection_catalog_tx(
 
 fn collection_exists(conn: &Connection, namespace: &str) -> Result<bool> {
     let exists = conn
+        .query_row(
+            "SELECT 1 FROM collections WHERE namespace = ?1",
+            params![namespace],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn collection_exists_tx(tx: &rusqlite::Transaction<'_>, namespace: &str) -> Result<bool> {
+    let exists = tx
         .query_row(
             "SELECT 1 FROM collections WHERE namespace = ?1",
             params![namespace],
@@ -4789,6 +4913,99 @@ mod tests {
     }
 
     #[test]
+    fn validation_metadata_create_list_and_name_only_behave_as_expected() {
+        let conn = test_conn();
+        let validator = doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name"],
+                "properties": { "name": { "bsonType": "string" } }
+            }
+        };
+
+        let create = create_collection(
+            &conn,
+            &doc! {
+                "create": "users",
+                "$db": "app",
+                "validator": validator.clone(),
+                "validationLevel": "strict",
+                "validationAction": "error",
+            },
+        )
+        .unwrap();
+        assert_eq!(create.get_f64("ok").unwrap(), 1.0);
+
+        let list =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        let options = first_batch(&list)[0]
+            .get_document("options")
+            .unwrap()
+            .clone();
+        assert_eq!(options.get_document("validator").unwrap(), &validator);
+        assert_eq!(options.get_str("validationLevel").unwrap(), "strict");
+        assert_eq!(options.get_str("validationAction").unwrap(), "error");
+
+        let name_only = list_collections(
+            &conn,
+            &doc! { "listCollections": 1_i32, "$db": "app", "nameOnly": true },
+        )
+        .unwrap();
+        assert!(!first_batch(&name_only)[0].contains_key("options"));
+    }
+
+    #[test]
+    fn coll_mod_updates_and_clears_validation_metadata() {
+        let conn = test_conn();
+        create_collection(&conn, &doc! { "create": "users", "$db": "app" }).unwrap();
+        let validator = doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name"],
+                "properties": { "name": { "bsonType": "string" } }
+            }
+        };
+
+        let updated = coll_mod(
+            &conn,
+            &doc! {
+                "collMod": "users",
+                "$db": "app",
+                "validator": validator.clone(),
+                "validationLevel": "strict",
+                "validationAction": "error",
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_f64("ok").unwrap(), 1.0);
+        let listed =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        assert_eq!(
+            first_batch(&listed)[0]
+                .get_document("options")
+                .unwrap()
+                .get_document("validator")
+                .unwrap(),
+            &validator
+        );
+
+        let cleared = coll_mod(
+            &conn,
+            &doc! { "collMod": "users", "$db": "app", "validator": {} },
+        )
+        .unwrap();
+        assert_eq!(cleared.get_f64("ok").unwrap(), 1.0);
+        let listed =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        assert!(
+            !first_batch(&listed)[0]
+                .get_document("options")
+                .unwrap()
+                .contains_key("validator")
+        );
+    }
+
+    #[test]
     fn catalog_surfaces_document_only_namespaces_and_write_creates_catalog() {
         let conn = test_conn();
         conn.execute(
@@ -4900,7 +5117,7 @@ mod tests {
         for response in [
             create_collection(
                 &conn,
-                &doc! { "create": "users", "$db": "app", "validator": {} },
+                &doc! { "create": "users", "$db": "app", "capped": true },
             )
             .unwrap(),
             list_collections(
@@ -4915,6 +5132,48 @@ mod tests {
                 &doc! { "dropDatabase": 1_i32, "$db": "app", "writeConcern": { "w": 1_i32 } },
             )
             .unwrap(),
+        ] {
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn validation_metadata_commands_reject_unsupported_and_malformed_options() {
+        let conn = test_conn();
+        create_collection(&conn, &doc! { "create": "users", "$db": "app" }).unwrap();
+
+        for response in [
+            create_collection(
+                &conn,
+                &doc! { "create": "bad", "$db": "app", "validator": { "$jsonSchema": { "bsonType": "object", "additionalProperties": false } } },
+            )
+            .unwrap(),
+            create_collection(
+                &conn,
+                &doc! { "create": "bad", "$db": "app", "validationLevel": "moderate" },
+            )
+            .unwrap(),
+            create_collection(
+                &conn,
+                &doc! { "create": "bad", "$db": "app", "validationAction": "warn" },
+            )
+            .unwrap(),
+            coll_mod(
+                &conn,
+                &doc! { "collMod": "missing", "$db": "app", "validator": {} },
+            )
+            .unwrap(),
+            coll_mod(
+                &conn,
+                &doc! { "collMod": "users", "$db": "app", "validator": { "$jsonSchema": { "bsonType": "object", "properties": { "a.b": { "bsonType": "string" } } } } },
+            )
+            .unwrap(),
+            coll_mod(
+                &conn,
+                &doc! { "collMod": "users", "$db": "app", "expireAfterSeconds": 1_i32 },
+            )
+            .unwrap(),
+            coll_mod(&conn, &doc! { "collMod": "users", "$db": "app" }).unwrap(),
         ] {
             assert_command_error(&response);
         }
