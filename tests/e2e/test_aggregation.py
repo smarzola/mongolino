@@ -111,6 +111,100 @@ def test_aggregate_computed_project_add_set_and_unset(collection):
     ]
 
 
+def test_aggregate_replace_root_replace_with_and_group_computed_operands(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "o1",
+                "customer": {"id": "c1", "name": "Ada"},
+                "price": 7,
+                "tax": 2,
+                "status": "open",
+            },
+            {
+                "_id": "o2",
+                "customer": {"id": "c1", "name": "Ada"},
+                "price": 5,
+                "tax": 1,
+                "status": "closed",
+            },
+            {
+                "_id": "o3",
+                "customer": {"id": "c2", "name": "Grace"},
+                "price": 9,
+                "tax": 3,
+                "status": "open",
+            },
+        ]
+    )
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "o1"}},
+                {"$replaceRoot": {"newRoot": "$customer"}},
+            ]
+        )
+    ) == [{"id": "c1", "name": "Ada"}]
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "o3"}},
+                {
+                    "$replaceWith": {
+                        "customerId": "$customer.id",
+                        "label": {"$concat": ["$customer.name", ":", "$status"]},
+                        "total": {"$add": ["$price", "$tax"]},
+                    }
+                },
+            ]
+        )
+    ) == [{"customerId": "c2", "label": "Grace:open", "total": 12}]
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": {
+                            "customer": "$customer.id",
+                            "open": {"$eq": ["$status", "open"]},
+                        },
+                        "gross": {"$sum": {"$add": ["$price", "$tax"]}},
+                        "avgGross": {"$avg": {"$add": ["$price", "$tax"]}},
+                        "labels": {"$push": {"$concat": ["$customer.name", ":", "$status"]}},
+                        "snapshots": {
+                            "$addToSet": {
+                                "status": "$status",
+                                "total": {"$add": ["$price", "$tax"]},
+                            }
+                        },
+                        "firstTotal": {"$first": {"$add": ["$price", "$tax"]}},
+                        "lastUpper": {"$last": {"$toUpper": "$status"}},
+                        "minTotal": {"$min": {"$add": ["$price", "$tax"]}},
+                        "maxTotal": {"$max": {"$add": ["$price", "$tax"]}},
+                    }
+                },
+                {"$sort": {"gross": -1}},
+                {"$limit": 1},
+            ]
+        )
+    ) == [
+        {
+            "_id": {"customer": "c2", "open": True},
+            "gross": 12,
+            "avgGross": 12.0,
+            "labels": ["Grace:open"],
+            "snapshots": [{"status": "open", "total": 12}],
+            "firstTotal": 12,
+            "lastUpper": "OPEN",
+            "minTotal": 12,
+            "maxTotal": 12,
+        }
+    ]
+
+
 def test_aggregate_match_sort_and_count_with_collation(collection):
     collection.insert_many(
         [
@@ -569,7 +663,6 @@ def test_aggregate_adversarial_errors_and_empty_groups_do_not_leak_state(collect
 
     for pipeline, contains in [
         ([{"$group": {"_id": {"$add": ["$team", 1]}, "n": {"$sum": 1}}}], "$add"),
-        ([{"$group": {"_id": "$team", "values": {"$addToSet": {"score": "$score"}}}}], "$group"),
         ([{"$group": {"_id": {"$sum": 1}, "n": {"$sum": 1}}}], "$group"),
         ([{"$unwind": {"path": "$team", "includeArrayIndex": "team.idx"}}], "$unwind"),
     ]:
@@ -613,6 +706,22 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
                 {"aggregate": collection.name, "pipeline": [{"$group": group}], "cursor": {}}
             )
         assert "$group" in str(excinfo.value)
+
+
+def test_aggregate_replace_root_rejects_malformed_and_non_document_results(collection):
+    seed_scores(collection)
+
+    for pipeline, contains in [
+        ([{"$replaceRoot": "$meta"}], "newRoot"),
+        ([{"$replaceRoot": {}}], "newRoot"),
+        ([{"$replaceRoot": {"newRoot": "$meta", "extra": True}}], "extra"),
+        ([{"$replaceWith": {"$dateDiff": {}}}], "$dateDiff"),
+        ([{"$replaceRoot": {"newRoot": "$missing"}}], "document"),
+        ([{"$replaceWith": "$score"}], "document"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
 
 
 def test_aggregate_shaping_rejects_malformed_paths_and_runtime_errors(collection):

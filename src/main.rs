@@ -1429,6 +1429,20 @@ fn aggregate_pipeline_documents(
                     })
                     .collect();
             }
+            "$replaceRoot" | "$replaceWith" => {
+                let replacement = match parse_aggregate_replace_root_stage(operator, operand) {
+                    Ok(replacement) => replacement,
+                    Err(response) => return Ok(Err(response)),
+                };
+                let mut replaced = Vec::new();
+                for document in documents {
+                    match apply_aggregate_replace_root_stage(&document, &replacement, collation) {
+                        Ok(document) => replaced.push(document),
+                        Err(response) => return Ok(Err(response)),
+                    }
+                }
+                documents = replaced;
+            }
             "$count" => {
                 let Bson::String(field) = operand else {
                     return Ok(Err(command_error(
@@ -1535,7 +1549,10 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
             "$unset" => {
                 parse_aggregate_unset_stage(operand)?;
             }
-            "$replaceRoot" | "$replaceWith" | "$lookup" => {
+            "$replaceRoot" | "$replaceWith" => {
+                parse_aggregate_replace_root_stage(operator, operand)?;
+            }
+            "$lookup" => {
                 return Err(command_error(
                     72,
                     &format!("aggregate stage {operator} is not supported"),
@@ -1613,6 +1630,11 @@ struct AggregationComputedField {
 #[derive(Clone, Debug, PartialEq)]
 struct AggregateUnsetSpec {
     paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateReplaceRootSpec {
+    expression: AggregationExpression,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1841,6 +1863,52 @@ fn validate_aggregation_output_path(
         ));
     }
     validate_aggregation_path(path, context, true)
+}
+
+fn parse_aggregate_replace_root_stage(
+    operator: &str,
+    operand: &Bson,
+) -> std::result::Result<AggregateReplaceRootSpec, Document> {
+    let expression = match operator {
+        "$replaceRoot" => {
+            let Bson::Document(spec) = operand else {
+                return Err(command_error(
+                    9,
+                    "$replaceRoot requires a document with newRoot",
+                ));
+            };
+            for key in spec.keys() {
+                if key != "newRoot" {
+                    return Err(command_error(
+                        72,
+                        &format!("$replaceRoot option {key} is not supported"),
+                    ));
+                }
+            }
+            let Some(new_root) = spec.get("newRoot") else {
+                return Err(command_error(9, "$replaceRoot requires newRoot"));
+            };
+            parse_aggregation_expression(new_root, "$replaceRoot", true)?
+        }
+        "$replaceWith" => parse_aggregation_expression(operand, "$replaceWith", true)?,
+        _ => unreachable!("replace root parser called for checked operators"),
+    };
+    Ok(AggregateReplaceRootSpec { expression })
+}
+
+fn apply_aggregate_replace_root_stage(
+    document: &Document,
+    spec: &AggregateReplaceRootSpec,
+    collation: &Collation,
+) -> std::result::Result<Document, Document> {
+    let context = AggregationExpressionContext::new(document, collation);
+    match spec.expression.evaluate(&context)?.unwrap_or(Bson::Null) {
+        Bson::Document(document) => Ok(document),
+        _ => Err(command_error(
+            9,
+            "$replaceRoot/$replaceWith expression must evaluate to a document",
+        )),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2077,16 +2145,25 @@ fn parse_accumulator_expression(
             Bson::String(value) if value.starts_with('$') => {
                 parse_aggregation_expression(operand, "$group $sum", false)
             }
+            Bson::Document(_) | Bson::Array(_) => {
+                parse_aggregation_expression(operand, "$group $sum", true)
+            }
             _ => Err(command_error(
                 72,
-                "$group $sum supports numeric constants and field paths",
+                "$group $sum supports numeric constants, field paths, and supported expressions",
             )),
         },
         AccumulatorOp::Avg => match operand {
             Bson::String(value) if value.starts_with('$') => {
                 parse_aggregation_expression(operand, "$group $avg", false)
             }
-            _ => Err(command_error(72, "$group $avg supports field paths")),
+            Bson::Document(_) | Bson::Array(_) => {
+                parse_aggregation_expression(operand, "$group $avg", true)
+            }
+            _ => Err(command_error(
+                72,
+                "$group $avg supports field paths and supported expressions",
+            )),
         },
         AccumulatorOp::Min
         | AccumulatorOp::Max
@@ -2094,7 +2171,7 @@ fn parse_accumulator_expression(
         | AccumulatorOp::Last
         | AccumulatorOp::Push
         | AccumulatorOp::AddToSet => {
-            parse_aggregation_expression(operand, "$group accumulator", false)
+            parse_aggregation_expression(operand, "$group accumulator", true)
         }
     }
 }
@@ -14357,6 +14434,171 @@ mod tests {
         )
         .unwrap();
         assert_command_error(&runtime_error);
+    }
+
+    #[test]
+    fn aggregate_replace_root_replace_with_and_group_computed_operands() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "orders",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "o1",
+                        "customer": { "id": "c1", "name": "Ada" },
+                        "price": 7_i32,
+                        "tax": 2_i32,
+                        "status": "open",
+                    },
+                    {
+                        "_id": "o2",
+                        "customer": { "id": "c1", "name": "Ada" },
+                        "price": 5_i32,
+                        "tax": 1_i32,
+                        "status": "closed",
+                    },
+                    {
+                        "_id": "o3",
+                        "customer": { "id": "c2", "name": "Grace" },
+                        "price": 9_i32,
+                        "tax": 3_i32,
+                        "status": "open",
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let replaced = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "o1" } },
+                    { "$replaceRoot": { "newRoot": "$customer" } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&replaced),
+            vec![doc! { "id": "c1", "name": "Ada" }]
+        );
+
+        let computed_root = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "o3" } },
+                    {
+                        "$replaceWith": {
+                            "customerId": "$customer.id",
+                            "label": { "$concat": ["$customer.name", ":", "$status"] },
+                            "total": { "$add": ["$price", "$tax"] },
+                        }
+                    },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&computed_root),
+            vec![doc! { "customerId": "c2", "label": "Grace:open", "total": 12_i64 }]
+        );
+
+        let grouped = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$group": {
+                            "_id": { "customer": "$customer.id", "open": { "$eq": ["$status", "open"] } },
+                            "gross": { "$sum": { "$add": ["$price", "$tax"] } },
+                            "avgGross": { "$avg": { "$add": ["$price", "$tax"] } },
+                            "labels": { "$push": { "$concat": ["$customer.name", ":", "$status"] } },
+                            "snapshots": { "$addToSet": { "status": "$status", "total": { "$add": ["$price", "$tax"] } } },
+                            "firstTotal": { "$first": { "$add": ["$price", "$tax"] } },
+                            "lastUpper": { "$last": { "$toUpper": "$status" } },
+                            "minTotal": { "$min": { "$add": ["$price", "$tax"] } },
+                            "maxTotal": { "$max": { "$add": ["$price", "$tax"] } },
+                        }
+                    },
+                    { "$sort": { "gross": -1_i32 } },
+                    { "$limit": 1_i32 },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&grouped),
+            vec![doc! {
+                "_id": { "customer": "c2", "open": true },
+                "gross": 12_i64,
+                "avgGross": 12.0,
+                "labels": ["Grace:open"],
+                "snapshots": [{ "status": "open", "total": 12_i64 }],
+                "firstTotal": 12_i64,
+                "lastUpper": "OPEN",
+                "minTotal": 12_i64,
+                "maxTotal": 12_i64,
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregate_replace_root_rejects_malformed_and_non_document_results() {
+        let conn = test_conn();
+        seed_ttl_command_fixture(&conn, "bad_replace_root");
+
+        for pipeline in [
+            vec![Bson::Document(doc! { "$replaceRoot": "$profile" })],
+            vec![Bson::Document(doc! { "$replaceRoot": {} })],
+            vec![Bson::Document(
+                doc! { "$replaceRoot": { "newRoot": "$profile", "extra": true } },
+            )],
+            vec![Bson::Document(doc! { "$replaceWith": { "$dateDiff": {} } })],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "bad_replace_root",
+                    "$db": "app",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_invalid_ttl_read_preserves_expired(&conn, "bad_replace_root", response);
+        }
+
+        for pipeline in [
+            vec![Bson::Document(
+                doc! { "$replaceRoot": { "newRoot": "$missing" } },
+            )],
+            vec![Bson::Document(doc! { "$replaceWith": "$expiresAt" })],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "bad_replace_root",
+                    "$db": "app",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
     }
 
     #[test]
