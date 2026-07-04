@@ -418,6 +418,29 @@ def test_unique_index_rejects_array_values(collection):
     assert "does not support array value" in str(excinfo.value)
 
 
+def test_unique_index_rejects_compound_and_dotted_multikey_values(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "u1",
+                "tags": ["math"],
+                "active": True,
+                "contacts": [{"email": "a@example.test"}],
+            },
+        ]
+    )
+
+    with pytest.raises(OperationFailure) as compound_error:
+        collection.create_index([("tags", ASCENDING), ("active", ASCENDING)], unique=True)
+    assert compound_error.value.code == 72
+    assert "does not support array value" in str(compound_error.value)
+
+    with pytest.raises(OperationFailure) as dotted_error:
+        collection.create_index([("contacts.email", ASCENDING)], unique=True)
+    assert dotted_error.value.code == 72
+    assert "does not support multikey path" in str(dotted_error.value)
+
+
 def test_indexed_find_uses_single_field_scalar_multikey_entries(collection):
     collection.insert_many(
         [

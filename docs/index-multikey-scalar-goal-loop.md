@@ -145,7 +145,7 @@ When a milestone is complete:
 - [x] Milestone 0: Multikey entry model and deduplication
 - [x] Milestone 1: Entry maintenance and mutation freshness
 - [x] Milestone 2: Read/count/write planner pushdown
-- [ ] Milestone 3: Unique and unsupported multikey semantics
+- [x] Milestone 3: Unique and unsupported multikey semantics
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Multikey Entry Model And Deduplication
@@ -288,7 +288,7 @@ matcher results. Verified with `cargo fmt -- --check`, `cargo test find`,
 `cargo test count`, `cargo test aggregate_match_count`, `cargo test update`,
 `cargo build`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_crud.py`,
-and `cargo test`. Commit: pending.
+and `cargo test`. Commit: `d01f7a3`.
 
 ## Milestone 3: Unique And Unsupported Multikey Semantics
 
@@ -331,6 +331,15 @@ cargo test index
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py
 cargo test
 ```
+
+Status 2026-07-04: kept unique multikey unsupported explicitly by rejecting any
+unique indexed path that traverses arrays, including single-leaf dotted arrays;
+mapped unsupported unique multikey write errors to code 72; added PyMongo
+coverage for unique array create, compound/dotted unique multikey create,
+update, upsert, and insert errors. Verified with `cargo fmt -- --check`,
+`cargo test unique`, `cargo test index`, `cargo build`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py`,
+and `cargo test`. Commit: pending.
 
 ## Milestone 4: Benchmarks, Docs, And Final Verification
 

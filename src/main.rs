@@ -3016,6 +3016,19 @@ fn unique_key_for_document(
 ) -> std::result::Result<String, String> {
     let mut parts = Vec::new();
     for field in index.key.keys() {
+        if indexed_path_contains_array(document, field) {
+            let direct_value = get_document_path(document, field);
+            if matches!(direct_value, Some(Bson::Array(_))) {
+                return Err(format!(
+                    "unique index {} does not support array value at {field}",
+                    index.name
+                ));
+            }
+            return Err(format!(
+                "unique index {} does not support multikey path {field}",
+                index.name
+            ));
+        }
         let values = values_at_path(document, field);
         let value = match values.as_slice() {
             [] => Bson::Null,
@@ -4498,6 +4511,8 @@ fn update_error_code(errmsg: &str) -> i32 {
         11000
     } else if errmsg.starts_with("Document failed validation") {
         DOCUMENT_VALIDATION_ERROR_CODE
+    } else if errmsg.starts_with("unique index") && errmsg.contains("does not support") {
+        72
     } else {
         2
     }
@@ -4508,6 +4523,8 @@ fn unique_write_error_code(errmsg: &str) -> i32 {
         11000
     } else if errmsg.starts_with("Document failed validation") {
         DOCUMENT_VALIDATION_ERROR_CODE
+    } else if errmsg.starts_with("unique index") && errmsg.contains("does not support") {
+        72
     } else {
         2
     }
@@ -8006,7 +8023,7 @@ mod tests {
             write_errors(&array_rejected_by_unique_index)[0]
                 .get_i32("code")
                 .unwrap(),
-            2
+            72
         );
     }
 

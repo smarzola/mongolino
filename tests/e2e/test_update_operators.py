@@ -453,6 +453,22 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
             {"$setOnInsert": {"email": "ada@example.test"}},
             upsert=True,
         )
+    with pytest.raises(WriteError) as array_update:
+        unique.update_one({"_id": "u2"}, {"$set": {"email": ["array@example.test"]}})
+    assert array_update.value.code == 72
+    assert "does not support array value" in str(array_update.value)
+    with pytest.raises(WriteError) as array_upsert:
+        unique.update_one(
+            {"_id": "u4"},
+            {"$setOnInsert": {"email": ["array@example.test"]}},
+            upsert=True,
+        )
+    assert array_upsert.value.code == 72
+    assert "does not support array value" in str(array_upsert.value)
+    with pytest.raises(WriteError) as array_insert:
+        unique.insert_one({"_id": "u5", "email": ["array@example.test"]})
+    assert array_insert.value.code == 72
+    assert "does not support array value" in str(array_insert.value)
 
     sparse = mongo_client["update_operator_sparse_unique"].users
     sparse.create_index([("email", ASCENDING)], unique=True, sparse=True)
