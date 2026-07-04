@@ -94,6 +94,45 @@ Full local profile after count pushdown:
 | aggregation_match_count | 100 | 7.10 | 14084.18 | 0.071 |
 | aggregation_unwind_group | 100 | 5761.48 | 17.36 | 57.615 |
 
+## Write Targeting And Unique Pushdown Results
+
+Recorded on 2026-07-04 for commit `bd50e45` after SQLite write-targeting and
+unique-conflict pushdown.
+
+Smoke profile: seeded query dataset 400 documents.
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 25 | 43.79 | 28544.76 | 1.752 |
+| find_id_equality | 25 | 0.60 | 41508.17 | 0.024 |
+| find_collection_scan | 25 | 108.50 | 230.42 | 4.340 |
+| find_indexed_scalar_equality | 25 | 6.94 | 3602.95 | 0.278 |
+| count_empty_filter | 25 | 0.62 | 40013.32 | 0.025 |
+| count_simple_equality | 25 | 0.81 | 31054.28 | 0.032 |
+| update_index_refresh | 25 | 9.74 | 2566.88 | 0.390 |
+| aggregation_match_count | 25 | 1.04 | 24143.91 | 0.041 |
+| aggregation_unwind_group | 25 | 194.48 | 128.55 | 7.779 |
+
+Local profile: seeded query dataset 3000 documents.
+
+| Benchmark | Before ms/op | After ms/op | Change |
+| --- | ---: | ---: | ---: |
+| update_index_refresh | 30.707 | 1.147 | 26.8x faster |
+
+Full local profile after write targeting and unique pushdown:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 100 | 272.93 | 36639.35 | 2.729 |
+| find_id_equality | 100 | 2.23 | 44924.48 | 0.022 |
+| find_collection_scan | 100 | 3131.30 | 31.94 | 31.313 |
+| find_indexed_scalar_equality | 100 | 215.11 | 464.88 | 2.151 |
+| count_empty_filter | 100 | 11.83 | 8451.95 | 0.118 |
+| count_simple_equality | 100 | 6.65 | 15045.51 | 0.066 |
+| update_index_refresh | 100 | 114.73 | 871.60 | 1.147 |
+| aggregation_match_count | 100 | 7.40 | 13522.58 | 0.074 |
+| aggregation_unwind_group | 100 | 5775.63 | 17.31 | 57.756 |
+
 ## Interpretation
 
 Current behavior has these SQLite-backed fast paths:
@@ -108,6 +147,12 @@ Current behavior has these SQLite-backed fast paths:
 - Aggregation pipelines exactly shaped as `$match` followed by `$count` reuse
   the same safe count planner and avoid BSON namespace decode when the filter
   is pushdown-safe.
+- update, delete, and findAndModify target selection use transaction-local
+  candidates for exact `_id` equality and safe indexed scalar equality, then
+  still validate every candidate with the Rust matcher before mutating.
+- single-field unique indexes with present non-null scalar values use
+  maintained `index_entries` for duplicate checks; unsupported unique shapes
+  keep the previous scan fallback.
 
 The remaining slow local results cluster around full namespace decode:
 
@@ -119,8 +164,10 @@ The remaining slow local results cluster around full namespace decode:
   cross-type;
 - general aggregation still starts by loading the full namespace into memory,
   then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
-- update target selection still pays scan-like cost when the selected filter is
-  not narrowed enough before applying modifiers and refreshing index entries.
+- write filters outside the conservative planner, including logical operators,
+  multi-predicate filters, unindexed fields, arrays, null/missing semantics,
+  and compound/multikey unique shapes, still use the Rust matcher and scan
+  fallback.
 
 Expect variance between local machines and GitHub-hosted runners. The CI budget
 therefore uses intentionally coarse latency and throughput thresholds. Use JSON
@@ -128,9 +175,9 @@ outputs from the same profile on the same machine for before/after comparisons.
 
 ## SQLite Pushdown Roadmap
 
-The target for the next two uplifts is to make SQLite the query engine whenever
-that is behaviorally equivalent to the supported MongoDB subset, while keeping
-the Rust BSON matcher as a compatibility fallback.
+The target is to make SQLite the query engine whenever that is behaviorally
+equivalent to the supported MongoDB subset, while keeping the Rust BSON matcher
+as a compatibility fallback.
 
 1. Push down `count` for empty filters and simple indexed equality filters.
 
@@ -203,3 +250,29 @@ the Rust BSON matcher as a compatibility fallback.
 
    Measurement: compare `aggregation_unwind_group` and the existing aggregation
    tests for `$unwind`, `$group`, `$push`, and `$addToSet`.
+
+5. Use SQLite for safe write target selection and unique conflict checks.
+
+   Baseline: local `update_index_refresh` was 30.707 ms/op because update,
+   delete, findAndModify, and unique checks could decode full namespaces even
+   when `_id` or maintained index entries were sufficient to narrow work.
+
+   Completed: transaction-local write target loading now supports exact `_id`
+   equality through `(namespace, id_key)` and safe indexed scalar equality
+   through `index_entries`. update, delete, and findAndModify still run the
+   Rust matcher against narrowed candidates before mutation, and findAndModify
+   sorting remains Rust-side. Safe single-field scalar unique checks use
+   `index_entries` while excluding the current document during updates.
+
+   Fallbacks: logical operators, range operators, `$in`/`$nin`/`$ne`, arrays,
+   multi-predicate filters, unindexed fields, null/missing unique semantics,
+   document values, compound indexes, and multikey unique shapes continue
+   through the Rust scan fallback.
+
+   Measurement: local `update_index_refresh` improved from 30.707 to
+   1.147 ms/op.
+
+Remaining pushdown candidates are aggregation-oriented: broader `$match`
+planning inside aggregation pipelines, possible SQLite grouping for bounded
+scalar fields, and any future side-table design for array-heavy `$unwind` and
+`$group` workloads.

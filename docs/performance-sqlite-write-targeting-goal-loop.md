@@ -97,7 +97,7 @@ When a milestone is complete:
 - [x] Milestone 1: Update/delete target narrowing
 - [x] Milestone 2: findAndModify target narrowing
 - [x] Milestone 3: Unique conflict check pushdown
-- [ ] Milestone 4: Benchmarks, docs, and final verification
+- [x] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Transaction Candidate Planner
 
@@ -254,7 +254,7 @@ passed: `cargo fmt -- --check`, `cargo test unique`, `cargo test update`,
 `cargo test find_and_modify`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv
 run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py
 tests/e2e/test_update_operators.py` (unsandboxed), and `cargo test`. Commit:
-pending.
+`bd50e45`.
 
 Likely files:
 
@@ -285,6 +285,19 @@ Acceptance criteria:
 - Ensure CI budget passes.
 - Full verification passes.
 - Milestone status is marked done in this file and committed.
+
+Status 2026-07-04: Done. Ran smoke, local, and CI budget benchmarks; updated
+`docs/performance-baseline.md` with write-targeting after numbers and roadmap
+status. Local `update_index_refresh` improved from 30.707 ms/op to 1.147 ms/op.
+Verification passed: `cargo fmt -- --check`, `cargo test`, `cargo build`,
+`cargo run --bin mongolino-bench -- --profile smoke --json
+/tmp/mongolino-bench-write-smoke.json`, `cargo run --bin mongolino-bench --
+--profile local --json /tmp/mongolino-bench-write-local.json`, `cargo run
+--bin mongolino-bench -- --profile ci --check-budget`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e` (unsandboxed). Commit: pending.
 
 Verification:
 
