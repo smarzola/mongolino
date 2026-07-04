@@ -63,11 +63,25 @@ def test_aggregate_skip_limit_stage_order(collection):
 
 def test_aggregate_count(collection):
     seed_scores(collection)
+    collection.create_index("active", name="active_1")
 
     assert list(collection.aggregate([{"$match": {"active": True}}, {"$count": "total"}])) == [
         {"total": 2}
     ]
+    assert list(collection.aggregate([{"$match": {"_id": "s1"}}, {"$count": "total"}])) == [
+        {"total": 1}
+    ]
     assert list(collection.aggregate([{"$match": {"team": "none"}}, {"$count": "total"}])) == []
+
+
+def test_aggregate_match_count_fallback_preserves_filter_errors(collection):
+    seed_scores(collection)
+
+    with pytest.raises(OperationFailure) as excinfo:
+        list(collection.aggregate([{"$match": {"$where": "this.active"}}, {"$count": "total"}]))
+
+    assert excinfo.value.code == 2
+    assert "$where" in str(excinfo.value)
 
 
 def seed_tagged_items(collection):

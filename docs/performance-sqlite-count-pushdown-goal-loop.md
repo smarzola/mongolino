@@ -96,7 +96,7 @@ When a milestone is complete:
 - [x] Milestone 0: Count planner design and safety tests
 - [x] Milestone 1: Empty and `_id` count pushdown
 - [x] Milestone 2: Indexed scalar equality count pushdown
-- [ ] Milestone 3: Aggregation `$match` + `$count` pushdown
+- [x] Milestone 3: Aggregation `$match` + `$count` pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Count Planner Design And Safety Tests
@@ -203,7 +203,7 @@ Status 2026-07-04:
 - Extended SQLite count pushdown to exact scalar equality filters with a matching maintained single-field index, including dotted scalar paths represented in `index_entries`.
 - Added scalar safety rejection for array, document, and null indexed operands; unsupported, unindexed, and multi-predicate filters continue to fall back to the Rust matcher path.
 - Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test planner`; `cargo test index`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py tests/e2e/test_indexes.py`; `cargo test`.
-- Commit: pending.
+- Commit: `1110639`.
 
 Problem:
 
@@ -246,6 +246,13 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 3: Aggregation `$match` Plus `$count` Pushdown
+
+Status 2026-07-04:
+
+- Added an aggregation fast path for exact `[{"$match": <filter>}, {"$count": <field>}]` pipelines that reuses the SQLite count planner and preserves empty-result `$count` shape.
+- Unsupported filters, malformed stages, and non-exact pipelines continue through the existing Rust aggregation executor and existing error behavior.
+- Verification: `cargo fmt -- --check`; `cargo test aggregate`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py tests/e2e/test_spec_corpus.py`; `cargo test`.
+- Commit: pending.
 
 Problem:
 

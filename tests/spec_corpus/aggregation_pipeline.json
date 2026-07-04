@@ -162,6 +162,34 @@
       ]
     },
     {
+      "name": "create_index",
+      "keys": {
+        "team": 1
+      },
+      "index_name": "team_1",
+      "expect_result": {
+        "name": "team_1"
+      }
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "team": "red"
+          }
+        },
+        {
+          "$count": "total"
+        }
+      ],
+      "expect_documents": [
+        {
+          "total": 2
+        }
+      ]
+    },
+    {
       "name": "aggregate",
       "pipeline": [
         {

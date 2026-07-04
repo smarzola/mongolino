@@ -972,6 +972,21 @@ fn aggregate_command_with_state(
         Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
     };
     let ns = namespace(db, collection);
+    if let Some(documents) = aggregate_match_count_pushdown(conn, &ns, pipeline)? {
+        let documents = match documents {
+            Ok(documents) => documents,
+            Err(response) => return Ok(response),
+        };
+        return Ok(cursor_response_for_documents(
+            client_state,
+            db,
+            collection,
+            &ns,
+            documents,
+            batch_size,
+            false,
+        ));
+    }
     let documents = match aggregate_pipeline_documents(conn, &ns, pipeline)? {
         Ok(documents) => documents,
         Err(response) => return Ok(response),
@@ -1012,6 +1027,62 @@ fn parse_aggregate_cursor(command: &Document) -> std::result::Result<usize, Docu
             "aggregate cursor batchSize must be an integer",
         )),
     }
+}
+
+fn aggregate_match_count_pushdown(
+    conn: &Connection,
+    namespace: &str,
+    pipeline: &[Bson],
+) -> Result<Option<std::result::Result<Vec<Document>, Document>>> {
+    let Some((filter, field)) = parse_match_count_pipeline(pipeline) else {
+        return Ok(None);
+    };
+    let Some(count) = pushed_down_count(conn, namespace, filter, 0, None)? else {
+        return Ok(None);
+    };
+    let documents = if count == 0 {
+        Vec::new()
+    } else {
+        vec![doc! { field: count }]
+    };
+    Ok(Some(Ok(documents)))
+}
+
+fn parse_match_count_pipeline<'a>(pipeline: &'a [Bson]) -> Option<(&'a Document, &'a str)> {
+    if pipeline.len() != 2 {
+        return None;
+    }
+    let Bson::Document(match_stage) = &pipeline[0] else {
+        return None;
+    };
+    if match_stage.len() != 1 {
+        return None;
+    }
+    let (match_operator, match_operand) = match_stage.iter().next()?;
+    if match_operator != "$match" {
+        return None;
+    }
+    let Bson::Document(filter) = match_operand else {
+        return None;
+    };
+
+    let Bson::Document(count_stage) = &pipeline[1] else {
+        return None;
+    };
+    if count_stage.len() != 1 {
+        return None;
+    }
+    let (count_operator, count_operand) = count_stage.iter().next()?;
+    if count_operator != "$count" {
+        return None;
+    }
+    let Bson::String(field) = count_operand else {
+        return None;
+    };
+    if field.is_empty() {
+        return None;
+    }
+    Some((filter, field.as_str()))
 }
 
 fn aggregate_pipeline_documents(
@@ -7338,6 +7409,105 @@ mod tests {
         .unwrap();
         let batch = first_batch(&response);
         assert_eq!(batch[0].get_i64("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn aggregate_match_count_uses_safe_count_pushdown() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "active": 1_i32 }, "name": "active_1" }],
+            },
+        )
+        .unwrap();
+
+        let indexed = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "active": true } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&indexed), vec![doc! { "total": 2_i64 }]);
+
+        let id_match = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "u1" } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&id_match), vec![doc! { "total": 1_i64 }]);
+
+        let empty_match = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "active": false } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&empty_match), vec![doc! { "total": 1_i64 }]);
+
+        let no_results = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "missing" } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&no_results), Vec::<Document>::new());
+    }
+
+    #[test]
+    fn aggregate_match_count_falls_back_for_unsupported_filters() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "$where": "this.active" } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert_eq!(response.get_i32("code").unwrap(), 2);
+        assert!(response.get_str("errmsg").unwrap().contains("$where"));
     }
 
     #[test]
