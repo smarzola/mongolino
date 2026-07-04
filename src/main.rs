@@ -2255,6 +2255,173 @@ enum CountPlan {
     Fallback,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum PlannerScanStrategy {
+    CollectionScan,
+    IdExact,
+    IndexExactEquality,
+    IndexEqualityPrefix,
+    IndexRange,
+    IndexSort,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlannerDiagnostic {
+    scan_strategy: PlannerScanStrategy,
+    index_name: Option<String>,
+    index_key: Option<Document>,
+    matcher_validation_required: bool,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PlannerV2Plan {
+    CollectionScan {
+        diagnostic: PlannerDiagnostic,
+    },
+    IdEquality {
+        id_key: String,
+        diagnostic: PlannerDiagnostic,
+    },
+    IndexExactEquality {
+        index_name: String,
+        index_key: Document,
+        key_value: String,
+        diagnostic: PlannerDiagnostic,
+    },
+    IndexEqualityPrefix {
+        index_name: String,
+        index_key: Document,
+        prefix_len: usize,
+        key_value: String,
+        diagnostic: PlannerDiagnostic,
+    },
+    IndexRange {
+        index_name: String,
+        index_key: Document,
+        range: RangePlannerKey,
+        diagnostic: PlannerDiagnostic,
+    },
+    IndexSort {
+        index_name: String,
+        index_key: Document,
+        diagnostic: PlannerDiagnostic,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RangePlannerKey {
+    field: String,
+    equality_prefix_len: usize,
+    key_prefix: String,
+    lower: Option<RangeBound>,
+    upper: Option<RangeBound>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RangeBound {
+    key: String,
+    inclusive: bool,
+}
+
+fn planner_diagnostic(
+    scan_strategy: PlannerScanStrategy,
+    index: Option<&IndexSpec>,
+    matcher_validation_required: bool,
+    fallback_reason: Option<String>,
+) -> PlannerDiagnostic {
+    PlannerDiagnostic {
+        scan_strategy,
+        index_name: index.map(|index| index.name.clone()),
+        index_key: index.map(|index| index.key.clone()),
+        matcher_validation_required,
+        fallback_reason,
+    }
+}
+
+fn collection_scan_plan(reason: impl Into<String>) -> PlannerV2Plan {
+    PlannerV2Plan::CollectionScan {
+        diagnostic: planner_diagnostic(
+            PlannerScanStrategy::CollectionScan,
+            None,
+            true,
+            Some(reason.into()),
+        ),
+    }
+}
+
+fn planner_v2_plan_for_filter(indexes: Vec<IndexSpec>, filter: &Document) -> PlannerV2Plan {
+    if filter.is_empty() {
+        return collection_scan_plan("empty filter");
+    }
+    if let Some(value) = exact_equality_filter_value(filter, "_id") {
+        return PlannerV2Plan::IdEquality {
+            id_key: id_key_from_bson(value),
+            diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+        };
+    }
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return collection_scan_plan("top-level logical filters are not index-planned");
+    }
+
+    let mut fallback_reason = "no compatible index".to_string();
+    for index in planner_indexes(indexes) {
+        if !filter_implies_index_membership(&index, filter) {
+            fallback_reason = format!(
+                "filter does not safely imply index {} membership",
+                index.name
+            );
+            continue;
+        }
+        if let Some(key_value) = planner_key_for_filter(&index, filter) {
+            return PlannerV2Plan::IndexExactEquality {
+                index_name: index.name.clone(),
+                index_key: index.key.clone(),
+                key_value,
+                diagnostic: planner_diagnostic(
+                    PlannerScanStrategy::IndexExactEquality,
+                    Some(&index),
+                    true,
+                    None,
+                ),
+            };
+        }
+        if let Some(range) = range_planner_key_for_filter(&index, filter) {
+            return PlannerV2Plan::IndexRange {
+                index_name: index.name.clone(),
+                index_key: index.key.clone(),
+                range,
+                diagnostic: planner_diagnostic(
+                    PlannerScanStrategy::IndexRange,
+                    Some(&index),
+                    true,
+                    None,
+                ),
+            };
+        }
+        if let Some((prefix_len, key_value)) = prefix_planner_key_for_filter(&index, filter) {
+            return PlannerV2Plan::IndexEqualityPrefix {
+                index_name: index.name.clone(),
+                index_key: index.key.clone(),
+                prefix_len,
+                key_value,
+                diagnostic: planner_diagnostic(
+                    PlannerScanStrategy::IndexEqualityPrefix,
+                    Some(&index),
+                    true,
+                    None,
+                ),
+            };
+        }
+        fallback_reason = format!(
+            "index {} does not match supported exact, prefix, or range shapes",
+            index.name
+        );
+    }
+
+    collection_scan_plan(fallback_reason)
+}
+
 fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<CountPlan> {
     if filter.is_empty() {
         return Ok(CountPlan::Empty);
@@ -2362,7 +2529,7 @@ fn distinct_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct IndexSpec {
     name: String,
     key: Document,
@@ -3307,6 +3474,113 @@ fn compound_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Optio
     Some(encode_compound_planner_key(&parts))
 }
 
+fn prefix_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<(usize, String)> {
+    if !is_compound_index(spec) || filter.keys().any(|key| key.starts_with('$')) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for field in spec.key.keys() {
+        let Some(value) = exact_equality_filter_part(filter, field) else {
+            break;
+        };
+        if !is_compound_planner_scalar(value) {
+            return None;
+        }
+        parts.push(id_key_from_bson(value));
+    }
+    if parts.is_empty() || parts.len() >= spec.key.len() {
+        return None;
+    }
+    Some((parts.len(), encode_compound_prefix_planner_key(&parts)))
+}
+
+fn range_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<RangePlannerKey> {
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return None;
+    }
+
+    let mut equality_parts = Vec::new();
+    for field in spec.key.keys() {
+        if let Some(value) = exact_equality_filter_part(filter, field) {
+            if !is_compound_planner_scalar(value) {
+                return None;
+            }
+            equality_parts.push(id_key_from_bson(value));
+            continue;
+        }
+
+        let condition = filter.get(field)?;
+        let (lower, upper) = range_bounds_for_condition(condition)?;
+        return Some(RangePlannerKey {
+            field: field.to_string(),
+            equality_prefix_len: equality_parts.len(),
+            key_prefix: encode_range_planner_prefix(&equality_parts),
+            lower,
+            upper,
+        });
+    }
+    None
+}
+
+fn range_bounds_for_condition(
+    condition: &Bson,
+) -> Option<(Option<RangeBound>, Option<RangeBound>)> {
+    let Bson::Document(operators) = condition else {
+        return None;
+    };
+    if operators.is_empty()
+        || operators
+            .keys()
+            .any(|operator| !matches!(operator.as_str(), "$gt" | "$gte" | "$lt" | "$lte"))
+    {
+        return None;
+    }
+    let mut lower = None;
+    let mut upper = None;
+    let mut range_type = None::<&'static str>;
+    for (operator, value) in operators {
+        let (value_type, key) = sortable_range_value_key(value)?;
+        if let Some(existing) = range_type {
+            if existing != value_type {
+                return None;
+            }
+        } else {
+            range_type = Some(value_type);
+        }
+        match operator.as_str() {
+            "$gt" => {
+                lower = Some(RangeBound {
+                    key,
+                    inclusive: false,
+                })
+            }
+            "$gte" => {
+                lower = Some(RangeBound {
+                    key,
+                    inclusive: true,
+                })
+            }
+            "$lt" => {
+                upper = Some(RangeBound {
+                    key,
+                    inclusive: false,
+                })
+            }
+            "$lte" => {
+                upper = Some(RangeBound {
+                    key,
+                    inclusive: true,
+                })
+            }
+            _ => return None,
+        }
+    }
+    if lower.is_none() && upper.is_none() {
+        return None;
+    }
+    Some((lower, upper))
+}
+
 fn planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<String> {
     if let Some(field) = single_field_index_name(spec) {
         let value = exact_equality_filter_part(filter, field)?;
@@ -3445,6 +3719,52 @@ fn encode_compound_planner_key(parts: &[String]) -> String {
         key.push_str(part);
     }
     key
+}
+
+fn encode_compound_prefix_planner_key(parts: &[String]) -> String {
+    let mut key = format!("compound-prefix:{}", parts.len());
+    for part in parts {
+        key.push(':');
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(part);
+    }
+    key
+}
+
+fn encode_range_planner_prefix(equality_parts: &[String]) -> String {
+    let mut key = format!("range:{}", equality_parts.len());
+    for part in equality_parts {
+        key.push(':');
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(part);
+    }
+    key.push(':');
+    key
+}
+
+fn range_planner_key_value(equality_parts: &[String], range_value: &Bson) -> Option<String> {
+    let (_, sortable) = sortable_range_value_key(range_value)?;
+    Some(format!(
+        "{}{}",
+        encode_range_planner_prefix(equality_parts),
+        sortable
+    ))
+}
+
+fn sortable_range_value_key(value: &Bson) -> Option<(&'static str, String)> {
+    match value {
+        Bson::String(value) => Some(("str", format!("str:{value}"))),
+        Bson::Boolean(false) => Some(("bool", "bool:0".to_string())),
+        Bson::Boolean(true) => Some(("bool", "bool:1".to_string())),
+        Bson::ObjectId(value) => Some(("oid", format!("oid:{value}"))),
+        Bson::DateTime(value) => {
+            let shifted = value.timestamp_millis() as i128 - i64::MIN as i128;
+            Some(("date", format!("date:{shifted:020}")))
+        }
+        _ => None,
+    }
 }
 
 fn indexes_for_namespace_tx(
@@ -8532,6 +8852,134 @@ mod tests {
         ] {
             assert_eq!(compound_planner_key_for_filter(&spec, &filter), None);
         }
+    }
+
+    #[test]
+    fn planner_v2_classifies_exact_prefix_range_and_fallback_shapes() {
+        let exact = IndexSpec {
+            name: "active_1".to_string(),
+            key: doc! { "active": 1_i32 },
+            unique: false,
+            sparse: false,
+            partial_filter: None,
+        };
+        let compound = IndexSpec {
+            name: "city_active_created_1".to_string(),
+            key: doc! { "profile.city": 1_i32, "active": 1_i32, "created": 1_i32 },
+            unique: false,
+            sparse: false,
+            partial_filter: None,
+        };
+        let created = IndexSpec {
+            name: "created_1".to_string(),
+            key: doc! { "created": 1_i32 },
+            unique: false,
+            sparse: false,
+            partial_filter: None,
+        };
+
+        assert!(matches!(
+            planner_v2_plan_for_filter(vec![exact.clone()], &doc! { "active": true }),
+            PlannerV2Plan::IndexExactEquality { index_name, key_value, diagnostic, .. }
+                if index_name == "active_1"
+                    && key_value == "bool:true"
+                    && diagnostic.scan_strategy == PlannerScanStrategy::IndexExactEquality
+                    && diagnostic.matcher_validation_required
+        ));
+
+        assert!(matches!(
+            planner_v2_plan_for_filter(
+                vec![compound.clone()],
+                &doc! { "profile.city": "Rome" },
+            ),
+            PlannerV2Plan::IndexEqualityPrefix { index_name, prefix_len, key_value, diagnostic, .. }
+                if index_name == "city_active_created_1"
+                    && prefix_len == 1
+                    && key_value == "compound-prefix:1:8:str:Rome"
+                    && diagnostic.scan_strategy == PlannerScanStrategy::IndexEqualityPrefix
+        ));
+
+        assert!(matches!(
+            planner_v2_plan_for_filter(
+                vec![compound],
+                &doc! { "profile.city": "Rome", "active": true, "created": { "$gte": "2026-01", "$lt": "2026-02" } },
+            ),
+            PlannerV2Plan::IndexRange { index_name, range, diagnostic, .. }
+                if index_name == "city_active_created_1"
+                    && range.field == "created"
+                    && range.equality_prefix_len == 2
+                    && range.key_prefix == "range:2:8:str:Rome:9:bool:true:"
+                    && range.lower == Some(RangeBound { key: "str:2026-01".to_string(), inclusive: true })
+                    && range.upper == Some(RangeBound { key: "str:2026-02".to_string(), inclusive: false })
+                    && diagnostic.scan_strategy == PlannerScanStrategy::IndexRange
+        ));
+
+        assert!(matches!(
+            planner_v2_plan_for_filter(
+                vec![created],
+                &doc! { "created": { "$gte": 1_i32 } },
+            ),
+            PlannerV2Plan::CollectionScan { diagnostic }
+                if diagnostic
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("does not match supported"))
+        ));
+    }
+
+    #[test]
+    fn planner_v2_falls_back_for_unsupported_and_membership_unsafe_shapes() {
+        let sparse = IndexSpec {
+            name: "email_sparse".to_string(),
+            key: doc! { "email": 1_i32, "active": 1_i32 },
+            unique: false,
+            sparse: true,
+            partial_filter: None,
+        };
+        let partial = IndexSpec {
+            name: "email_active_partial".to_string(),
+            key: doc! { "email": 1_i32 },
+            unique: false,
+            sparse: false,
+            partial_filter: Some(doc! { "active": true }),
+        };
+        let tags = IndexSpec {
+            name: "tags_1".to_string(),
+            key: doc! { "tags": 1_i32 },
+            unique: false,
+            sparse: false,
+            partial_filter: None,
+        };
+
+        assert!(matches!(
+            planner_v2_plan_for_filter(vec![tags.clone()], &doc! { "$or": [{ "tags": "math" }] }),
+            PlannerV2Plan::CollectionScan { diagnostic }
+                if diagnostic.fallback_reason == Some("top-level logical filters are not index-planned".to_string())
+        ));
+        assert!(matches!(
+            planner_v2_plan_for_filter(vec![tags], &doc! { "tags": { "$in": ["math"] } }),
+            PlannerV2Plan::CollectionScan { diagnostic }
+                if diagnostic
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("does not match supported"))
+        ));
+        assert!(matches!(
+            planner_v2_plan_for_filter(vec![sparse], &doc! { "email": "a@example.test" }),
+            PlannerV2Plan::CollectionScan { diagnostic }
+                if diagnostic
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("membership"))
+        ));
+        assert!(matches!(
+            planner_v2_plan_for_filter(vec![partial], &doc! { "email": "a@example.test" }),
+            PlannerV2Plan::CollectionScan { diagnostic }
+                if diagnostic
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("membership"))
+        ));
     }
 
     #[test]

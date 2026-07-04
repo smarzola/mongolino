@@ -166,7 +166,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Planner v2 architecture and diagnostics model
+- [x] Milestone 0: Planner v2 architecture and diagnostics model
 - [ ] Milestone 1: Equality-prefix candidate narrowing
 - [ ] Milestone 2: Safe range scans and count pushdown
 - [ ] Milestone 3: Hint command semantics
@@ -211,6 +211,12 @@ cargo fmt -- --check
 cargo test planner
 cargo test index
 ```
+
+Status 2026-07-04: Added planner v2 plan/diagnostic types plus conservative
+exact, equality-prefix, range, unsupported-operator, and membership fallback
+classification tests. Verification passed with `cargo fmt -- --check`,
+`cargo test planner`, and `cargo test index`. Commit: reported in goal-loop
+status after commit creation.
 
 ## Milestone 1: Equality-Prefix Candidate Narrowing
 
