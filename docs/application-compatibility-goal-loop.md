@@ -107,7 +107,8 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and architecture preparation
   - Status 2026-07-04: Baseline verification before edits: `cargo fmt -- --check` passed; `cargo test` passed (39 tests); `cargo build` passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed at localhost bind with `PermissionError: [Errno 1] Operation not permitted`; rerun outside the sandbox passed (40 passed, 1 skipped). Added per-client command context scaffolding, migration helper scaffolding, and tests pinning the previous closed-cursor batch behavior. Milestone verification after edits: `cargo fmt -- --check` passed; `cargo test` passed (41 tests); `cargo build` passed with one existing-style dead-code warning for the test-only `handle_command` wrapper; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` passed (40 passed, 1 skipped). Commit hash reported after commit.
-- [ ] Milestone 1: Server-side cursor state and `getMore`
+- [x] Milestone 1: Server-side cursor state and `getMore`
+  - Status 2026-07-04: Implemented per-client in-memory cursor state, positive cursor ids for remaining `find` batches, `getMore` with `nextBatch`, exhaustion cleanup, Rust cursor/getMore tests, PyMongo batch iteration/getMore tests, local cursor corpus coverage, and README cursor notes. Verification: `cargo fmt -- --check` passed; `cargo test cursor` passed (1 test); `cargo test get_more` passed (2 tests); `cargo test` passed (43 tests); `cargo build` passed with dead-code warnings for test wrappers; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` passed (42 passed, 1 skipped). Commit hash reported after commit.
 - [ ] Milestone 2: Cursor lifecycle hardening and `killCursors`
 - [ ] Milestone 3: Durable collection catalog and lifecycle commands
 - [ ] Milestone 4: Count, distinct, and metadata commands

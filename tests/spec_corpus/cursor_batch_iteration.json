@@ -1,0 +1,40 @@
+{
+  "name": "cursor batch iteration",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Ada"
+    },
+    {
+      "_id": "u2",
+      "name": "Grace"
+    },
+    {
+      "_id": "u3",
+      "name": "Katherine"
+    }
+  ],
+  "operations": [
+    {
+      "name": "find",
+      "filter": {},
+      "batch_size": 1,
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "name": "Ada"
+        },
+        {
+          "_id": "u2",
+          "name": "Grace"
+        },
+        {
+          "_id": "u3",
+          "name": "Katherine"
+        }
+      ]
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -77,8 +78,41 @@ struct WireMessage {
     payload: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
-struct ClientState {}
+#[derive(Debug)]
+struct ClientState {
+    cursors: HashMap<i64, CursorState>,
+    next_cursor_id: i64,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            cursors: HashMap::new(),
+            next_cursor_id: 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CursorState {
+    namespace: String,
+    remaining: VecDeque<Document>,
+}
+
+impl ClientState {
+    fn insert_cursor(&mut self, namespace: String, remaining: Vec<Document>) -> i64 {
+        let id = self.next_cursor_id;
+        self.next_cursor_id += 1;
+        self.cursors.insert(
+            id,
+            CursorState {
+                namespace,
+                remaining: remaining.into(),
+            },
+        );
+        id
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -404,7 +438,7 @@ fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
 
 fn handle_command_with_state(
     conn: &Connection,
-    _client_state: &mut ClientState,
+    client_state: &mut ClientState,
     command: &Document,
 ) -> Result<Document> {
     let Some(command_name) = command_name(command) else {
@@ -428,7 +462,8 @@ fn handle_command_with_state(
         "listDatabases" => list_databases(conn),
         "endSessions" => Ok(doc! { "ok": 1.0 }),
         "insert" => insert_documents(conn, command),
-        "find" => find_documents(conn, command),
+        "find" => find_documents_with_state(conn, client_state, command),
+        "getMore" => get_more(client_state, command),
         "update" => update_documents(conn, command),
         "delete" => delete_documents(conn, command),
         other => Ok(command_error(
@@ -1226,6 +1261,15 @@ fn apply_delete_entry(
 }
 
 fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
+    let mut client_state = ClientState::default();
+    find_documents_with_state(conn, &mut client_state, command)
+}
+
+fn find_documents_with_state(
+    conn: &Connection,
+    client_state: &mut ClientState,
+    command: &Document,
+) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
     let collection = match command.get_str("find") {
         Ok(collection) if !collection.is_empty() => collection,
@@ -1256,6 +1300,7 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
     if let Err(errmsg) = optional_bool(command, "singleBatch") {
         return Ok(command_error(9, &errmsg));
     }
+    let single_batch = command.get_bool("singleBatch").unwrap_or(false);
     let batch_size = match optional_i64(command, "batchSize") {
         Ok(Some(value)) if value < 0 => {
             return Ok(command_error(9, "batchSize must be non-negative"));
@@ -1284,7 +1329,7 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(value) => value,
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
-    let namespace = namespace(db, collection);
+    let ns = namespace(db, collection);
 
     if sort.is_none()
         && skip == 0
@@ -1297,20 +1342,26 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
         if let Some(document) = conn
             .query_row(
                 "SELECT bson FROM documents WHERE namespace = ?1 AND id_key = ?2",
-                params![namespace, wanted_id],
+                params![ns, wanted_id],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?
             .map(decode_document)
             .transpose()?
         {
-            return Ok(cursor_response(db, collection, vec![document]));
+            return Ok(cursor_response(
+                db,
+                collection,
+                0,
+                "firstBatch",
+                vec![document],
+            ));
         }
-        return Ok(cursor_response(db, collection, vec![]));
+        return Ok(cursor_response(db, collection, 0, "firstBatch", vec![]));
     }
 
     let mut docs = Vec::new();
-    for document in documents_for_namespace(conn, &namespace)? {
+    for document in documents_for_namespace(conn, &ns)? {
         match matches_filter(&document, &filter) {
             Ok(true) => docs.push(document),
             Ok(false) => {}
@@ -1327,7 +1378,6 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
     if let Some(limit) = limit {
         docs.truncate(limit);
     }
-    docs.truncate(batch_size);
     if let Some(projection) = &projection {
         docs = docs
             .into_iter()
@@ -1335,7 +1385,96 @@ fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
             .collect();
     }
 
-    Ok(cursor_response(db, collection, docs))
+    let (first_batch, remaining) = split_batch(docs, batch_size);
+    let cursor_id = if !single_batch && !remaining.is_empty() {
+        client_state.insert_cursor(ns, remaining)
+    } else {
+        0
+    };
+
+    Ok(cursor_response(
+        db,
+        collection,
+        cursor_id,
+        "firstBatch",
+        first_batch,
+    ))
+}
+
+fn get_more(client_state: &mut ClientState, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let cursor_id = match command.get("getMore") {
+        Some(Bson::Int64(value)) if *value > 0 => *value,
+        Some(Bson::Int32(value)) if *value > 0 => *value as i64,
+        Some(Bson::Int64(_)) | Some(Bson::Int32(_)) => {
+            return Ok(command_error(9, "getMore cursor id must be positive"));
+        }
+        _ => return Ok(command_error(9, "getMore requires an integer cursor id")),
+    };
+    let collection = match command.get_str("collection") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "getMore requires a collection name")),
+    };
+    let batch_size = match optional_i64(command, "batchSize") {
+        Ok(Some(value)) if value < 0 => {
+            return Ok(command_error(9, "batchSize must be non-negative"));
+        }
+        Ok(Some(value)) => value.min(1000) as usize,
+        Ok(None) => 101,
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["getMore", "collection", "batchSize", "$db", "lsid"],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let ns = namespace(db, collection);
+    let Some(cursor) = client_state.cursors.get_mut(&cursor_id) else {
+        return Ok(command_error(43, "cursor not found"));
+    };
+    if cursor.namespace != ns {
+        return Ok(command_error(
+            43,
+            "cursor namespace does not match getMore collection",
+        ));
+    }
+
+    let mut batch = Vec::new();
+    for _ in 0..batch_size {
+        let Some(document) = cursor.remaining.pop_front() else {
+            break;
+        };
+        batch.push(document);
+    }
+    let response_cursor_id = if cursor.remaining.is_empty() {
+        client_state.cursors.remove(&cursor_id);
+        0
+    } else {
+        cursor_id
+    };
+
+    Ok(cursor_response(
+        db,
+        collection,
+        response_cursor_id,
+        "nextBatch",
+        batch,
+    ))
+}
+
+fn split_batch(documents: Vec<Document>, batch_size: usize) -> (Vec<Document>, Vec<Document>) {
+    let mut first_batch = Vec::new();
+    let mut remaining = Vec::new();
+    for (index, document) in documents.into_iter().enumerate() {
+        if index < batch_size {
+            first_batch.push(document);
+        } else {
+            remaining.push(document);
+        }
+    }
+    (first_batch, remaining)
 }
 
 fn optional_i64(command: &Document, key: &str) -> std::result::Result<Option<i64>, String> {
@@ -1854,13 +1993,27 @@ fn documents_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<Doc
         .collect::<Result<Vec<_>>>()
 }
 
-fn cursor_response(db: &str, collection: &str, documents: Vec<Document>) -> Document {
+fn cursor_response(
+    db: &str,
+    collection: &str,
+    cursor_id: i64,
+    batch_field: &str,
+    documents: Vec<Document>,
+) -> Document {
+    let mut cursor = doc! {
+        "id": cursor_id,
+        "ns": namespace(db, collection),
+    };
+    cursor.insert(
+        batch_field,
+        documents
+            .into_iter()
+            .map(Bson::Document)
+            .collect::<Vec<_>>(),
+    );
+
     doc! {
-        "cursor": {
-            "id": 0_i64,
-            "ns": namespace(db, collection),
-            "firstBatch": documents.into_iter().map(Bson::Document).collect::<Vec<_>>(),
-        },
+        "cursor": cursor,
         "ok": 1.0,
     }
 }
@@ -1968,14 +2121,30 @@ mod tests {
     }
 
     fn first_batch(response: &Document) -> Vec<Document> {
+        batch(response, "firstBatch")
+    }
+
+    fn next_batch(response: &Document) -> Vec<Document> {
+        batch(response, "nextBatch")
+    }
+
+    fn batch(response: &Document, field: &str) -> Vec<Document> {
         response
             .get_document("cursor")
             .unwrap()
-            .get_array("firstBatch")
+            .get_array(field)
             .unwrap()
             .iter()
             .map(|value| value.as_document().unwrap().clone())
             .collect()
+    }
+
+    fn cursor_id(response: &Document) -> i64 {
+        response
+            .get_document("cursor")
+            .unwrap()
+            .get_i64("id")
+            .unwrap()
     }
 
     fn assert_command_error(response: &Document) {
@@ -2117,12 +2286,14 @@ mod tests {
     }
 
     #[test]
-    fn find_batch_size_currently_returns_closed_cursor_and_drops_remainder() {
+    fn find_batch_size_returns_live_cursor_with_remainder() {
         let conn = test_conn();
         seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
 
-        let response = find_documents(
+        let response = find_documents_with_state(
             &conn,
+            &mut client_state,
             &doc! {
                 "find": "users",
                 "$db": "app",
@@ -2133,10 +2304,75 @@ mod tests {
         .unwrap();
         let cursor = response.get_document("cursor").unwrap();
 
-        assert_eq!(cursor.get_i64("id").unwrap(), 0);
+        assert!(cursor.get_i64("id").unwrap() > 0);
         let batch = first_batch(&response);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].get_str("_id").unwrap(), "u1");
+        assert_eq!(client_state.cursors.len(), 1);
+    }
+
+    #[test]
+    fn get_more_returns_next_batches_and_closes_on_exhaustion() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "sort": { "_id": 1_i32 },
+                "batchSize": 1_i32,
+            },
+        )
+        .unwrap();
+        let id = cursor_id(&response);
+        assert!(id > 0);
+
+        let next = get_more(
+            &mut client_state,
+            &doc! {
+                "getMore": id,
+                "collection": "users",
+                "$db": "app",
+                "batchSize": 1_i32,
+            },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&next), id);
+        assert_eq!(next_batch(&next)[0].get_str("_id").unwrap(), "u2");
+
+        let final_batch = get_more(
+            &mut client_state,
+            &doc! {
+                "getMore": id,
+                "collection": "users",
+                "$db": "app",
+                "batchSize": 10_i32,
+            },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&final_batch), 0);
+        assert_eq!(next_batch(&final_batch)[0].get_str("_id").unwrap(), "u3");
+        assert!(client_state.cursors.is_empty());
+    }
+
+    #[test]
+    fn get_more_rejects_malformed_requests() {
+        let mut client_state = ClientState::default();
+
+        for command in [
+            doc! { "getMore": "bad", "collection": "users", "$db": "app" },
+            doc! { "getMore": -1_i64, "collection": "users", "$db": "app" },
+            doc! { "getMore": 1_i64, "$db": "app" },
+            doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "batchSize": -1_i32 },
+            doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "comment": "nope" },
+        ] {
+            let response = get_more(&mut client_state, &command).unwrap();
+            assert_command_error(&response);
+        }
     }
 
     #[test]

@@ -131,11 +131,49 @@ def test_find_projection_edges(collection):
     assert included_without_id == {"name": "Ada", "profile": {"city": "Rome"}}
 
 
-def test_find_sort_skip_limit_and_batch_size_closed_cursor(collection):
+def test_find_sort_skip_limit_and_batch_size_cursor_iteration(collection):
     seed_users(collection)
 
     assert ids(collection.find({}).sort("age", DESCENDING).skip(1).limit(1)) == ["u2"]
-    assert ids(collection.find({}).sort("_id", ASCENDING).batch_size(1)) == ["u1"]
+    assert ids(collection.find({}).sort("_id", ASCENDING).batch_size(1)) == ["u1", "u2", "u3"]
+    assert ids(collection.find({}).sort("_id", ASCENDING).limit(2).batch_size(1)) == ["u1", "u2"]
+    assert ids(collection.find({}).sort("_id", ASCENDING).batch_size(2)) == ["u1", "u2", "u3"]
+
+
+def test_find_command_get_more_batches(collection):
+    seed_users(collection)
+
+    first = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {},
+            "sort": {"_id": 1},
+            "batchSize": 1,
+        }
+    )
+    cursor = first["cursor"]
+    assert cursor["id"] > 0
+    assert [doc["_id"] for doc in cursor["firstBatch"]] == ["u1"]
+
+    second = collection.database.command(
+        {
+            "getMore": cursor["id"],
+            "collection": collection.name,
+            "batchSize": 1,
+        }
+    )
+    assert second["cursor"]["id"] == cursor["id"]
+    assert [doc["_id"] for doc in second["cursor"]["nextBatch"]] == ["u2"]
+
+    final = collection.database.command(
+        {
+            "getMore": cursor["id"],
+            "collection": collection.name,
+            "batchSize": 10,
+        }
+    )
+    assert final["cursor"]["id"] == 0
+    assert [doc["_id"] for doc in final["cursor"]["nextBatch"]] == ["u3"]
 
 
 def test_update_one_set_and_unset(collection):

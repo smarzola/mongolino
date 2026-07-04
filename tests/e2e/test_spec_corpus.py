@@ -133,6 +133,8 @@ def execute_operation(operation, collection):
             operation.get("filter", {}),
             projection=operation.get("projection"),
         )
+        if "batch_size" in operation:
+            cursor = cursor.batch_size(operation["batch_size"])
         return list(cursor.sort("_id", 1))
     if name == "update_one":
         return collection.update_one(
