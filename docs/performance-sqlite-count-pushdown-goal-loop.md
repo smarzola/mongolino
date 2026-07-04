@@ -301,7 +301,7 @@ Status 2026-07-04:
 - Local headline changes: `count_empty_filter` 29.298 -> 0.116 ms/op; `count_simple_equality` 30.109 -> 0.066 ms/op; `aggregation_match_count` 30.032 -> 0.071 ms/op.
 - Verification: `cargo fmt -- --check`; `cargo test`; `cargo build`; `cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-count-smoke.json`; `cargo run --bin mongolino-bench -- --profile local --json /tmp/mongolino-bench-count-local.json`; `cargo run --bin mongolino-bench -- --profile ci --check-budget`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`.
 - Sandbox note: PyMongo e2e cannot bind localhost inside the sandbox; the exact sandbox error observed earlier was `PermissionError: [Errno 1] Operation not permitted` at `socket.bind(("127.0.0.1", 0))`.
-- Commit: pending.
+- Commit: `bf175a1`.
 
 Problem:
 
