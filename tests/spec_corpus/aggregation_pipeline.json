@@ -7,18 +7,51 @@
       "_id": "s1",
       "active": true,
       "score": 7,
+      "setDoc": {
+        "nested": [
+          1,
+          2
+        ],
+        "shape": "same"
+      },
+      "setNumber": 1,
+      "setValue": [
+        1,
+        2
+      ],
       "team": "red"
     },
     {
       "_id": "s2",
       "active": false,
       "score": 5,
+      "setDoc": {
+        "nested": [
+          1,
+          2
+        ],
+        "shape": "same"
+      },
+      "setNumber": 1.0,
+      "setValue": 1,
       "team": "blue"
     },
     {
       "_id": "s3",
       "active": true,
       "score": 11,
+      "setDoc": {
+        "nested": [
+          1,
+          2
+        ],
+        "shape": "same"
+      },
+      "setNumber": 1,
+      "setValue": [
+        1,
+        2
+      ],
       "team": "red"
     }
   ],
@@ -50,6 +83,63 @@
         {
           "_id": "s3",
           "score": 11
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$group": {
+            "_id": "all",
+            "documents": {
+              "$addToSet": "$setDoc"
+            },
+            "numbers": {
+              "$addToSet": "$setNumber"
+            },
+            "pushed": {
+              "$push": "$setValue"
+            },
+            "values": {
+              "$addToSet": "$setValue"
+            }
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "all",
+          "documents": [
+            {
+              "nested": [
+                1,
+                2
+              ],
+              "shape": "same"
+            }
+          ],
+          "numbers": [
+            1
+          ],
+          "pushed": [
+            [
+              1,
+              2
+            ],
+            1,
+            [
+              1,
+              2
+            ]
+          ],
+          "values": [
+            [
+              1,
+              2
+            ],
+            1
+          ]
         }
       ]
     },

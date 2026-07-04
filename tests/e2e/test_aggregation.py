@@ -246,6 +246,99 @@ def test_aggregate_unwind_group_array_accumulators_and_cursor(collection):
     ]
 
 
+def test_aggregate_add_to_set_uses_whole_value_equality(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "a1",
+                "case": "array-first",
+                "value": [1, 2],
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1,
+            },
+            {
+                "_id": "a2",
+                "case": "array-first",
+                "value": 1,
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1.0,
+            },
+            {
+                "_id": "a3",
+                "case": "array-first",
+                "value": [1, 2],
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1,
+            },
+            {
+                "_id": "a4",
+                "case": "array-first",
+                "value": [2, 1],
+                "docValue": {"shape": "other", "nested": [1, 2]},
+                "number": 2.0,
+            },
+            {
+                "_id": "s1",
+                "case": "scalar-first",
+                "value": 1,
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1.0,
+            },
+            {
+                "_id": "s2",
+                "case": "scalar-first",
+                "value": [1, 2],
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1,
+            },
+            {
+                "_id": "s3",
+                "case": "scalar-first",
+                "value": 1,
+                "docValue": {"shape": "same", "nested": [1, 2]},
+                "number": 1,
+            },
+        ]
+    )
+
+    result = list(
+        collection.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$case",
+                        "values": {"$addToSet": "$value"},
+                        "documents": {"$addToSet": "$docValue"},
+                        "numbers": {"$addToSet": "$number"},
+                        "pushed": {"$push": "$value"},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+
+    assert result == [
+        {
+            "_id": "array-first",
+            "values": [[1, 2], 1, [2, 1]],
+            "documents": [
+                {"shape": "same", "nested": [1, 2]},
+                {"shape": "other", "nested": [1, 2]},
+            ],
+            "numbers": [1, 2.0],
+            "pushed": [[1, 2], 1, [1, 2], [2, 1]],
+        },
+        {
+            "_id": "scalar-first",
+            "values": [1, [1, 2]],
+            "documents": [{"shape": "same", "nested": [1, 2]}],
+            "numbers": [1.0],
+            "pushed": [1, [1, 2], 1],
+        },
+    ]
+
+
 def test_aggregate_adversarial_errors_and_empty_groups_do_not_leak_state(collection):
     seed_scores(collection)
 

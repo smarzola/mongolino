@@ -1503,7 +1503,7 @@ impl AccumulatorState {
                 let value = value.unwrap_or(Bson::Null);
                 if !values
                     .iter()
-                    .any(|existing| bson_values_equal(existing, &value))
+                    .any(|existing| aggregation_values_equal(existing, &value))
                 {
                     values.push(value);
                 }
@@ -7372,6 +7372,115 @@ mod tests {
                 "uniqueIds": ["p1", "p2", "p3"],
                 "uniqueLiteral": ["seen"],
             }]
+        );
+    }
+
+    #[test]
+    fn aggregate_group_add_to_set_uses_whole_value_equality() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "set_values",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "a1",
+                        "case": "array-first",
+                        "value": [1_i32, 2_i32],
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1_i32,
+                    },
+                    {
+                        "_id": "a2",
+                        "case": "array-first",
+                        "value": 1_i32,
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1.0,
+                    },
+                    {
+                        "_id": "a3",
+                        "case": "array-first",
+                        "value": [1_i32, 2_i32],
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1_i64,
+                    },
+                    {
+                        "_id": "a4",
+                        "case": "array-first",
+                        "value": [2_i32, 1_i32],
+                        "docValue": { "shape": "other", "nested": [1_i32, 2_i32] },
+                        "number": 2.0,
+                    },
+                    {
+                        "_id": "s1",
+                        "case": "scalar-first",
+                        "value": 1_i32,
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1.0,
+                    },
+                    {
+                        "_id": "s2",
+                        "case": "scalar-first",
+                        "value": [1_i32, 2_i32],
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1_i32,
+                    },
+                    {
+                        "_id": "s3",
+                        "case": "scalar-first",
+                        "value": 1_i32,
+                        "docValue": { "shape": "same", "nested": [1_i32, 2_i32] },
+                        "number": 1_i64,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "set_values",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$group": {
+                            "_id": "$case",
+                            "values": { "$addToSet": "$value" },
+                            "documents": { "$addToSet": "$docValue" },
+                            "numbers": { "$addToSet": "$number" },
+                            "pushed": { "$push": "$value" },
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! {
+                    "_id": "array-first",
+                    "values": [[1_i32, 2_i32], 1_i32, [2_i32, 1_i32]],
+                    "documents": [
+                        { "shape": "same", "nested": [1_i32, 2_i32] },
+                        { "shape": "other", "nested": [1_i32, 2_i32] },
+                    ],
+                    "numbers": [1_i32, 2.0],
+                    "pushed": [[1_i32, 2_i32], 1_i32, [1_i32, 2_i32], [2_i32, 1_i32]],
+                },
+                doc! {
+                    "_id": "scalar-first",
+                    "values": [1_i32, [1_i32, 2_i32]],
+                    "documents": [{ "shape": "same", "nested": [1_i32, 2_i32] }],
+                    "numbers": [1.0],
+                    "pushed": [1_i32, [1_i32, 2_i32], 1_i32],
+                },
+            ]
         );
     }
 
