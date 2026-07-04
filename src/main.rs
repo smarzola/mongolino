@@ -1380,14 +1380,53 @@ fn aggregate_pipeline_documents(
                 let Bson::Document(projection) = operand else {
                     return Ok(Err(command_error(9, "$project requires a document")));
                 };
-                let projection = match parse_projection_document(projection) {
+                let projection = match parse_aggregate_project_stage(projection) {
                     Ok(Some(projection)) => projection,
                     Ok(None) => continue,
-                    Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
+                    Err(response) => return Ok(Err(response)),
+                };
+                let mut projected = Vec::new();
+                for document in documents {
+                    match apply_aggregate_project_stage(&document, &projection, collation) {
+                        Ok(document) => projected.push(document),
+                        Err(response) => return Ok(Err(response)),
+                    }
+                }
+                documents = projected;
+            }
+            "$addFields" | "$set" => {
+                let Bson::Document(spec) = operand else {
+                    return Ok(Err(command_error(
+                        9,
+                        &format!("{operator} requires a document"),
+                    )));
+                };
+                let spec = match parse_aggregate_add_fields_stage(spec, operator) {
+                    Ok(spec) => spec,
+                    Err(response) => return Ok(Err(response)),
+                };
+                let mut shaped = Vec::new();
+                for document in documents {
+                    match apply_aggregate_add_fields_stage(document, &spec, collation) {
+                        Ok(document) => shaped.push(document),
+                        Err(response) => return Ok(Err(response)),
+                    }
+                }
+                documents = shaped;
+            }
+            "$unset" => {
+                let unset = match parse_aggregate_unset_stage(operand) {
+                    Ok(unset) => unset,
+                    Err(response) => return Ok(Err(response)),
                 };
                 documents = documents
                     .into_iter()
-                    .map(|document| apply_projection(&document, &projection))
+                    .map(|mut document| {
+                        for path in &unset.paths {
+                            unset_document_path(&mut document, path);
+                        }
+                        document
+                    })
                     .collect();
             }
             "$count" => {
@@ -1485,9 +1524,22 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
                 let Bson::Document(projection) = operand else {
                     return Err(command_error(9, "$project requires a document"));
                 };
-                if let Err(errmsg) = parse_projection_document(projection) {
-                    return Err(command_error(2, &errmsg));
-                }
+                parse_aggregate_project_stage(projection)?;
+            }
+            "$addFields" | "$set" => {
+                let Bson::Document(spec) = operand else {
+                    return Err(command_error(9, &format!("{operator} requires a document")));
+                };
+                parse_aggregate_add_fields_stage(spec, operator)?;
+            }
+            "$unset" => {
+                parse_aggregate_unset_stage(operand)?;
+            }
+            "$replaceRoot" | "$replaceWith" | "$lookup" => {
+                return Err(command_error(
+                    72,
+                    &format!("aggregate stage {operator} is not supported"),
+                ));
             }
             "$count" => {
                 let Bson::String(field) = operand else {
@@ -1537,6 +1589,258 @@ fn validate_aggregate_pipeline_for_collation(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AggregateProjectSpec {
+    Include {
+        fields: Vec<String>,
+        computed: Vec<AggregationComputedField>,
+        include_id: bool,
+    },
+    Exclude {
+        fields: Vec<String>,
+        include_id: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AggregationComputedField {
+    path: String,
+    expression: AggregationExpression,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateUnsetSpec {
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AggregateProjectMode {
+    Include,
+    Exclude,
+}
+
+fn parse_aggregate_project_stage(
+    projection: &Document,
+) -> std::result::Result<Option<AggregateProjectSpec>, Document> {
+    let mut mode = None;
+    let mut fields = Vec::new();
+    let mut computed = Vec::new();
+    let mut include_id = true;
+    let mut saw_id = false;
+
+    for (field, value) in projection {
+        validate_aggregation_output_path(field, "$project")?;
+        let projection_mode = aggregate_project_mode_value(value);
+        if field == "_id" {
+            saw_id = true;
+            match projection_mode {
+                Some(AggregateProjectMode::Include) => include_id = true,
+                Some(AggregateProjectMode::Exclude) => include_id = false,
+                None => {
+                    include_id = false;
+                    computed.push(AggregationComputedField {
+                        path: field.to_string(),
+                        expression: parse_aggregation_expression(value, "$project", true)?,
+                    });
+                }
+            }
+            continue;
+        }
+
+        match projection_mode {
+            Some(field_mode) => {
+                match (mode, field_mode) {
+                    (None, mode_value) => mode = Some(mode_value),
+                    (Some(AggregateProjectMode::Include), AggregateProjectMode::Include)
+                    | (Some(AggregateProjectMode::Exclude), AggregateProjectMode::Exclude) => {}
+                    _ => {
+                        return Err(command_error(
+                            9,
+                            "$project cannot mix inclusion and exclusion fields except _id",
+                        ));
+                    }
+                }
+                fields.push(field.to_string());
+            }
+            None => {
+                if matches!(mode, Some(AggregateProjectMode::Exclude)) {
+                    return Err(command_error(
+                        9,
+                        "$project cannot mix computed fields with exclusion projection",
+                    ));
+                }
+                mode = Some(AggregateProjectMode::Include);
+                computed.push(AggregationComputedField {
+                    path: field.to_string(),
+                    expression: parse_aggregation_expression(value, "$project", true)?,
+                });
+            }
+        }
+    }
+
+    if projection.is_empty() {
+        return Ok(None);
+    }
+    let collision_paths = fields
+        .iter()
+        .cloned()
+        .chain(computed.iter().map(|field| field.path.clone()))
+        .collect::<Vec<_>>();
+    reject_path_collisions(&collision_paths, "$project")
+        .map_err(|errmsg| command_error(9, &errmsg))?;
+
+    match mode {
+        Some(AggregateProjectMode::Exclude) => {
+            Ok(Some(AggregateProjectSpec::Exclude { fields, include_id }))
+        }
+        Some(AggregateProjectMode::Include) => Ok(Some(AggregateProjectSpec::Include {
+            fields,
+            computed,
+            include_id,
+        })),
+        None if saw_id => Ok(Some(if include_id {
+            AggregateProjectSpec::Include {
+                fields,
+                computed,
+                include_id,
+            }
+        } else {
+            AggregateProjectSpec::Exclude { fields, include_id }
+        })),
+        None => Ok(None),
+    }
+}
+
+fn aggregate_project_mode_value(value: &Bson) -> Option<AggregateProjectMode> {
+    match value {
+        Bson::Int32(0) | Bson::Int64(0) | Bson::Boolean(false) => {
+            Some(AggregateProjectMode::Exclude)
+        }
+        Bson::Int32(1) | Bson::Int64(1) | Bson::Boolean(true) => {
+            Some(AggregateProjectMode::Include)
+        }
+        _ => None,
+    }
+}
+
+fn apply_aggregate_project_stage(
+    document: &Document,
+    projection: &AggregateProjectSpec,
+    collation: &Collation,
+) -> std::result::Result<Document, Document> {
+    match projection {
+        AggregateProjectSpec::Include {
+            fields,
+            computed,
+            include_id,
+        } => {
+            let mut out = Document::new();
+            if *include_id && let Some(id) = document.get("_id") {
+                out.insert("_id", id.clone());
+            }
+            for field in fields {
+                if field == "_id" {
+                    continue;
+                }
+                if let Some(value) = get_document_path(document, field) {
+                    set_document_path(&mut out, field, value.clone());
+                }
+            }
+            let context = AggregationExpressionContext::new(document, collation);
+            for computed_field in computed {
+                let value = computed_field
+                    .expression
+                    .evaluate(&context)?
+                    .unwrap_or(Bson::Null);
+                set_document_path(&mut out, &computed_field.path, value);
+            }
+            Ok(out)
+        }
+        AggregateProjectSpec::Exclude { fields, include_id } => {
+            let mut out = document.clone();
+            if !include_id {
+                out.remove("_id");
+            }
+            for field in fields {
+                unset_document_path(&mut out, field);
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn parse_aggregate_add_fields_stage(
+    spec: &Document,
+    context: &str,
+) -> std::result::Result<Vec<AggregationComputedField>, Document> {
+    let mut fields = Vec::new();
+    let mut paths = Vec::new();
+    for (path, value) in spec {
+        validate_aggregation_output_path(path, context)?;
+        paths.push(path.to_string());
+        fields.push(AggregationComputedField {
+            path: path.to_string(),
+            expression: parse_aggregation_expression(value, context, true)?,
+        });
+    }
+    reject_path_collisions(&paths, context).map_err(|errmsg| command_error(9, &errmsg))?;
+    Ok(fields)
+}
+
+fn apply_aggregate_add_fields_stage(
+    mut document: Document,
+    fields: &[AggregationComputedField],
+    collation: &Collation,
+) -> std::result::Result<Document, Document> {
+    let source = document.clone();
+    let context = AggregationExpressionContext::new(&source, collation);
+    for field in fields {
+        let value = field.expression.evaluate(&context)?.unwrap_or(Bson::Null);
+        set_document_path(&mut document, &field.path, value);
+    }
+    Ok(document)
+}
+
+fn parse_aggregate_unset_stage(value: &Bson) -> std::result::Result<AggregateUnsetSpec, Document> {
+    let paths = match value {
+        Bson::String(path) => vec![path.to_string()],
+        Bson::Array(values) => {
+            let mut paths = Vec::new();
+            for value in values {
+                let Bson::String(path) = value else {
+                    return Err(command_error(9, "$unset array entries must be strings"));
+                };
+                paths.push(path.to_string());
+            }
+            paths
+        }
+        _ => {
+            return Err(command_error(
+                9,
+                "$unset requires a string path or array of string paths",
+            ));
+        }
+    };
+    for path in &paths {
+        validate_aggregation_output_path(path, "$unset")?;
+    }
+    reject_path_collisions(&paths, "$unset").map_err(|errmsg| command_error(9, &errmsg))?;
+    Ok(AggregateUnsetSpec { paths })
+}
+
+fn validate_aggregation_output_path(
+    path: &str,
+    context: &str,
+) -> std::result::Result<(), Document> {
+    if path.starts_with('$') {
+        return Err(command_error(
+            9,
+            &format!("{context} output field path cannot start with $"),
+        ));
+    }
+    validate_aggregation_path(path, context, true)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -13906,6 +14210,156 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_project_add_set_and_unset_compute_document_shapes() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "authors",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "a1",
+                        "first": "Ada",
+                        "last": "Lovelace",
+                        "score": 7_i32,
+                        "profile": { "city": "London", "hidden": true },
+                        "tags": ["math", "logic"],
+                    },
+                    {
+                        "_id": "a2",
+                        "first": "Grace",
+                        "last": "Hopper",
+                        "score": 9_i32,
+                        "profile": { "city": "Arlington", "hidden": true },
+                        "tags": ["compiler"],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "authors",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "a1" } },
+                    {
+                        "$project": {
+                            "_id": 0_i32,
+                            "first": 1_i32,
+                            "display": { "$concat": ["$first", " ", "$last"] },
+                            "nested": { "city": "$profile.city", "scoreText": { "$toString": "$score" } },
+                            "rootCopy": "$$ROOT._id",
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "nested.lower": { "$toLower": "$display" },
+                            "computed.total": { "$add": [4_i32, 6_i32] },
+                        }
+                    },
+                    { "$set": { "alias": "$nested.city" } },
+                    { "$unset": ["first", "nested.scoreText"] },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_batch(&response),
+            vec![doc! {
+                "display": "Ada Lovelace",
+                "nested": {
+                    "city": "London",
+                    "lower": "ada lovelace",
+                },
+                "rootCopy": "a1",
+                "computed": { "total": 10_i64 },
+                "alias": "London",
+            }]
+        );
+
+        let exclude = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "authors",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "a2" } },
+                    { "$unset": "profile.hidden" },
+                    { "$project": { "tags": 0_i32, "_id": 0_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&exclude),
+            vec![doc! {
+                "first": "Grace",
+                "last": "Hopper",
+                "score": 9_i32,
+                "profile": { "city": "Arlington" },
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregate_shaping_rejects_adversarial_paths_and_expressions_before_ttl() {
+        let conn = test_conn();
+        seed_ttl_command_fixture(&conn, "bad_aggregate_shape");
+
+        for pipeline in [
+            vec![Bson::Document(
+                doc! { "$project": { "name": 1_i32, "name.first": "$first" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$project": { "name": 0_i32, "display": { "$concat": ["$first"] } } },
+            )],
+            vec![Bson::Document(doc! { "$project": { "": "$first" } })],
+            vec![Bson::Document(doc! { "$project": { "$bad": "$first" } })],
+            vec![Bson::Document(
+                doc! { "$addFields": { "profile": "$first", "profile.city": "$last" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$set": { "profile.$bad": "$first" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$unset": ["profile", "profile.city"] },
+            )],
+            vec![Bson::Document(doc! { "$unset": [1_i32] })],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "bad_aggregate_shape",
+                    "$db": "app",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_invalid_ttl_read_preserves_expired(&conn, "bad_aggregate_shape", response);
+        }
+
+        let runtime_error = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_aggregate_shape",
+                "$db": "app",
+                "pipeline": [{ "$addFields": { "ratio": { "$divide": [10_i32, 0_i32] } } }],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_command_error(&runtime_error);
+    }
+
+    #[test]
     fn aggregate_pipeline_stage_order_is_sequential() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -14409,7 +14863,7 @@ mod tests {
             vec![Bson::Document(doc! { "$limit": "bad" })],
             vec![Bson::Document(doc! { "$project": "bad" })],
             vec![Bson::Document(
-                doc! { "$project": { "name": { "$literal": 1_i32 } } },
+                doc! { "$project": { "name": 0_i32, "display": { "$literal": 1_i32 } } },
             )],
             vec![Bson::Document(doc! { "$count": "" })],
             vec![Bson::Document(doc! { "$count": 1_i32 })],

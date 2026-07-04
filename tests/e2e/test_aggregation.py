@@ -35,6 +35,82 @@ def test_aggregate_match_sort_project(collection):
     ]
 
 
+def test_aggregate_computed_project_add_set_and_unset(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "a1",
+                "first": "Ada",
+                "last": "Lovelace",
+                "score": 7,
+                "profile": {"city": "London", "hidden": True},
+                "tags": ["math", "logic"],
+            },
+            {
+                "_id": "a2",
+                "first": "Grace",
+                "last": "Hopper",
+                "score": 9,
+                "profile": {"city": "Arlington", "hidden": True},
+                "tags": ["compiler"],
+            },
+        ]
+    )
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "a1"}},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "first": 1,
+                        "display": {"$concat": ["$first", " ", "$last"]},
+                        "nested": {
+                            "city": "$profile.city",
+                            "scoreText": {"$toString": "$score"},
+                        },
+                        "rootCopy": "$$ROOT._id",
+                    }
+                },
+                {
+                    "$addFields": {
+                        "nested.lower": {"$toLower": "$display"},
+                        "computed.total": {"$add": [4, 6]},
+                    }
+                },
+                {"$set": {"alias": "$nested.city"}},
+                {"$unset": ["first", "nested.scoreText"]},
+            ]
+        )
+    ) == [
+        {
+            "display": "Ada Lovelace",
+            "nested": {"city": "London", "lower": "ada lovelace"},
+            "rootCopy": "a1",
+            "computed": {"total": 10},
+            "alias": "London",
+        }
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "a2"}},
+                {"$unset": "profile.hidden"},
+                {"$project": {"tags": 0, "_id": 0}},
+            ]
+        )
+    ) == [
+        {
+            "first": "Grace",
+            "last": "Hopper",
+            "score": 9,
+            "profile": {"city": "Arlington"},
+        }
+    ]
+
+
 def test_aggregate_match_sort_and_count_with_collation(collection):
     collection.insert_many(
         [
@@ -492,9 +568,7 @@ def test_aggregate_adversarial_errors_and_empty_groups_do_not_leak_state(collect
     )
 
     for pipeline, contains in [
-        ([{"$group": {"_id": {"$add": ["$team", 1]}, "n": {"$sum": 1}}}], "$group"),
-        ([{"$group": {"_id": ["$team"], "n": {"$sum": 1}}}], "$group"),
-        ([{"$group": {"_id": "$team", "values": {"$push": ["$score"]}}}], "$group"),
+        ([{"$group": {"_id": {"$add": ["$team", 1]}, "n": {"$sum": 1}}}], "$add"),
         ([{"$group": {"_id": "$team", "values": {"$addToSet": {"score": "$score"}}}}], "$group"),
         ([{"$group": {"_id": {"$sum": 1}, "n": {"$sum": 1}}}], "$group"),
         ([{"$unwind": {"path": "$team", "includeArrayIndex": "team.idx"}}], "$unwind"),
@@ -521,13 +595,43 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
         {"_id": "$team", "n": {"$median": "$score"}},
         {"_id": "$team", "n": {"$avg": 1}},
         {"_id": "$team", "n": {"$sum": "literal"}},
-        {"_id": "$team", "n": {"$first": {"$add": [1, 2]}}},
+        {
+            "_id": "$team",
+            "n": {
+                "$first": {
+                    "$dateDiff": {
+                        "startDate": "$created",
+                        "endDate": "$updated",
+                        "unit": "day",
+                    }
+                }
+            },
+        },
     ]:
         with pytest.raises(OperationFailure) as excinfo:
             collection.database.command(
                 {"aggregate": collection.name, "pipeline": [{"$group": group}], "cursor": {}}
             )
         assert "$group" in str(excinfo.value)
+
+
+def test_aggregate_shaping_rejects_malformed_paths_and_runtime_errors(collection):
+    seed_scores(collection)
+
+    for pipeline, contains in [
+        ([{"$project": {"team": 1, "team.name": "$team"}}], "conflicting"),
+        ([{"$project": {"team": 0, "display": {"$literal": 1}}}], "computed"),
+        ([{"$project": {"": "$team"}}], "empty"),
+        ([{"$project": {"$bad": "$team"}}], "$"),
+        ([{"$addFields": {"profile": "$team", "profile.city": "$team"}}], "conflicting"),
+        ([{"$set": {"profile.$bad": "$team"}}], "$"),
+        ([{"$unset": ["profile", "profile.city"]}], "conflicting"),
+        ([{"$unset": [1]}], "strings"),
+        ([{"$addFields": {"ratio": {"$divide": [10, 0]}}}], "divide"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
 
 
 def test_aggregate_unwind_rejects_malformed_options(collection):
