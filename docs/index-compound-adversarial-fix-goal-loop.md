@@ -109,3 +109,15 @@ Report:
 - performance impact on clean scalar compound benchmarks;
 - verification commands and outcomes;
 - remaining multikey limitations.
+
+## Status
+
+- 2026-07-04: Implemented conservative `index_multikey_omissions` sentinel
+  maintenance. Single-field and full-key compound planners now use
+  `index_entries` only when the selected index has no tracked array omissions;
+  otherwise find/count/aggregation count and write target selection fall back to
+  the Rust matcher. Added Rust planner coverage and PyMongo e2e coverage for
+  single-field and compound array-backed matches across find, count,
+  aggregation `$match` + `$count`, update/delete, and findAndModify. Full
+  scalar multikey entry maintenance remains reserved for the later multikey
+  uplift.

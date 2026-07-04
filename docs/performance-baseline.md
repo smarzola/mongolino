@@ -191,10 +191,14 @@ Current behavior has these SQLite-backed fast paths:
 - `_id` equality `find` uses the SQLite primary key `(namespace, id_key)` and
   avoids decoding the namespace.
 - Simple scalar equality `find` can use maintained `index_entries`, then still
-  decodes matching BSON documents for final matcher compatibility.
+  decodes matching BSON documents for final matcher compatibility. If an
+  indexed path has array traversal omitted from scalar planner entries, a
+  maintained omission sentinel disables the pushdown and the Rust matcher scans
+  the collection.
 - Full-key safe compound equality `find` can use maintained compound
   `index_entries`, then still decodes candidate BSON documents for final Rust
-  matcher validation.
+  matcher validation. The same omission sentinel disables compound pushdown
+  when any indexed key path contains arrays.
 - `count` uses SQLite for empty filters, exact `_id` equality, and exact
   non-numeric indexed scalar equality with maintained single-field or full-key
   compound index entries.
@@ -223,8 +227,9 @@ The remaining slow local results cluster around full namespace decode:
   then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
 - write filters outside the conservative planner, including logical operators,
   multi-predicate filters, unindexed fields, arrays, null/missing semantics,
-  numeric unique values, partial compound filters, and multikey unique shapes,
-  still use the Rust matcher and scan fallback.
+  indexed paths with array omissions, numeric unique values, partial compound
+  filters, and multikey unique shapes, still use the Rust matcher and scan
+  fallback.
 
 Expect variance between local machines and GitHub-hosted runners. The CI budget
 therefore uses intentionally coarse latency and throughput thresholds. Use JSON

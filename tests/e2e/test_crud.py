@@ -265,6 +265,26 @@ def test_update_targets_compound_indexed_filters(collection):
     assert fallback_numeric.matched_count == 0
 
 
+def test_update_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "tags": ["math"], "active": True},
+            {"_id": "u2", "tags": "math", "active": True},
+            {"_id": "u3", "tags": "math", "active": False},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.create_index([("tags", ASCENDING), ("active", ASCENDING)], name="tags_active_1")
+
+    one = collection.update_one({"tags": "math", "active": True}, {"$set": {"seen": True}})
+    assert one.matched_count == 1
+    assert collection.find_one({"_id": "u1"})["seen"] is True
+
+    many = collection.update_many({"tags": "math"}, {"$set": {"touched": True}})
+    assert many.matched_count == 3
+    assert ids(collection.find({"touched": True}).sort("_id", ASCENDING)) == ["u1", "u2", "u3"]
+
+
 def test_replacement_update_and_upsert(collection):
     seed_users(collection)
 
@@ -345,6 +365,26 @@ def test_delete_targets_compound_indexed_filters(collection):
     many = collection.delete_many({"profile.city": "Rome", "active": True})
     assert many.deleted_count == 1
     assert ids(collection.find({})) == ["u2"]
+
+
+def test_delete_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "tags": ["math"], "active": True},
+            {"_id": "u2", "tags": "math", "active": True},
+            {"_id": "u3", "tags": "math", "active": False},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.create_index([("tags", ASCENDING), ("active", ASCENDING)], name="tags_active_1")
+
+    one = collection.delete_one({"tags": "math", "active": True})
+    assert one.deleted_count == 1
+    assert ids(collection.find({"tags": "math"}).sort("_id", ASCENDING)) == ["u2", "u3"]
+
+    many = collection.delete_many({"tags": "math"})
+    assert many.deleted_count == 2
+    assert ids(collection.find({})) == []
 
 
 def seed_users(collection):

@@ -218,6 +218,43 @@ def test_unique_index_rejects_array_values(collection):
     assert "does not support array value" in str(excinfo.value)
 
 
+def test_indexed_find_falls_back_when_single_field_index_has_array_omissions(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "tags": ["math", "logic"], "nested": [{"kind": "first"}, {"kind": "second"}]},
+            {"_id": "u2", "tags": "math", "nested": {"kind": "second"}},
+            {"_id": "u3", "tags": "systems", "nested": {"kind": "first"}},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.create_index([("nested.kind", ASCENDING)], name="nested_kind_1")
+
+    assert [doc["_id"] for doc in collection.find({"tags": "math"}).sort("_id", ASCENDING)] == [
+        "u1",
+        "u2",
+    ]
+    assert [doc["_id"] for doc in collection.find({"nested.kind": "second"}).sort("_id", ASCENDING)] == [
+        "u1",
+        "u2",
+    ]
+
+
+def test_indexed_find_falls_back_when_compound_index_has_array_omissions(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "tags": ["math"], "active": True},
+            {"_id": "u2", "tags": "math", "active": True},
+            {"_id": "u3", "tags": "math", "active": False},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING), ("active", ASCENDING)], name="tags_active_1")
+
+    assert [doc["_id"] for doc in collection.find({"tags": "math", "active": True}).sort("_id", ASCENDING)] == [
+        "u1",
+        "u2",
+    ]
+
+
 def test_indexed_query_results_stay_correct_after_mutations(collection):
     collection.insert_many(
         [

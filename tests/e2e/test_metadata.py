@@ -90,6 +90,21 @@ def test_compound_indexed_count_uses_safe_full_key_and_falls_back(collection):
     assert collection.count_documents({"profile.city": "Rome", "active": 1}) == 1
 
 
+def test_indexed_count_falls_back_when_index_has_array_omissions(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "tags": ["math"], "active": True},
+            {"_id": "u2", "tags": "math", "active": True},
+            {"_id": "u3", "tags": "math", "active": False},
+        ]
+    )
+    collection.create_index("tags", name="tags_1")
+    collection.create_index([("tags", 1), ("active", 1)], name="tags_active_1")
+
+    assert collection.count_documents({"tags": "math"}) == 3
+    assert collection.count_documents({"tags": "math", "active": True}) == 2
+
+
 def test_distinct_scalar_dotted_and_array_values(collection):
     seed(collection)
 

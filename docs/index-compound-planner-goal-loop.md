@@ -451,6 +451,12 @@ Status:
   Operation not permitted`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
   uv run --locked pytest tests/e2e` passed with 136 passed and 1 skipped.
   Commit hash: pending.
+- 2026-07-04 adversarial follow-up: Added maintained multikey omission
+  sentinels so single-field and full-key compound scalar planners fall back
+  when indexed array paths would make `index_entries` incomplete. This preserves
+  scalar compound pushdown on clean datasets but does not implement full
+  multikey index entries; scalar array-element indexing remains in the later
+  multikey uplift.
 
 ## Final Response Requirements
 

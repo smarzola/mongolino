@@ -15,6 +15,9 @@ Current index support after the compound planner uplift:
 - `unique: true` is enforced for supported unique key shapes.
 - Maintained `index_entries` support safe single-field scalar planner paths and
   safe full-key compound scalar planner paths.
+- Maintained multikey omission sentinels disable single-field or compound
+  index-entry pushdown when an indexed path contains array traversal that would
+  otherwise be omitted from scalar planner entries.
 - Single-field scalar and full-key compound scalar indexes can accelerate
   `find`, `count`, aggregation `$match` + `$count`, update/delete target
   selection, findAndModify target selection, and safe non-numeric unique checks.
@@ -26,6 +29,8 @@ Major gaps:
   collation-aware compound behavior are absent.
 - Sparse and partial index options are rejected.
 - Multikey indexes do not have MongoDB-compatible array indexing semantics.
+  Current planners fall back to Rust matcher scans when indexed array values are
+  present; scalar multikey entry maintenance remains reserved for uplift 3.
 - Query hints, index choice diagnostics, and broader sort/range pushdown are
   absent.
 - Text, geospatial, hashed, wildcard, collation-aware, hidden, and TTL indexes

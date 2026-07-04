@@ -236,6 +236,16 @@ fn init_document_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_index_entries_lookup
             ON index_entries(namespace, index_name, key_value);
 
+        CREATE TABLE IF NOT EXISTS index_multikey_omissions (
+            namespace TEXT NOT NULL,
+            index_name TEXT NOT NULL,
+            id_key TEXT NOT NULL,
+            PRIMARY KEY (namespace, index_name, id_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_index_multikey_omissions_lookup
+            ON index_multikey_omissions(namespace, index_name);
+
         CREATE TABLE IF NOT EXISTS documents (
             namespace TEXT NOT NULL,
             id_key TEXT NOT NULL,
@@ -2222,10 +2232,13 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
         return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
     }
-    if let Some((index, key_value)) = indexes_for_namespace(conn, namespace)?
-        .into_iter()
-        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
-    {
+    for index in indexes_for_namespace(conn, namespace)? {
+        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+            continue;
+        }
         return Ok(CountPlan::IndexedEquality {
             index_name: index.name,
             key_value,
@@ -2246,6 +2259,9 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     else {
         return Ok(CountPlan::Fallback);
     };
+    if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+        return Ok(CountPlan::Fallback);
+    }
     Ok(CountPlan::IndexedEquality {
         index_name: index.name,
         key_value: id_key_from_bson(value),
@@ -2465,10 +2481,18 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
             "DELETE FROM index_entries WHERE namespace = ?1",
             params![ns],
         )?;
+        tx.execute(
+            "DELETE FROM index_multikey_omissions WHERE namespace = ?1",
+            params![ns],
+        )?;
         tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?
     } else {
         tx.execute(
             "DELETE FROM index_entries WHERE namespace = ?1 AND index_name = ?2",
+            params![ns, index],
+        )?;
+        tx.execute(
+            "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2",
             params![ns, index],
         )?;
         tx.execute(
@@ -2795,6 +2819,10 @@ fn rebuild_index_entries_tx(
         "DELETE FROM index_entries WHERE namespace = ?1 AND index_name = ?2",
         params![namespace, spec.name],
     )?;
+    tx.execute(
+        "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2",
+        params![namespace, spec.name],
+    )?;
     for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(sql_string_error)? {
         insert_index_entry_for_document_tx(tx, namespace, spec, &stored.id_key, &stored.document)?;
     }
@@ -2809,6 +2837,10 @@ fn refresh_index_entries_for_document_tx(
 ) -> std::result::Result<(), rusqlite::Error> {
     tx.execute(
         "DELETE FROM index_entries WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    tx.execute(
+        "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
     )?;
     let indexes = indexes_for_namespace_tx(tx, namespace).map_err(sql_string_error)?;
@@ -2827,6 +2859,10 @@ fn delete_index_entries_for_document_tx(
         "DELETE FROM index_entries WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
     )?;
+    tx.execute(
+        "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
     Ok(())
 }
 
@@ -2837,6 +2873,12 @@ fn insert_index_entry_for_document_tx(
     id_key: &str,
     document: &Document,
 ) -> std::result::Result<(), rusqlite::Error> {
+    if index_has_multikey_omission(spec, document) {
+        tx.execute(
+            "INSERT OR IGNORE INTO index_multikey_omissions(namespace, index_name, id_key) VALUES (?1, ?2, ?3)",
+            params![namespace, spec.name, id_key],
+        )?;
+    }
     let Some(key_value) = planner_key_for_document(spec, document) else {
         return Ok(());
     };
@@ -2845,6 +2887,57 @@ fn insert_index_entry_for_document_tx(
         params![namespace, spec.name, key_value, id_key],
     )?;
     Ok(())
+}
+
+fn index_has_multikey_omission(spec: &IndexSpec, document: &Document) -> bool {
+    spec.key
+        .keys()
+        .any(|field| indexed_path_contains_array(document, field))
+}
+
+fn indexed_path_contains_array(document: &Document, path: &str) -> bool {
+    let mut parts = path.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let rest = parts.collect::<Vec<_>>();
+    document
+        .get(first)
+        .is_some_and(|value| bson_path_contains_array(value, &rest))
+}
+
+fn bson_path_contains_array(value: &Bson, parts: &[&str]) -> bool {
+    match value {
+        Bson::Array(_) => true,
+        Bson::Document(document) if !parts.is_empty() => document
+            .get(parts[0])
+            .is_some_and(|next| bson_path_contains_array(next, &parts[1..])),
+        _ => false,
+    }
+}
+
+fn index_entries_safe_for_planner(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2)",
+        params![namespace, index_name],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn index_entries_safe_for_planner_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    index_name: &str,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2)",
+        params![namespace, index_name],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
@@ -3828,10 +3921,13 @@ fn plan_transaction_candidates(
             value,
         )));
     }
-    if let Some((index, key_value)) = indexes_for_namespace_tx(tx, namespace)?
-        .into_iter()
-        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
-    {
+    for index in indexes_for_namespace_tx(tx, namespace)? {
+        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
+            continue;
+        }
         return Ok(TransactionCandidatePlan::IndexedEquality {
             index_name: index.name,
             key_value,
@@ -3850,6 +3946,9 @@ fn plan_transaction_candidates(
     else {
         return Ok(TransactionCandidatePlan::Fallback);
     };
+    if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
+        return Ok(TransactionCandidatePlan::Fallback);
+    }
     Ok(TransactionCandidatePlan::IndexedEquality {
         index_name: index.name,
         key_value: id_key_from_bson(value),
@@ -5501,10 +5600,13 @@ fn indexed_candidate_documents(
     namespace: &str,
     filter: &Document,
 ) -> Result<Option<Vec<Document>>> {
-    if let Some((index, key_value)) = indexes_for_namespace(conn, namespace)?
-        .into_iter()
-        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
-    {
+    for index in indexes_for_namespace(conn, namespace)? {
+        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+            continue;
+        }
         return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
     }
 
@@ -5520,6 +5622,9 @@ fn indexed_candidate_documents(
     else {
         return Ok(None);
     };
+    if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+        return Ok(None);
+    }
     let key_value = id_key_from_bson(value);
     indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value)
 }
@@ -9727,6 +9832,46 @@ mod tests {
     }
 
     #[test]
+    fn planner_falls_back_when_single_field_index_omits_array_values() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                    { "key": { "nested.kind": 1_i32 }, "name": "nested_kind_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert!(!index_entries_safe_for_planner(&conn, "app.users", "tags_1").unwrap());
+        assert!(!index_entries_safe_for_planner(&conn, "app.users", "nested_kind_1").unwrap());
+        assert!(
+            indexed_candidate_documents(&conn, "app.users", &doc! { "tags": "math" })
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            indexed_candidate_documents(&conn, "app.users", &doc! { "nested.kind": "second" })
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(find_ids(&conn, doc! { "tags": "math" }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "nested.kind": "second" }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "tags": "math" }).unwrap(),
+            CountPlan::Fallback
+        );
+    }
+
+    #[test]
     fn planner_uses_compound_index_entries_for_full_equality() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -9770,6 +9915,111 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn planner_falls_back_when_compound_index_omits_array_values() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "tags": ["math"], "active": true },
+                    { "_id": "u2", "tags": "math", "active": true },
+                    { "_id": "u3", "tags": "math", "active": false },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32, "active": 1_i32 }, "name": "tags_active_1" }],
+            },
+        )
+        .unwrap();
+
+        assert!(!index_entries_safe_for_planner(&conn, "app.users", "tags_active_1").unwrap());
+        assert!(
+            indexed_candidate_documents(
+                &conn,
+                "app.users",
+                &doc! { "tags": "math", "active": true },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": "math", "active": true }),
+            vec!["u1", "u2"]
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "tags": "math", "active": true }).unwrap(),
+            CountPlan::Fallback
+        );
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            plan_transaction_candidates(&tx, "app.users", &doc! { "tags": "math", "active": true })
+                .unwrap(),
+            TransactionCandidatePlan::Fallback
+        );
+    }
+
+    #[test]
+    fn planner_reuses_index_after_last_array_omission_is_removed() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "tag": ["math"] },
+                    { "_id": "u2", "tag": "math" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "tag": 1_i32 }, "name": "tag_1" }],
+            },
+        )
+        .unwrap();
+        assert!(
+            indexed_candidate_documents(&conn, "app.users", &doc! { "tag": "math" })
+                .unwrap()
+                .is_none()
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "tag": "math" } } }],
+            },
+        )
+        .unwrap();
+
+        assert!(index_entries_safe_for_planner(&conn, "app.users", "tag_1").unwrap());
+        let candidates = indexed_candidate_documents(&conn, "app.users", &doc! { "tag": "math" })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u2"]
         );
     }
 
@@ -9863,9 +10113,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+        let omissions: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users' AND index_name = 'city_active_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omissions, 1);
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
-            vec!["u1", "u3"]
+            vec!["u1", "u3", "unsafe_array"]
         );
 
         update_documents(
@@ -9879,7 +10137,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
-            vec!["u3"]
+            vec!["u3", "unsafe_array"]
         );
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Milan", "active": true }),
@@ -9899,7 +10157,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
-            Vec::<String>::new()
+            vec!["unsafe_array"]
         );
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Rome", "active": false }),
@@ -9929,6 +10187,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        let omissions: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users' AND index_name = 'city_active_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omissions, 0);
     }
 
     #[test]

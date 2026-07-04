@@ -166,6 +166,30 @@ def test_find_and_modify_refreshes_compound_index_entries(collection):
     assert collection.find_one({"state": "queued", "email": "b@example.test"}) is None
 
 
+def test_find_and_modify_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
+    collection.insert_many(
+        [
+            {"_id": "j1", "tags": ["math"], "state": "queued"},
+            {"_id": "j2", "tags": "math", "state": "queued"},
+            {"_id": "j3", "tags": "math", "state": "done"},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.create_index([("tags", ASCENDING), ("state", ASCENDING)], name="tags_state_1")
+
+    updated = collection.find_one_and_update(
+        {"tags": "math", "state": "queued"},
+        {"$set": {"state": "running"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j1"
+    assert updated["state"] == "running"
+
+    removed = collection.find_one_and_delete({"tags": "math", "state": "queued"})
+    assert removed["_id"] == "j2"
+    assert collection.find_one({"_id": "j2"}) is None
+
+
 def test_find_one_and_update_upsert_returns_inserted_document(collection):
     result = collection.find_one_and_update(
         {"_id": "counter", "kind": "local"},

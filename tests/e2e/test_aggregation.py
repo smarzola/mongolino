@@ -112,6 +112,25 @@ def test_aggregate_match_count_uses_compound_index_for_safe_full_key(collection)
     assert list(collection.aggregate([{"$match": {"team": "missing", "active": True}}, {"$count": "total"}])) == []
 
 
+def test_aggregate_match_count_falls_back_when_index_has_array_omissions(collection):
+    collection.insert_many(
+        [
+            {"_id": "s1", "tags": ["red"], "active": True},
+            {"_id": "s2", "tags": "red", "active": True},
+            {"_id": "s3", "tags": "red", "active": False},
+        ]
+    )
+    collection.create_index("tags", name="tags_1")
+    collection.create_index([("tags", 1), ("active", 1)], name="tags_active_1")
+
+    assert list(collection.aggregate([{"$match": {"tags": "red"}}, {"$count": "total"}])) == [
+        {"total": 3}
+    ]
+    assert list(collection.aggregate([{"$match": {"tags": "red", "active": True}}, {"$count": "total"}])) == [
+        {"total": 2}
+    ]
+
+
 def test_aggregate_match_count_fallback_preserves_filter_errors(collection):
     seed_scores(collection)
 
