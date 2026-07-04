@@ -3543,7 +3543,9 @@ fn apply_update_entry(
     let update = classify_update(update)?;
 
     let mut matches = Vec::new();
-    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+    for stored in
+        transaction_candidate_documents(tx, namespace, query).map_err(|err| err.to_string())?
+    {
         match matches_filter(&stored.document, query) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}
@@ -3636,6 +3638,122 @@ fn stored_documents_for_namespace_tx(
         })
     })
     .collect::<Result<Vec<_>>>()
+}
+
+fn stored_document_by_id_key_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    id_key: &str,
+) -> Result<Option<StoredDocument>> {
+    tx.query_row(
+        "SELECT id_key, bson FROM documents WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )
+    .optional()?
+    .map(|(id_key, bytes)| {
+        Ok(StoredDocument {
+            id_key,
+            document: decode_document(bytes)?,
+        })
+    })
+    .transpose()
+}
+
+#[derive(Debug, PartialEq)]
+enum TransactionCandidatePlan {
+    IdEquality(String),
+    IndexedEquality {
+        index_name: String,
+        key_value: String,
+    },
+    Fallback,
+}
+
+fn plan_transaction_candidates(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+) -> Result<TransactionCandidatePlan> {
+    if let Some(value) = exact_equality_filter_value(filter, "_id") {
+        return Ok(TransactionCandidatePlan::IdEquality(id_key_from_bson(
+            value,
+        )));
+    }
+    let Some((field, value)) = exact_single_equality_filter(filter) else {
+        return Ok(TransactionCandidatePlan::Fallback);
+    };
+    if !is_write_candidate_pushdown_scalar(value) {
+        return Ok(TransactionCandidatePlan::Fallback);
+    }
+    let Some(index) = indexes_for_namespace_tx(tx, namespace)?
+        .into_iter()
+        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
+    else {
+        return Ok(TransactionCandidatePlan::Fallback);
+    };
+    Ok(TransactionCandidatePlan::IndexedEquality {
+        index_name: index.name,
+        key_value: id_key_from_bson(value),
+    })
+}
+
+fn transaction_candidate_documents(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+) -> Result<Vec<StoredDocument>> {
+    match plan_transaction_candidates(tx, namespace, filter)? {
+        TransactionCandidatePlan::IdEquality(id_key) => {
+            Ok(stored_document_by_id_key_tx(tx, namespace, &id_key)?
+                .into_iter()
+                .collect())
+        }
+        TransactionCandidatePlan::IndexedEquality {
+            index_name,
+            key_value,
+        } => indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value),
+        TransactionCandidatePlan::Fallback => stored_documents_for_namespace_tx(tx, namespace),
+    }
+}
+
+fn indexed_candidate_documents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    index_name: &str,
+    key_value: &str,
+) -> Result<Vec<StoredDocument>> {
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT d.id_key, d.bson
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+           AND e.key_value = ?3
+         ORDER BY d.created_at
+        "#,
+    )?;
+    stmt.query_map(params![namespace, index_name, key_value], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?
+    .map(|row| {
+        let (id_key, bytes) = row?;
+        Ok(StoredDocument {
+            id_key,
+            document: decode_document(bytes)?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()
+}
+
+fn is_write_candidate_pushdown_scalar(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
+    )
 }
 
 fn insert_stored_document_tx(
@@ -4568,7 +4686,9 @@ fn apply_delete_entry(
     };
 
     let mut targets = Vec::new();
-    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+    for stored in
+        transaction_candidate_documents(tx, namespace, query).map_err(|err| err.to_string())?
+    {
         match matches_filter(&stored.document, query) {
             Ok(true) => targets.push(stored.id_key),
             Ok(false) => {}
@@ -7248,6 +7368,112 @@ mod tests {
                 CountPlan::Fallback
             );
         }
+    }
+
+    #[test]
+    fn transaction_candidate_planner_classifies_safe_and_fallback_filters() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "active": 1_i32 }, "name": "active_1" },
+                    { "key": { "profile.city": 1_i32 }, "name": "city_1" },
+                    { "key": { "age": 1_i32 }, "name": "age_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(
+            plan_transaction_candidates(&tx, "app.users", &doc! { "_id": "u1" }).unwrap(),
+            TransactionCandidatePlan::IdEquality("str:u1".to_string())
+        );
+        assert_eq!(
+            plan_transaction_candidates(&tx, "app.users", &doc! { "_id": { "$eq": "u1" } })
+                .unwrap(),
+            TransactionCandidatePlan::IdEquality("str:u1".to_string())
+        );
+        assert_eq!(
+            plan_transaction_candidates(&tx, "app.users", &doc! { "active": true }).unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "active_1".to_string(),
+                key_value: "bool:true".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_transaction_candidates(
+                &tx,
+                "app.users",
+                &doc! { "profile.city": { "$eq": "Rome" } }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "city_1".to_string(),
+                key_value: "str:Rome".to_string(),
+            }
+        );
+
+        for filter in [
+            doc! {},
+            doc! { "tags": ["math"] },
+            doc! { "$or": [{ "active": true }] },
+            doc! { "active": { "$in": [true] } },
+            doc! { "active": { "$ne": false } },
+            doc! { "active": true, "name": "Ada" },
+            doc! { "name": "Ada" },
+            doc! { "active": null },
+            doc! { "active": { "nested": true } },
+            doc! { "age": 37_i32 },
+            doc! { "age": 37_i64 },
+            doc! { "age": 37.0 },
+        ] {
+            assert_eq!(
+                plan_transaction_candidates(&tx, "app.users", &filter).unwrap(),
+                TransactionCandidatePlan::Fallback
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_candidate_loader_returns_created_order_candidates() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32 }, "name": "city_1" }],
+            },
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let id_candidates =
+            transaction_candidate_documents(&tx, "app.users", &doc! { "_id": "u2" }).unwrap();
+        assert_eq!(
+            id_candidates
+                .iter()
+                .map(|stored| stored.document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u2"]
+        );
+
+        let indexed_candidates =
+            transaction_candidate_documents(&tx, "app.users", &doc! { "profile.city": "Rome" })
+                .unwrap();
+        assert_eq!(
+            indexed_candidates
+                .iter()
+                .map(|stored| stored.document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u3"]
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Transaction candidate planner
+- [x] Milestone 0: Transaction candidate planner
 - [ ] Milestone 1: Update/delete target narrowing
 - [ ] Milestone 2: findAndModify target narrowing
 - [ ] Milestone 3: Unique conflict check pushdown
@@ -118,6 +118,12 @@ Acceptance criteria:
 - Always returns candidates that still need Rust matcher validation.
 - Add Rust tests for classification and candidate order.
 - Milestone status is marked done in this file and committed.
+
+Status 2026-07-04: Done. Added transaction-local `_id` and safe indexed scalar
+candidate planning/loading, with Rust tests for classification and created-order
+candidate delivery. Verification passed: `cargo fmt -- --check`,
+`cargo test planner`, `cargo test update`, `cargo test delete`,
+`cargo test find_and_modify`, and `cargo test`. Commit: `5b1f921`.
 
 Likely files:
 
