@@ -7480,6 +7480,7 @@ mod tests {
                 "indexes": [
                     { "key": { "active": 1_i32 }, "name": "active_1" },
                     { "key": { "age": 1_i32 }, "name": "age_1" },
+                    { "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" },
                 ],
             },
         )
@@ -7512,6 +7513,18 @@ mod tests {
             }
         );
         assert_eq!(
+            plan_count(
+                &conn,
+                "app.users",
+                &doc! { "active": true, "profile.city": { "$eq": "Rome" } }
+            )
+            .unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "city_active_1".to_string(),
+                key_value: "compound:2:8:str:Rome:9:bool:true".to_string(),
+            }
+        );
+        assert_eq!(
             plan_count(&conn, "app.users", &doc! { "age": 37_i32 }).unwrap(),
             CountPlan::Fallback
         );
@@ -7534,6 +7547,9 @@ mod tests {
             doc! { "profile.city": "Rome" },
             doc! { "active": null },
             doc! { "active": { "nested": true } },
+            doc! { "profile.city": "Rome", "active": 1_i32 },
+            doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
+            doc! { "profile.city": "Rome" },
         ] {
             assert_eq!(
                 plan_count(&conn, "app.users", &filter).unwrap(),
@@ -9638,6 +9654,53 @@ mod tests {
         assert_eq!(
             find_ids(&conn, doc! { "profile.city": "Rome" }),
             vec!["u1", "u3"]
+        );
+    }
+
+    #[test]
+    fn planner_uses_compound_index_entries_for_full_equality() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" }],
+            },
+        )
+        .unwrap();
+
+        let candidates = indexed_candidate_documents(
+            &conn,
+            "app.users",
+            &doc! { "active": true, "profile.city": "Rome" },
+        )
+        .unwrap()
+        .unwrap();
+        let candidate_ids = candidates
+            .iter()
+            .map(|doc| doc.get_str("_id").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, vec!["u1", "u3"]);
+
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
+            vec!["u1", "u3"]
+        );
+        assert!(
+            indexed_candidate_documents(&conn, "app.users", &doc! { "profile.city": "Rome" },)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            indexed_candidate_documents(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Rome", "active": 1_i32 },
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

@@ -161,7 +161,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Compound key encoding and planner classification
 - [x] Milestone 1: Compound index entry maintenance
-- [ ] Milestone 2: Compound read and count pushdown
+- [x] Milestone 2: Compound read and count pushdown
 - [ ] Milestone 3: Compound write target and unique pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
@@ -304,6 +304,19 @@ cargo test aggregate_match_count
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py
 cargo test
 ```
+
+Status:
+
+- 2026-07-04: Full-key safe compound equality now narrows `find` candidates
+  through maintained entries while still applying the Rust matcher, and
+  `count` plus aggregation `$match` + `$count` use the same safe count path.
+  Numeric, partial, extra-field, array, document, null, and operator shapes
+  fall back. Verified with `cargo fmt -- --check`; `cargo test count`;
+  `cargo test find`; `cargo test aggregate_match_count`; `cargo test`;
+  sandboxed PyMongo e2e failed at localhost bind with `PermissionError: [Errno
+  1] Operation not permitted`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py
+  tests/e2e/test_aggregation.py` passed. Commit hash: pending.
 
 ## Milestone 3: Compound Write Target And Unique Pushdown
 

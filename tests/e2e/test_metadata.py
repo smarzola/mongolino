@@ -73,6 +73,23 @@ def test_indexed_count_mixed_numeric_values_match_cross_type(collection):
     assert collection.count_documents({"n": 1.0}) == 3
 
 
+def test_compound_indexed_count_uses_safe_full_key_and_falls_back(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "profile": {"city": "Rome"}, "active": True},
+            {"_id": "u2", "profile": {"city": "Rome"}, "active": False},
+            {"_id": "u3", "profile": {"city": "London"}, "active": True},
+            {"_id": "u4", "profile": {"city": "Rome"}, "active": 1},
+        ]
+    )
+    collection.create_index([("profile.city", 1), ("active", 1)], name="city_active_1")
+
+    assert collection.count_documents({"profile.city": "Rome", "active": True}) == 1
+    assert collection.count_documents({"active": True, "profile.city": {"$eq": "Rome"}}, skip=1) == 0
+    assert collection.count_documents({"profile.city": "Rome"}) == 3
+    assert collection.count_documents({"profile.city": "Rome", "active": 1}) == 1
+
+
 def test_distinct_scalar_dotted_and_array_values(collection):
     seed(collection)
 

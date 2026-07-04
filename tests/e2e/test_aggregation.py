@@ -92,6 +92,26 @@ def test_aggregate_match_count_indexed_mixed_numeric_values(collection):
         ]
 
 
+def test_aggregate_match_count_uses_compound_index_for_safe_full_key(collection):
+    collection.insert_many(
+        [
+            {"_id": "s1", "team": "red", "active": True},
+            {"_id": "s2", "team": "red", "active": False},
+            {"_id": "s3", "team": "blue", "active": True},
+            {"_id": "s4", "team": "red", "active": 1},
+        ]
+    )
+    collection.create_index([("team", 1), ("active", 1)], name="team_active_1")
+
+    assert list(collection.aggregate([{"$match": {"team": "red", "active": True}}, {"$count": "total"}])) == [
+        {"total": 1}
+    ]
+    assert list(collection.aggregate([{"$match": {"team": "red", "active": 1}}, {"$count": "total"}])) == [
+        {"total": 1}
+    ]
+    assert list(collection.aggregate([{"$match": {"team": "missing", "active": True}}, {"$count": "total"}])) == []
+
+
 def test_aggregate_match_count_fallback_preserves_filter_errors(collection):
     seed_scores(collection)
 
