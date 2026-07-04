@@ -112,7 +112,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Baseline and shared query-shaping preparation
-- [ ] Milestone 1: `findAndModify` command compatibility
+- [x] Milestone 1: `findAndModify` command compatibility
 - [ ] Milestone 2: Aggregation read pipeline subset
 - [ ] Milestone 3: Aggregation cursor batching and adversarial command coverage
 - [ ] Milestone 4: Spec corpus, README, and final verification hardening
@@ -170,6 +170,8 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: `findAndModify` Command Compatibility
+
+Status 2026-07-04: Complete. Added `findAndModify` / `findandmodify` dispatch, transaction-backed update/replace/delete/upsert behavior, pre-image/post-image responses, projection aliases, unique-index enforcement, index-entry refresh/delete, and explicit errors for malformed or unsupported command shapes. Verification: `cargo fmt -- --check` passed; `cargo test find_and_modify` passed; `cargo test unique` passed; `cargo test planner` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_find_and_modify.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `cargo test` passed.
 
 Problem:
 

@@ -503,6 +503,7 @@ fn handle_command_with_state(
         "count" => count_documents_command(conn, command),
         "distinct" => distinct_command(conn, command),
         "aggregate" => aggregate_command(conn, command),
+        "findAndModify" | "findandmodify" => find_and_modify(conn, command_name.as_str(), command),
         "createIndexes" => create_indexes(conn, command),
         "listIndexes" => list_indexes(conn, command),
         "dropIndexes" => drop_indexes(conn, command),
@@ -946,6 +947,300 @@ fn parse_count_documents_pipeline(
     }
 
     Ok((filter, skip, limit))
+}
+
+fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str(command_key) {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "findAndModify command requires a collection name",
+            ));
+        }
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "findAndModify",
+            "findandmodify",
+            "query",
+            "sort",
+            "remove",
+            "update",
+            "new",
+            "upsert",
+            "fields",
+            "projection",
+            "$db",
+            "lsid",
+        ],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let query = match optional_document(command, "query") {
+        Ok(Some(query)) => query,
+        Ok(None) => Document::new(),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let sort = match parse_sort(command) {
+        Ok(sort) => sort,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
+    let projection = match parse_find_and_modify_projection(command) {
+        Ok(projection) => projection,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
+    let remove = match optional_bool(command, "remove") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let return_new = match optional_bool(command, "new") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let upsert = match optional_bool(command, "upsert") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+
+    if remove && command.contains_key("update") {
+        return Ok(command_error(
+            9,
+            "findAndModify cannot combine remove and update",
+        ));
+    }
+    if remove && upsert {
+        return Ok(command_error(
+            9,
+            "findAndModify cannot combine remove and upsert",
+        ));
+    }
+    if !remove && !command.contains_key("update") {
+        return Ok(command_error(9, "findAndModify requires remove or update"));
+    }
+
+    let update = if remove {
+        None
+    } else {
+        match command.get("update") {
+            Some(Bson::Document(update)) => match classify_update(update) {
+                Ok(update) => Some(update),
+                Err(errmsg) => return Ok(command_error(update_error_code(&errmsg), &errmsg)),
+            },
+            Some(Bson::Array(_)) => {
+                return Ok(command_error(
+                    72,
+                    "findAndModify pipeline updates are not supported",
+                ));
+            }
+            Some(_) => return Ok(command_error(9, "findAndModify update must be a document")),
+            None => unreachable!("update presence checked above"),
+        }
+    };
+
+    let namespace = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    ensure_collection_catalog_tx(&tx, &namespace)?;
+    let outcome = if remove {
+        apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref())?
+    } else {
+        apply_find_and_modify_update(
+            &tx,
+            &namespace,
+            &query,
+            sort.as_deref(),
+            update.as_ref().expect("update parsed above"),
+            upsert,
+            return_new,
+        )?
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(response) => return Ok(response),
+    };
+    tx.commit()?;
+
+    let value = outcome
+        .value
+        .map(|document| {
+            projection
+                .as_ref()
+                .map(|projection| apply_projection(&document, projection))
+                .unwrap_or(document)
+        })
+        .map(Bson::Document)
+        .unwrap_or(Bson::Null);
+    let mut last_error = doc! {
+        "n": outcome.n,
+    };
+    if let Some(updated_existing) = outcome.updated_existing {
+        last_error.insert("updatedExisting", updated_existing);
+    }
+    if let Some(upserted) = outcome.upserted {
+        last_error.insert("upserted", upserted);
+    }
+
+    Ok(doc! {
+        "value": value,
+        "lastErrorObject": last_error,
+        "ok": 1.0,
+    })
+}
+
+struct FindAndModifyOutcome {
+    value: Option<Document>,
+    n: i32,
+    updated_existing: Option<bool>,
+    upserted: Option<Bson>,
+}
+
+fn apply_find_and_modify_remove(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    query: &Document,
+    sort: Option<&[(String, i32)]>,
+) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
+    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort)? {
+        Ok(target) => target,
+        Err(response) => return Ok(Err(response)),
+    }) else {
+        return Ok(Ok(FindAndModifyOutcome {
+            value: None,
+            n: 0,
+            updated_existing: None,
+            upserted: None,
+        }));
+    };
+
+    delete_index_entries_for_document_tx(tx, namespace, &target.id_key)?;
+    tx.execute(
+        "DELETE FROM documents WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, target.id_key],
+    )?;
+    Ok(Ok(FindAndModifyOutcome {
+        value: Some(target.document),
+        n: 1,
+        updated_existing: None,
+        upserted: None,
+    }))
+}
+
+fn apply_find_and_modify_update(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    query: &Document,
+    sort: Option<&[(String, i32)]>,
+    update: &UpdateSpec,
+    upsert: bool,
+    return_new: bool,
+) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
+    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort)? {
+        Ok(target) => target,
+        Err(response) => return Ok(Err(response)),
+    }) else {
+        if !upsert {
+            return Ok(Ok(FindAndModifyOutcome {
+                value: None,
+                n: 0,
+                updated_existing: Some(false),
+                upserted: None,
+            }));
+        }
+
+        let mut new_document = match build_upsert_document(query, update) {
+            Ok(document) => document,
+            Err(errmsg) => return Ok(Err(command_error(update_error_code(&errmsg), &errmsg))),
+        };
+        ensure_document_id(&mut new_document);
+        let upserted_id = new_document.get("_id").cloned().ok_or_else(|| {
+            MongolinoError::Protocol("upsert document is missing _id".to_string())
+        })?;
+        if let Err(errmsg) = ensure_unique_constraints_tx(tx, namespace, &new_document, None) {
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+        if let Err(err) = insert_stored_document_tx(tx, namespace, &new_document) {
+            let errmsg = duplicate_or_sql_error(namespace, &new_document, err);
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+        refresh_index_entries_for_document_tx(
+            tx,
+            namespace,
+            &id_key_from_bson(&upserted_id),
+            &new_document,
+        )?;
+        return Ok(Ok(FindAndModifyOutcome {
+            value: return_new.then_some(new_document),
+            n: 1,
+            updated_existing: Some(false),
+            upserted: Some(upserted_id),
+        }));
+    };
+
+    let new_document = match apply_update_to_document(&target.document, update) {
+        Ok(document) => document,
+        Err(errmsg) => {
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+    };
+    let new_id_key = match id_key(&new_document) {
+        Ok(id_key) => id_key,
+        Err(err) => return Err(err),
+    };
+    if new_id_key != target.id_key {
+        let errmsg = "update cannot change _id";
+        return Ok(Err(command_error(update_error_code(errmsg), errmsg)));
+    }
+    if new_document != target.document {
+        if let Err(errmsg) =
+            ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&target.id_key))
+        {
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+        if let Err(err) = update_stored_document_tx(tx, namespace, &target.id_key, &new_document) {
+            let errmsg = duplicate_or_sql_error(namespace, &new_document, err);
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+        refresh_index_entries_for_document_tx(tx, namespace, &target.id_key, &new_document)?;
+    }
+
+    Ok(Ok(FindAndModifyOutcome {
+        value: Some(if return_new {
+            new_document
+        } else {
+            target.document
+        }),
+        n: 1,
+        updated_existing: Some(true),
+        upserted: None,
+    }))
+}
+
+fn find_and_modify_target_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    query: &Document,
+    sort: Option<&[(String, i32)]>,
+) -> Result<std::result::Result<Option<StoredDocument>, Document>> {
+    let mut matches = Vec::new();
+    for stored in stored_documents_for_namespace_tx(tx, namespace)? {
+        match matches_filter(&stored.document, query) {
+            Ok(true) => matches.push(stored),
+            Ok(false) => {}
+            Err(err) => return Ok(Err(command_error(err.code, &err.errmsg))),
+        }
+    }
+    if let Some(sort) = sort {
+        sort_stored_documents(&mut matches, sort);
+    }
+    Ok(Ok(matches.into_iter().next()))
+}
+
+fn sort_stored_documents(documents: &mut [StoredDocument], sort: &[(String, i32)]) {
+    documents
+        .sort_by(|left, right| compare_documents_for_sort(&left.document, &right.document, sort));
 }
 
 fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result<usize, Document> {
@@ -2626,6 +2921,17 @@ fn optional_i64(command: &Document, key: &str) -> std::result::Result<Option<i64
     }
 }
 
+fn optional_document(
+    command: &Document,
+    key: &str,
+) -> std::result::Result<Option<Document>, String> {
+    match command.get(key) {
+        None => Ok(None),
+        Some(Bson::Document(document)) => Ok(Some(document.clone())),
+        Some(_) => Err(format!("{key} must be a document")),
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ProjectionMode {
     Include,
@@ -2646,7 +2952,31 @@ fn parse_projection(command: &Document) -> std::result::Result<Option<Projection
     let Bson::Document(projection) = value else {
         return Err("projection must be a document".to_string());
     };
+    parse_projection_document(projection)
+}
 
+fn parse_find_and_modify_projection(
+    command: &Document,
+) -> std::result::Result<Option<ProjectionSpec>, String> {
+    let projection = optional_document(command, "projection")?;
+    let fields = optional_document(command, "fields")?;
+    let projection = match (projection, fields) {
+        (Some(projection), Some(fields)) if projection != fields => {
+            return Err("fields and projection cannot conflict".to_string());
+        }
+        (Some(projection), _) => Some(projection),
+        (None, Some(fields)) => Some(fields),
+        (None, None) => None,
+    };
+    match projection {
+        Some(projection) => parse_projection_document(&projection),
+        None => Ok(None),
+    }
+}
+
+fn parse_projection_document(
+    projection: &Document,
+) -> std::result::Result<Option<ProjectionSpec>, String> {
     let mut mode = None;
     let mut fields = Vec::new();
     let mut include_id = true;
@@ -2823,22 +3153,28 @@ fn parse_sort(command: &Document) -> std::result::Result<Option<Vec<(String, i32
 }
 
 fn sort_documents(documents: &mut [Document], sort: &[(String, i32)]) {
-    documents.sort_by(|left, right| {
-        for (field, direction) in sort {
-            let ordering = compare_optional_bson(
-                get_document_path(left, field),
-                get_document_path(right, field),
-            );
-            if !ordering.is_eq() {
-                return if *direction == 1 {
-                    ordering
-                } else {
-                    ordering.reverse()
-                };
-            }
+    documents.sort_by(|left, right| compare_documents_for_sort(left, right, sort));
+}
+
+fn compare_documents_for_sort(
+    left: &Document,
+    right: &Document,
+    sort: &[(String, i32)],
+) -> std::cmp::Ordering {
+    for (field, direction) in sort {
+        let ordering = compare_optional_bson(
+            get_document_path(left, field),
+            get_document_path(right, field),
+        );
+        if !ordering.is_eq() {
+            return if *direction == 1 {
+                ordering
+            } else {
+                ordering.reverse()
+            };
         }
-        compare_optional_bson(left.get("_id"), right.get("_id"))
-    });
+    }
+    compare_optional_bson(left.get("_id"), right.get("_id"))
 }
 
 fn compare_optional_bson(left: Option<&Bson>, right: Option<&Bson>) -> std::cmp::Ordering {
@@ -4426,6 +4762,269 @@ mod tests {
         .unwrap();
         assert_command_error(&response);
         assert_eq!(response.get_i32("code").unwrap(), 72);
+    }
+
+    #[test]
+    fn find_and_modify_update_returns_pre_and_post_images_with_projection() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let pre_image = handle_command(
+            &conn,
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$inc": { "age": 1_i32 }, "$set": { "status": "seen" } },
+                "fields": { "name": 1_i32, "age": 1_i32, "_id": 0_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(pre_image.get_f64("ok").unwrap(), 1.0);
+        let value = pre_image.get_document("value").unwrap();
+        assert_eq!(value.get_str("name").unwrap(), "Ada");
+        assert_eq!(value.get_i32("age").unwrap(), 37);
+        assert!(!value.contains_key("_id"));
+        let leo = pre_image.get_document("lastErrorObject").unwrap();
+        assert_eq!(leo.get_i32("n").unwrap(), 1);
+        assert!(leo.get_bool("updatedExisting").unwrap());
+
+        let post_image = handle_command(
+            &conn,
+            &doc! {
+                "findandmodify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$inc": { "age": 1_i32 } },
+                "new": true,
+                "projection": { "age": 1_i32, "status": 1_i32, "_id": 0_i32 },
+            },
+        )
+        .unwrap();
+        let value = post_image.get_document("value").unwrap();
+        assert_eq!(value.get_i32("age").unwrap(), 39);
+        assert_eq!(value.get_str("status").unwrap(), "seen");
+    }
+
+    #[test]
+    fn find_and_modify_sorted_replace_and_delete_use_expected_target() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let replaced = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "profile.city": "Rome" },
+                "sort": { "age": -1_i32 },
+                "update": { "name": "Katherine Johnson", "age": 42_i32 },
+                "new": true,
+            },
+        )
+        .unwrap();
+        let value = replaced.get_document("value").unwrap();
+        assert_eq!(value.get_str("_id").unwrap(), "u3");
+        assert_eq!(value.get_str("name").unwrap(), "Katherine Johnson");
+
+        let removed = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "profile.city": "Rome" },
+                "sort": { "age": 1_i32 },
+                "remove": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            removed
+                .get_document("value")
+                .unwrap()
+                .get_str("_id")
+                .unwrap(),
+            "u1"
+        );
+        assert_eq!(find_ids(&conn, doc! { "_id": "u1" }), Vec::<String>::new());
+        assert_eq!(find_ids(&conn, doc! { "_id": "u3" }), vec!["u3"]);
+    }
+
+    #[test]
+    fn find_and_modify_upsert_reports_inserted_document_and_last_error() {
+        let conn = test_conn();
+
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u4", "email": "new@example.test" },
+                "update": { "$set": { "name": "New" }, "$inc": { "count": 1_i32 } },
+                "upsert": true,
+                "new": true,
+            },
+        )
+        .unwrap();
+
+        let value = response.get_document("value").unwrap();
+        assert_eq!(value.get_str("_id").unwrap(), "u4");
+        assert_eq!(value.get_str("email").unwrap(), "new@example.test");
+        assert_eq!(value.get_i32("count").unwrap(), 1);
+        let leo = response.get_document("lastErrorObject").unwrap();
+        assert_eq!(leo.get_i32("n").unwrap(), 1);
+        assert!(!leo.get_bool("updatedExisting").unwrap());
+        assert_eq!(leo.get_str("upserted").unwrap(), "u4");
+    }
+
+    #[test]
+    fn find_and_modify_duplicate_key_and_id_immutability_are_command_errors() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "ada@example.test" },
+                    { "_id": "u2", "email": "grace@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1", "unique": true }],
+            },
+        )
+        .unwrap();
+
+        let duplicate = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u2" },
+                "update": { "$set": { "email": "ada@example.test" } },
+                "new": true,
+            },
+        )
+        .unwrap();
+        assert_command_error(&duplicate);
+        assert_eq!(duplicate.get_i32("code").unwrap(), 11000);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u2" } },
+                )
+                .unwrap(),
+            )[0]
+            .get_str("email")
+            .unwrap(),
+            "grace@example.test"
+        );
+
+        let id_change = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "_id": "changed", "email": "other@example.test" },
+            },
+        )
+        .unwrap();
+        assert_command_error(&id_change);
+        assert!(id_change.get_str("errmsg").unwrap().contains("_id"));
+    }
+
+    #[test]
+    fn find_and_modify_refreshes_index_entries_after_update_and_delete() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_1" }],
+            },
+        )
+        .unwrap();
+
+        find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": "Ada Lovelace" } },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Ada" }),
+            Vec::<String>::new()
+        );
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada Lovelace" }), vec!["u1"]);
+
+        find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "remove": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Ada Lovelace" }),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn find_and_modify_rejects_malformed_and_unsupported_shapes() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for command in [
+            doc! { "findAndModify": "", "$db": "app", "query": {} },
+            doc! { "findAndModify": "users", "$db": "app", "query": "bad", "remove": true },
+            doc! { "findAndModify": "users", "$db": "app", "sort": "bad", "remove": true },
+            doc! { "findAndModify": "users", "$db": "app", "projection": "bad", "remove": true },
+            doc! { "findAndModify": "users", "$db": "app", "fields": { "name": 1_i32 }, "projection": { "age": 1_i32 }, "remove": true },
+            doc! { "findAndModify": "users", "$db": "app", "remove": true, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "remove": false },
+            doc! { "findAndModify": "users", "$db": "app" },
+            doc! { "findAndModify": "users", "$db": "app", "update": [{ "$set": { "name": "x" } }] },
+            doc! { "findAndModify": "users", "$db": "app", "update": "bad" },
+            doc! { "findAndModify": "users", "$db": "app", "arrayFilters": [], "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "collation": {}, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "hint": "_id_", "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "bypassDocumentValidation": true, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "maxTimeMS": 1_i32, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "let": {}, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "remove": true, "upsert": true },
+            doc! { "findAndModify": "users", "$db": "app", "query": { "$where": "bad" }, "remove": true },
+            doc! { "findAndModify": "users", "$db": "app", "projection": { "name": { "$literal": 1_i32 } }, "remove": true },
+        ] {
+            let response = handle_command(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
     }
 
     #[test]
