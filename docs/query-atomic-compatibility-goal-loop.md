@@ -114,7 +114,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and shared query-shaping preparation
 - [x] Milestone 1: `findAndModify` command compatibility
 - [x] Milestone 2: Aggregation read pipeline subset
-- [ ] Milestone 3: Aggregation cursor batching and adversarial command coverage
+- [x] Milestone 3: Aggregation cursor batching and adversarial command coverage
 - [ ] Milestone 4: Spec corpus, README, and final verification hardening
 
 ## Milestone 0: Baseline and Shared Query-Shaping Preparation
@@ -323,6 +323,8 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 3: Aggregation Cursor Batching and Adversarial Command Coverage
+
+Status 2026-07-04: Complete. Threaded aggregate through per-client cursor state, implemented `cursor.batchSize` parsing with explicit malformed-shape errors, stored aggregate remainders for `getMore`, and added unsupported aggregate option coverage. Verification: `cargo fmt -- --check` passed; `cargo test aggregate` passed; `cargo test get_more` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_cursors.py` failed with the same bind error; `cargo test` passed.
 
 Problem:
 

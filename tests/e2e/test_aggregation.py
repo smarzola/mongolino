@@ -80,3 +80,56 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
     with pytest.raises(OperationFailure) as excinfo:
         list(collection.aggregate([{"$group": {"_id": "$team", "n": {"$sum": 1}}}]))
     assert "count_documents group shape" in str(excinfo.value)
+
+
+def test_aggregate_batch_size_iterates_with_get_more(collection):
+    seed_scores(collection)
+
+    cursor = collection.aggregate(
+        [
+            {"$sort": {"_id": 1}},
+            {"$project": {"_id": 1}},
+        ],
+        batchSize=1,
+    )
+
+    assert [document["_id"] for document in cursor] == ["s1", "s2", "s3"]
+
+
+def test_aggregate_cursor_and_option_errors_are_explicit(collection):
+    seed_scores(collection)
+
+    for command, contains in [
+        (
+            {"aggregate": collection.name, "pipeline": [], "cursor": {"batchSize": 0}},
+            "batchSize",
+        ),
+        (
+            {"aggregate": collection.name, "pipeline": [], "cursor": {"batchSize": 1001}},
+            "batchSize",
+        ),
+        (
+            {"aggregate": collection.name, "pipeline": [], "cursor": {"unknown": 1}},
+            "unknown",
+        ),
+        (
+            {
+                "aggregate": collection.name,
+                "pipeline": [],
+                "cursor": {},
+                "allowDiskUse": True,
+            },
+            "allowDiskUse",
+        ),
+        (
+            {"aggregate": collection.name, "pipeline": [], "cursor": {}, "hint": "_id_"},
+            "hint",
+        ),
+        (
+            {"aggregate": collection.name, "pipeline": [], "cursor": {}, "let": {}},
+            "let",
+        ),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            collection.database.command(command)
+        assert contains in str(excinfo.value)

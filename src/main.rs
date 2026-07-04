@@ -502,7 +502,7 @@ fn handle_command_with_state(
         "dropDatabase" => drop_database(conn, command),
         "count" => count_documents_command(conn, command),
         "distinct" => distinct_command(conn, command),
-        "aggregate" => aggregate_command(conn, command),
+        "aggregate" => aggregate_command_with_state(conn, client_state, command),
         "findAndModify" | "findandmodify" => find_and_modify(conn, command_name.as_str(), command),
         "createIndexes" => create_indexes(conn, command),
         "listIndexes" => list_indexes(conn, command),
@@ -827,6 +827,15 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
 }
 
 fn aggregate_command(conn: &Connection, command: &Document) -> Result<Document> {
+    let mut client_state = ClientState::default();
+    aggregate_command_with_state(conn, &mut client_state, command)
+}
+
+fn aggregate_command_with_state(
+    conn: &Connection,
+    client_state: &mut ClientState,
+    command: &Document,
+) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
     let collection = match command.get_str("aggregate") {
         Ok(collection) if !collection.is_empty() => collection,
@@ -843,28 +852,55 @@ fn aggregate_command(conn: &Connection, command: &Document) -> Result<Document> 
     ) {
         return Ok(command_error(72, &errmsg));
     }
-    match command.get("cursor") {
-        Some(Bson::Document(_)) => {}
-        _ => return Ok(command_error(9, "aggregate requires a cursor document")),
-    }
+    let batch_size = match parse_aggregate_cursor(command) {
+        Ok(batch_size) => batch_size,
+        Err(response) => return Ok(response),
+    };
     let pipeline = match command.get_array("pipeline") {
         Ok(pipeline) => pipeline,
         Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
     };
-    let documents = match aggregate_pipeline_documents(conn, &namespace(db, collection), pipeline)?
-    {
+    let ns = namespace(db, collection);
+    let documents = match aggregate_pipeline_documents(conn, &ns, pipeline)? {
         Ok(documents) => documents,
         Err(response) => return Ok(response),
     };
 
-    Ok(doc! {
-        "cursor": {
-            "id": 0_i64,
-            "ns": namespace(db, collection),
-            "firstBatch": documents.into_iter().map(Bson::Document).collect::<Vec<_>>(),
-        },
-        "ok": 1.0,
-    })
+    Ok(cursor_response_for_documents(
+        client_state,
+        db,
+        collection,
+        &ns,
+        documents,
+        batch_size,
+        false,
+    ))
+}
+
+fn parse_aggregate_cursor(command: &Document) -> std::result::Result<usize, Document> {
+    let cursor = match command.get("cursor") {
+        Some(Bson::Document(cursor)) => cursor,
+        _ => return Err(command_error(9, "aggregate requires a cursor document")),
+    };
+    if let Some(key) = cursor.keys().find(|key| key.as_str() != "batchSize") {
+        return Err(command_error(
+            72,
+            &format!("aggregate cursor option {key} is not supported"),
+        ));
+    }
+    match cursor.get("batchSize") {
+        None => Ok(101),
+        Some(Bson::Int32(value)) if *value > 0 && *value <= 1000 => Ok(*value as usize),
+        Some(Bson::Int64(value)) if *value > 0 && *value <= 1000 => Ok(*value as usize),
+        Some(Bson::Int32(_)) | Some(Bson::Int64(_)) => Err(command_error(
+            9,
+            "aggregate cursor batchSize must be between 1 and 1000",
+        )),
+        Some(_) => Err(command_error(
+            9,
+            "aggregate cursor batchSize must be an integer",
+        )),
+    }
 }
 
 fn aggregate_pipeline_documents(
@@ -4509,6 +4545,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_batch(&skip_then_limit), vec![doc! { "_id": "u2" }]);
+    }
+
+    #[test]
+    fn aggregate_cursor_batch_size_uses_get_more_and_cleans_up() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+
+        let response = aggregate_command_with_state(
+            &conn,
+            &mut client_state,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": { "batchSize": 1_i32 },
+            },
+        )
+        .unwrap();
+
+        let id = cursor_id(&response);
+        assert!(id > 0);
+        assert_eq!(first_batch(&response), vec![doc! { "_id": "u1" }]);
+        assert_eq!(client_state.cursors.len(), 1);
+
+        let next = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "users", "$db": "app", "batchSize": 1_i32 },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&next), id);
+        assert_eq!(next_batch(&next), vec![doc! { "_id": "u2" }]);
+
+        let final_batch = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "users", "$db": "app", "batchSize": 10_i32 },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&final_batch), 0);
+        assert_eq!(next_batch(&final_batch), vec![doc! { "_id": "u3" }]);
+        assert!(client_state.cursors.is_empty());
+    }
+
+    #[test]
+    fn aggregate_rejects_malformed_cursor_and_unsupported_options() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for command in [
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": "bad" },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": { "batchSize": 0_i32 } },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": { "batchSize": -1_i32 } },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": { "batchSize": "bad" } },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": { "batchSize": 1001_i32 } },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": { "foo": 1_i32 } },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "allowDiskUse": true },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "explain": true },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "collation": {} },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "hint": "_id_" },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "comment": "nope" },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "maxTimeMS": 1_i32 },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "bypassDocumentValidation": true },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "readConcern": {} },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "writeConcern": {} },
+            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "let": {} },
+        ] {
+            let response = aggregate_command(&conn, &command).unwrap();
+            assert_command_error(&response);
+        }
     }
 
     #[test]
