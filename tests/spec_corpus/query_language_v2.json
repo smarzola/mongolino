@@ -10,7 +10,19 @@
       "tags": [
         "Math",
         "logic"
-      ]
+      ],
+      "scores": [
+        1,
+        2,
+        2
+      ],
+      "profile": {
+        "city": "Rome"
+      },
+      "nothing": null,
+      "active": true,
+      "age": 37,
+      "ratio": 1.5
     },
     {
       "_id": "u2",
@@ -18,7 +30,11 @@
       "bio": "COBOL\npioneer",
       "tags": [
         "navy"
-      ]
+      ],
+      "scores": [
+        3
+      ],
+      "age": 39
     },
     {
       "_id": "u3",
@@ -26,7 +42,9 @@
       "bio": "orbital math",
       "tags": [
         "space"
-      ]
+      ],
+      "scores": "none",
+      "age": 41.0
     },
     {
       "_id": "u4",
@@ -54,7 +72,19 @@
           "tags": [
             "Math",
             "logic"
-          ]
+          ],
+          "scores": [
+            1,
+            2,
+            2
+          ],
+          "profile": {
+            "city": "Rome"
+          },
+          "nothing": null,
+          "active": true,
+          "age": 37,
+          "ratio": 1.5
         }
       ]
     },
@@ -68,6 +98,87 @@
       },
       "expect_result": {
         "count": 1
+      }
+    },
+    {
+      "name": "count_documents",
+      "filter": {
+        "age": {
+          "$type": "number"
+        }
+      },
+      "expect_result": {
+        "count": 3
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "profile": {
+          "$type": "object"
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u1"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "tags": {
+          "$size": 2
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u1"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "tags": {
+          "$all": [
+            "logic",
+            "Math"
+          ]
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u1"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "tags": {
+          "$all": [
+            {
+              "$elemMatch": {
+                "$eq": "Math"
+              }
+            }
+          ]
+        }
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 2,
+        "contains": "$all $elemMatch clauses are not supported yet"
       }
     },
     {

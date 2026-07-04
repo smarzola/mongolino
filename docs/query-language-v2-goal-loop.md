@@ -133,7 +133,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Matcher architecture and error model
 - [x] Milestone 1: Regex predicate support
-- [ ] Milestone 2: `$type`, `$size`, and `$all`
+- [x] Milestone 2: `$type`, `$size`, and `$all`
 - [ ] Milestone 3: `$elemMatch` scalar and document semantics
 - [ ] Milestone 4: Cross-command/e2e/spec coverage and docs
 
@@ -228,7 +228,7 @@ test find_matcher` passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cac
 uv run --locked pytest tests/e2e/test_errors.py tests/e2e/test_crud.py` failed
 at localhost bind with `PermissionError: [Errno 1] Operation not permitted`;
 after `cargo build`, the same PyMongo command passed unsandboxed with 31 tests;
-`cargo test` passed. Commit: pending.
+`cargo test` passed. Commit: `d1d8edb`.
 
 ## Milestone 2: `$type`, `$size`, And `$all`
 
@@ -269,6 +269,15 @@ cargo test all
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_query_language.py
 cargo test
 ```
+
+Status 2026-07-04: Complete. Added `$type` for common aliases and BSON numeric
+codes, `$size` exact non-negative array length matching, and scalar `$all`
+membership. `$all` `$elemMatch` clauses remain explicit errors until Milestone
+3. Verification: `cargo fmt -- --check` passed; `cargo test type` passed;
+`cargo test size` passed; `cargo test all` passed; after `cargo build`,
+unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+pytest tests/e2e/test_query_language.py` passed with 2 tests; `cargo fmt --
+--check && cargo test` passed. Commit: pending.
 
 ## Milestone 3: `$elemMatch` Scalar And Document Semantics
 

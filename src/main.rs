@@ -6297,11 +6297,154 @@ fn matches_operator_predicate(
             };
             Ok(!matches_operator_document(values, nested)?)
         }
+        "$type" => matches_type_predicate(values, operand),
+        "$size" => matches_size_predicate(values, operand),
+        "$all" => matches_all_predicate(values, operand),
         _ => Err(match_error(
             2,
             format!("unsupported query operator {operator}"),
         )),
     }
+}
+
+fn matches_type_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+    let expected = parse_query_type_set(operand, "$type")?;
+    Ok(values.iter().any(|candidate| {
+        expected
+            .iter()
+            .any(|kind| query_type_matches(kind, candidate))
+    }))
+}
+
+fn query_type_matches(kind: &BsonTypeName, value: &Bson) -> bool {
+    if kind.matches(value) {
+        return true;
+    }
+    if *kind != BsonTypeName::Array {
+        if let Bson::Array(values) = value {
+            return values.iter().any(|value| query_type_matches(kind, value));
+        }
+    }
+    false
+}
+
+fn parse_query_type_set(value: &Bson, path: &str) -> MatchResult<Vec<BsonTypeName>> {
+    let values = match value {
+        Bson::String(_) | Bson::Int32(_) | Bson::Int64(_) => vec![value],
+        Bson::Array(values) if !values.is_empty() => values.iter().collect(),
+        Bson::Array(_) => return Err(match_error(2, format!("{path} array must not be empty"))),
+        _ => {
+            return Err(match_error(
+                2,
+                format!("{path} requires a string alias, numeric code, or non-empty array"),
+            ));
+        }
+    };
+    let mut parsed = Vec::new();
+    for value in values {
+        let kind = parse_query_type_name(value, path)?;
+        if !parsed.contains(&kind) {
+            parsed.push(kind);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_query_type_name(value: &Bson, path: &str) -> MatchResult<BsonTypeName> {
+    match value {
+        Bson::String(alias) => BsonTypeName::parse(alias)
+            .ok_or_else(|| match_error(2, format!("{path} alias {alias} is not supported"))),
+        Bson::Int32(code) => query_type_name_for_code(*code, path),
+        Bson::Int64(code) => {
+            let Ok(code) = i32::try_from(*code) else {
+                return Err(match_error(
+                    2,
+                    format!("{path} code {code} is not supported"),
+                ));
+            };
+            query_type_name_for_code(code, path)
+        }
+        _ => Err(match_error(
+            2,
+            format!("{path} values must be string aliases or numeric codes"),
+        )),
+    }
+}
+
+fn query_type_name_for_code(code: i32, path: &str) -> MatchResult<BsonTypeName> {
+    match code {
+        1 => Ok(BsonTypeName::Double),
+        2 => Ok(BsonTypeName::String),
+        3 => Ok(BsonTypeName::Object),
+        4 => Ok(BsonTypeName::Array),
+        8 => Ok(BsonTypeName::Bool),
+        9 => Ok(BsonTypeName::Date),
+        10 => Ok(BsonTypeName::Null),
+        16 => Ok(BsonTypeName::Int),
+        18 => Ok(BsonTypeName::Long),
+        _ => Err(match_error(
+            2,
+            format!("{path} code {code} is not supported"),
+        )),
+    }
+}
+
+fn matches_size_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+    let size = parse_non_negative_i32(operand, "$size")? as usize;
+    Ok(values
+        .iter()
+        .any(|candidate| matches!(candidate, Bson::Array(values) if values.len() == size)))
+}
+
+fn parse_non_negative_i32(value: &Bson, operator: &str) -> MatchResult<i32> {
+    let size = match value {
+        Bson::Int32(value) => *value,
+        Bson::Int64(value) => i32::try_from(*value)
+            .map_err(|_| match_error(2, format!("{operator} value is out of range")))?,
+        _ => {
+            return Err(match_error(
+                2,
+                format!("{operator} requires a non-negative integer"),
+            ));
+        }
+    };
+    if size < 0 {
+        return Err(match_error(
+            2,
+            format!("{operator} requires a non-negative integer"),
+        ));
+    }
+    Ok(size)
+}
+
+fn matches_all_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+    let Bson::Array(required) = operand else {
+        return Err(match_error(2, "$all requires an array"));
+    };
+    for required_value in required {
+        if is_operator_document(required_value) {
+            let Bson::Document(document) = required_value else {
+                unreachable!("operator document checked above");
+            };
+            if document.contains_key("$elemMatch") {
+                return Err(match_error(
+                    2,
+                    "$all $elemMatch clauses are not supported yet",
+                ));
+            }
+            return Err(match_error(2, "$all entries cannot be operator documents"));
+        }
+    }
+    Ok(values.iter().any(|candidate| {
+        let Bson::Array(candidate_values) = candidate else {
+            return false;
+        };
+        required.iter().all(|required_value| {
+            candidate_values
+                .iter()
+                .any(|candidate_value| bson_values_equal(candidate_value, required_value))
+        })
+    }))
 }
 
 fn matches_regex_predicate(
@@ -11687,6 +11830,132 @@ mod tests {
     }
 
     #[test]
+    fn find_matcher_supports_type_size_and_all_predicates() {
+        let conn = test_conn();
+        let object_id = ObjectId::new();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "name": "Ada",
+                        "profile": { "city": "Rome" },
+                        "tags": ["math", "logic"],
+                        "scores": [1_i32, 2_i32, 2_i64],
+                        "nothing": Bson::Null,
+                        "active": true,
+                        "oid": object_id,
+                        "age": 37_i32,
+                        "long": 37_i64,
+                        "ratio": 1.5,
+                        "created": bson::DateTime::from_millis(1_000),
+                    },
+                    {
+                        "_id": "u2",
+                        "name": "Grace",
+                        "tags": ["navy"],
+                        "scores": [3_i32],
+                        "age": 39_i64,
+                    },
+                    {
+                        "_id": "u3",
+                        "name": "Katherine",
+                        "tags": [],
+                        "scores": "none",
+                        "age": 41.0,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_ids(&conn, doc! { "name": { "$type": "string" } }),
+            vec!["u1", "u2", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile": { "$type": "object" } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": { "$type": "array" } }),
+            vec!["u1", "u2", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": { "$type": "string" } }),
+            vec!["u1", "u2"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "active": { "$type": "bool" } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "oid": { "$type": "objectId" } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "created": { "$type": 9_i32 } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "nothing": { "$type": 10_i64 } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$type": ["int", "long"] } }),
+            vec!["u1", "u2"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "age": { "$type": "number" } }),
+            vec!["u1", "u2", "u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "ratio": { "$type": 1_i32 } }),
+            vec!["u1"]
+        );
+
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": { "$size": 2_i32 } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": { "$size": 0_i64 } }),
+            vec!["u3"]
+        );
+        assert!(find_ids(&conn, doc! { "name": { "$size": 1_i32 } }).is_empty());
+
+        assert_eq!(
+            find_ids(&conn, doc! { "tags": { "$all": ["logic", "math"] } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "scores": { "$all": [2_i32, 2_i32] } }),
+            vec!["u1"]
+        );
+        assert!(find_ids(&conn, doc! { "tags": { "$all": ["math", "missing"] } }).is_empty());
+
+        for filter in [
+            doc! { "name": { "$type": "decimal" } },
+            doc! { "name": { "$type": 99_i32 } },
+            doc! { "name": { "$type": [] } },
+            doc! { "tags": { "$size": -1_i32 } },
+            doc! { "tags": { "$size": 1.5 } },
+            doc! { "tags": { "$all": "math" } },
+            doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "math" } }] } },
+        ] {
+            let response = find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": filter },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
     fn find_matcher_supports_logical_operators() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -11719,7 +11988,6 @@ mod tests {
         for filter in [
             doc! { "$where": "this.age > 1" },
             doc! { "tags": { "$elemMatch": { "$eq": "math" } } },
-            doc! { "tags": { "$all": ["math"] } },
             doc! { "age": { "$in": "Ada" } },
             doc! { "age": { "$nin": "Ada" } },
             doc! { "age": { "$exists": 1_i32 } },
