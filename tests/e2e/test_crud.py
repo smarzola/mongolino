@@ -249,6 +249,87 @@ def test_collation_find_count_distinct_update_and_delete(collection):
     assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u2", "u3", "u4"]
 
 
+def test_collation_compound_prefix_index_targets_reads_counts_updates_and_deletes(collection):
+    collation = {"locale": "en", "strength": 2}
+    collection.insert_many(
+        [
+            {"_id": "e1", "account": "Acme", "created": "2026-01-01", "state": "queued"},
+            {"_id": "e2", "account": "ACME", "created": "2026-01-02", "state": "queued"},
+            {"_id": "e3", "account": "Beta", "created": "2026-01-03", "state": "queued"},
+        ]
+    )
+    created = collection.create_index(
+        [("account", ASCENDING), ("created", ASCENDING)],
+        name="account_created_ci",
+        collation=collation,
+    )
+    assert created == "account_created_ci"
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["account_created_ci"]["collation"] == collation
+
+    assert ids(
+        collection.find(
+            {"account": "ACME"},
+            hint="account_created_ci",
+            collation=collation,
+        ).sort("_id", ASCENDING)
+    ) == ["e1", "e2"]
+    assert collection.count_documents({"account": "ACME"}, collation=collation) == 2
+    assert (
+        collection.database.command(
+            "count",
+            collection.name,
+            query={"account": "ACME"},
+            hint="account_created_ci",
+            collation=collation,
+        )["n"]
+        == 2
+    )
+
+    with pytest.raises(OperationFailure):
+        list(
+            collection.find(
+                {"account": "ACME"},
+                hint="account_created_ci",
+                collation={"locale": "simple"},
+            )
+        )
+
+    with pytest.raises(WriteError):
+        collection.update_many(
+            {"account": "ACME"},
+            {"$set": {"state": "bad-update"}},
+            hint="account_created_ci",
+            collation={"locale": "simple"},
+        )
+    assert ids(collection.find({"state": "bad-update"})) == []
+
+    updated = collection.update_many(
+        {"account": "ACME"},
+        {"$set": {"state": "matched"}},
+        hint="account_created_ci",
+        collation=collation,
+    )
+    assert updated.matched_count == 2
+    assert ids(collection.find({"state": "matched"}).sort("_id", ASCENDING)) == ["e1", "e2"]
+
+    with pytest.raises(WriteError):
+        collection.delete_one(
+            {"account": "ACME"},
+            hint="account_created_ci",
+            collation={"locale": "simple"},
+        )
+    assert collection.count_documents({"account": "ACME"}, collation=collation) == 2
+
+    deleted = collection.delete_one(
+        {"account": "ACME"},
+        hint="account_created_ci",
+        collation=collation,
+    )
+    assert deleted.deleted_count == 1
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == ["e2", "e3"]
+
+
 def test_invalid_collation_read_and_write_do_not_sweep_ttl_or_mutate(collection, mongolino_server):
     expired = ObjectId("000000000000000000000001")
     collection.insert_many(

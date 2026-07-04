@@ -277,6 +277,42 @@ def test_find_and_modify_targets_compound_prefix_filter(collection):
     assert collection.find_one({"state": "running"})["_id"] == "j2"
 
 
+def test_find_and_modify_targets_collation_compound_prefix_hint(collection):
+    collation = {"locale": "en", "strength": 2}
+    collection.insert_many(
+        [
+            {"_id": "j1", "account": "Acme", "created": "2026-01-01", "state": "queued"},
+            {"_id": "j2", "account": "ACME", "created": "2026-01-02", "state": "queued"},
+            {"_id": "j3", "account": "Beta", "created": "2026-01-03", "state": "queued"},
+        ]
+    )
+    collection.create_index(
+        [("account", ASCENDING), ("created", ASCENDING)],
+        name="account_created_ci",
+        collation=collation,
+    )
+
+    updated = collection.find_one_and_update(
+        {"account": "ACME"},
+        {"$set": {"state": "running"}},
+        hint="account_created_ci",
+        collation=collation,
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j1"
+    assert updated["state"] == "running"
+
+    with pytest.raises(OperationFailure):
+        collection.find_one_and_update(
+            {"account": "ACME"},
+            {"$set": {"state": "bad-hint"}},
+            hint="account_created_ci",
+            collation={"locale": "simple"},
+            return_document=ReturnDocument.AFTER,
+        )
+    assert collection.find_one({"state": "bad-hint"}) is None
+
+
 def test_find_and_modify_hint_errors_do_not_mutate(collection):
     seed_jobs(collection)
     collection.create_index([("state", ASCENDING), ("email", ASCENDING)], name="state_email_1")
