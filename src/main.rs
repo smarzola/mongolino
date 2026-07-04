@@ -1550,19 +1550,23 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
                 let Bson::Document(projection) = operand else {
                     return Err(command_error(9, "$project requires a document"));
                 };
-                parse_aggregate_project_stage(projection)?;
+                if let Some(projection) = parse_aggregate_project_stage(projection)? {
+                    validate_aggregate_project_static_expressions(&projection)?;
+                }
             }
             "$addFields" | "$set" => {
                 let Bson::Document(spec) = operand else {
                     return Err(command_error(9, &format!("{operator} requires a document")));
                 };
-                parse_aggregate_add_fields_stage(spec, operator)?;
+                let fields = parse_aggregate_add_fields_stage(spec, operator)?;
+                validate_aggregation_computed_fields_static(&fields)?;
             }
             "$unset" => {
                 parse_aggregate_unset_stage(operand)?;
             }
             "$replaceRoot" | "$replaceWith" => {
-                parse_aggregate_replace_root_stage(operator, operand)?;
+                let replacement = parse_aggregate_replace_root_stage(operator, operand)?;
+                validate_aggregate_replace_root_static_expression(&replacement)?;
             }
             "$lookup" => {
                 parse_aggregate_lookup_stage(operand)?;
@@ -1588,7 +1592,8 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
                 let Bson::Document(group) = operand else {
                     return Err(command_error(9, "$group requires a document"));
                 };
-                parse_group_stage(group)?;
+                let group = parse_group_stage(group)?;
+                validate_group_static_expressions(&group)?;
             }
             _ => {
                 return Err(command_error(
@@ -1599,6 +1604,57 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
         }
     }
 
+    Ok(())
+}
+
+fn validate_aggregate_project_static_expressions(
+    projection: &AggregateProjectSpec,
+) -> std::result::Result<(), Document> {
+    if let AggregateProjectSpec::Include { computed, .. } = projection {
+        validate_aggregation_computed_fields_static(computed)?;
+    }
+    Ok(())
+}
+
+fn validate_aggregation_computed_fields_static(
+    fields: &[AggregationComputedField],
+) -> std::result::Result<(), Document> {
+    for field in fields {
+        validate_static_aggregation_expression(&field.expression)?;
+    }
+    Ok(())
+}
+
+fn validate_aggregate_replace_root_static_expression(
+    replacement: &AggregateReplaceRootSpec,
+) -> std::result::Result<(), Document> {
+    validate_static_aggregation_expression(&replacement.expression)?;
+    let Some(value) = evaluate_constant_aggregation_expression(&replacement.expression)? else {
+        return Ok(());
+    };
+    if matches!(value, Bson::Document(_)) {
+        return Ok(());
+    }
+    Err(command_error(
+        9,
+        "$replaceRoot/$replaceWith expression must evaluate to a document",
+    ))
+}
+
+fn validate_group_static_expressions(group: &GroupSpec) -> std::result::Result<(), Document> {
+    validate_static_aggregation_expression(&group.id)?;
+    for accumulator in &group.accumulators {
+        validate_static_aggregation_expression(&accumulator.expression)?;
+    }
+    Ok(())
+}
+
+fn validate_static_aggregation_expression(
+    expression: &AggregationExpression,
+) -> std::result::Result<(), Document> {
+    if evaluate_constant_aggregation_expression(expression)?.is_some() {
+        return Ok(());
+    }
     Ok(())
 }
 
@@ -1999,6 +2055,7 @@ fn apply_aggregate_lookup_stage(
     collation: &Collation,
 ) -> Result<std::result::Result<Vec<Document>, Document>> {
     let foreign_namespace = namespace(db, &spec.from);
+    sweep_ttl_namespace(conn, &foreign_namespace)?;
     let foreign_documents = documents_for_namespace(conn, &foreign_namespace)?;
     let mut out = Vec::with_capacity(documents.len());
 
@@ -3060,6 +3117,18 @@ impl AggregationExpression {
             Self::Operator(operator) => operator.evaluate(context),
         }
     }
+
+    fn is_constant(&self) -> bool {
+        match self {
+            Self::FieldPath(_) | Self::Variable(_, _) => false,
+            Self::Literal(_) => true,
+            Self::Array(expressions) => expressions.iter().all(Self::is_constant),
+            Self::Document(fields) => fields
+                .iter()
+                .all(|(_, expression)| expression.is_constant()),
+            Self::Operator(operator) => operator.is_constant(),
+        }
+    }
 }
 
 impl AggregationExpressionOperator {
@@ -3212,6 +3281,48 @@ impl AggregationExpressionOperator {
             }
         }
     }
+
+    fn is_constant(&self) -> bool {
+        match self {
+            Self::Literal(_) => true,
+            Self::IfNull(expressions)
+            | Self::Concat(expressions)
+            | Self::And(expressions)
+            | Self::Or(expressions)
+            | Self::Add(expressions)
+            | Self::Multiply(expressions) => {
+                expressions.iter().all(AggregationExpression::is_constant)
+            }
+            Self::ToString(expression)
+            | Self::ToLower(expression)
+            | Self::ToUpper(expression)
+            | Self::Not(expression) => expression.is_constant(),
+            Self::Eq(left, right)
+            | Self::Ne(left, right)
+            | Self::Gt(left, right)
+            | Self::Gte(left, right)
+            | Self::Lt(left, right)
+            | Self::Lte(left, right)
+            | Self::Subtract(left, right)
+            | Self::Divide(left, right) => left.is_constant() && right.is_constant(),
+            Self::Cond {
+                condition,
+                then_expr,
+                else_expr,
+            } => condition.is_constant() && then_expr.is_constant() && else_expr.is_constant(),
+        }
+    }
+}
+
+fn evaluate_constant_aggregation_expression(
+    expression: &AggregationExpression,
+) -> std::result::Result<Option<Bson>, Document> {
+    if !expression.is_constant() {
+        return Ok(None);
+    }
+    let document = Document::new();
+    let context = AggregationExpressionContext::new(&document, &Collation::Simple);
+    expression.evaluate(&context)
 }
 
 fn aggregation_operands_equal(
@@ -14580,17 +14691,50 @@ mod tests {
             assert_invalid_ttl_read_preserves_expired(&conn, "bad_aggregate_shape", response);
         }
 
-        let runtime_error = aggregate_command(
+        for pipeline in [
+            vec![Bson::Document(
+                doc! { "$addFields": { "ratio": { "$divide": [10_i32, 0_i32] } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$addFields": { "total": { "$add": [1_i32, "bad"] } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$set": { "total": { "$multiply": [2_i32, "bad"] } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$project": { "lower": { "$toLower": 1_i32 } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$project": { "label": { "$concat": ["ok", 1_i32] } } },
+            )],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "bad_aggregate_shape",
+                    "$db": "app",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_invalid_ttl_read_preserves_expired(&conn, "bad_aggregate_shape", response);
+        }
+
+        let data_dependent = aggregate_command(
             &conn,
             &doc! {
                 "aggregate": "bad_aggregate_shape",
                 "$db": "app",
-                "pipeline": [{ "$addFields": { "ratio": { "$divide": [10_i32, 0_i32] } } }],
+                "pipeline": [
+                    { "$match": { "_id": "future" } },
+                    { "$addFields": { "ratio": { "$divide": ["$category", 2_i32] } } },
+                ],
                 "cursor": {},
             },
         )
         .unwrap();
-        assert_command_error(&runtime_error);
+        assert_command_error(&data_dependent);
     }
 
     #[test]
@@ -14724,6 +14868,10 @@ mod tests {
                 doc! { "$replaceRoot": { "newRoot": "$profile", "extra": true } },
             )],
             vec![Bson::Document(doc! { "$replaceWith": { "$dateDiff": {} } })],
+            vec![Bson::Document(
+                doc! { "$replaceRoot": { "newRoot": 1_i32 } },
+            )],
+            vec![Bson::Document(doc! { "$replaceWith": "literal" })],
         ] {
             let response = aggregate_command(
                 &conn,
@@ -14918,6 +15066,112 @@ mod tests {
             vec![
                 doc! { "_id": "o1", "self": [{ "_id": "o1", "profileId": "p1", "profileIds": ["p2", "missing"], "owner": "ADA" }] }
             ]
+        );
+    }
+
+    #[test]
+    fn aggregate_lookup_sweeps_foreign_ttl_and_malformed_lookup_sweeps_none() {
+        let conn = test_conn();
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        let future =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() + 86_400_000);
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_orders",
+                "$db": "app",
+                "documents": [
+                    { "_id": "o1", "profileId": "live" },
+                    { "_id": "o2", "profileId": "expired" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "lookup_profiles",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_profiles",
+                "$db": "app",
+                "documents": [
+                    { "_id": "live", "expiresAt": future, "name": "Live" },
+                    { "_id": "expired", "expiresAt": past, "name": "Expired" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let joined = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "lookup_orders",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "lookup_profiles",
+                            "localField": "profileId",
+                            "foreignField": "_id",
+                            "as": "profile",
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32, "profile": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&joined),
+            vec![
+                doc! { "_id": "o1", "profile": [{ "_id": "live", "expiresAt": future, "name": "Live" }] },
+                doc! { "_id": "o2", "profile": [] },
+            ]
+        );
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.lookup_profiles"),
+            vec!["live"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_lookup_source");
+        seed_ttl_command_fixture(&conn, "bad_lookup_foreign");
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_lookup_source",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "bad_lookup_foreign",
+                            "localField": "category",
+                            "foreignField": "category",
+                            "as": "matches",
+                            "pipeline": [],
+                        }
+                    },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_lookup_source", response);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_lookup_foreign"),
+            vec!["expired", "future"]
         );
     }
 

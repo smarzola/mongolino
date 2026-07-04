@@ -1,4 +1,8 @@
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from bson import BSON
 from bson.int64 import Int64
 from pymongo.errors import OperationFailure
 
@@ -14,6 +18,15 @@ def seed_scores(collection):
             {"_id": "s3", "team": "red", "score": 11, "active": True, "meta": {"rank": 1}},
         ]
     )
+
+
+def stored_ids(db_path, namespace):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT bson FROM documents WHERE namespace = ? ORDER BY created_at",
+            (namespace,),
+        ).fetchall()
+    return [BSON(row[0]).decode()["_id"] for row in rows]
 
 
 def test_aggregate_match_sort_project(collection):
@@ -335,6 +348,50 @@ def test_aggregate_lookup_simple_equality_arrays_null_collation_self_and_cursor(
                 }
             ],
         }
+    ]
+
+
+def test_aggregate_lookup_sweeps_foreign_ttl_before_join(collection, mongolino_server):
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(days=1)
+    future = now + timedelta(days=1)
+    profiles = collection.database[f"{collection.name}_profiles"]
+
+    collection.insert_many(
+        [
+            {"_id": "o1", "profileId": "live"},
+            {"_id": "o2", "profileId": "expired"},
+        ]
+    )
+    profiles.create_index("expiresAt", name="expires_ttl", expireAfterSeconds=60)
+    profiles.insert_many(
+        [
+            {"_id": "live", "expiresAt": future, "name": "Live"},
+            {"_id": "expired", "expiresAt": past, "name": "Expired"},
+        ]
+    )
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "profileId",
+                        "foreignField": "_id",
+                        "as": "profile",
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"_id": 1, "profile": 1}},
+            ]
+        )
+    ) == [
+        {"_id": "o1", "profile": [{"_id": "live", "expiresAt": future, "name": "Live"}]},
+        {"_id": "o2", "profile": []},
+    ]
+    assert stored_ids(mongolino_server.db_path, f"{profiles.database.name}.{profiles.name}") == [
+        "live"
     ]
 
 
@@ -953,6 +1010,38 @@ def test_aggregate_shaping_rejects_malformed_paths_and_runtime_errors(collection
         with pytest.raises(OperationFailure) as excinfo:
             list(collection.aggregate(pipeline))
         assert contains in str(excinfo.value)
+
+
+def test_aggregate_static_expression_errors_do_not_sweep_ttl(collection, mongolino_server):
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(days=1)
+    future = now + timedelta(days=1)
+    collection.create_index("expiresAt", name="expires_ttl", expireAfterSeconds=60)
+    collection.insert_many(
+        [
+            {"_id": "expired", "expiresAt": past, "category": "old"},
+            {"_id": "future", "expiresAt": future, "category": "new"},
+        ]
+    )
+
+    for pipeline, contains in [
+        ([{"$addFields": {"ratio": {"$divide": [10, 0]}}}], "divide"),
+        ([{"$addFields": {"total": {"$add": [1, "bad"]}}}], "$add"),
+        ([{"$set": {"total": {"$multiply": [2, "bad"]}}}], "$multiply"),
+        ([{"$project": {"lower": {"$toLower": 1}}}], "$toLower"),
+        ([{"$project": {"label": {"$concat": ["ok", 1]}}}], "$concat"),
+        ([{"$replaceRoot": {"newRoot": 1}}], "document"),
+        ([{"$replaceWith": "literal"}], "document"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
+        assert stored_ids(
+            mongolino_server.db_path,
+            f"{collection.database.name}.{collection.name}",
+        ) == ["expired", "future"]
+
+    assert list(collection.find({}, {"_id": 1}).sort("_id", 1)) == [{"_id": "future"}]
 
 
 def test_aggregate_unwind_rejects_malformed_options(collection):

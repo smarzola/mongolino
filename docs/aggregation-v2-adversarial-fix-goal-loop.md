@@ -126,8 +126,8 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Fix `$lookup` foreign TTL visibility
-- [ ] Milestone 1: Preflight constant expression runtime errors
+- [x] Milestone 0: Fix `$lookup` foreign TTL visibility
+- [x] Milestone 1: Preflight constant expression runtime errors
 - [ ] Milestone 2: PyMongo e2e and final verification
 
 ## Milestone 0: Fix `$lookup` Foreign TTL Visibility
@@ -174,6 +174,20 @@ cargo test ttl
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status 2026-07-05:
+
+- Implemented a `$lookup` foreign namespace TTL sweep before loading foreign
+  documents, after aggregate command and pipeline shape/collation preflight.
+- Added Rust coverage proving valid `$lookup` hides/deletes expired foreign
+  documents while malformed `$lookup` leaves both source and foreign TTL
+  namespaces unswept.
+- Verification passed:
+  - `cargo fmt -- --check`
+  - `cargo test lookup`
+  - `cargo test aggregate`
+  - `cargo test ttl`
+- Commit: pending in the combined Milestone 0/1 code commit.
 
 ## Milestone 1: Preflight Constant Expression Runtime Errors
 
@@ -225,6 +239,22 @@ cargo test ttl
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status 2026-07-05:
+
+- Added conservative static expression validation during aggregate pipeline
+  preflight: only expressions proven constant, with no field paths or
+  `$$ROOT`/`$$CURRENT`, are evaluated before TTL sweep.
+- Covered constant `$divide` by zero, numeric nonnumeric operands, string
+  nonstring operands, and constant non-document `$replaceRoot`/`$replaceWith`.
+- Preserved data-dependent runtime behavior for field-dependent expressions.
+- Verification passed:
+  - `cargo fmt -- --check`
+  - `cargo test aggregation_expression`
+  - `cargo test aggregate_shaping`
+  - `cargo test aggregate`
+  - `cargo test ttl`
+- Commit: pending in the combined Milestone 0/1 code commit.
 
 ## Milestone 2: PyMongo E2E And Final Verification
 
