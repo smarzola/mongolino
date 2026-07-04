@@ -176,7 +176,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: TTL metadata model and migration-safe persistence
+- [x] Milestone 0: TTL metadata model and migration-safe persistence
 - [ ] Milestone 1: `createIndexes` TTL validation and listing
 - [ ] Milestone 2: Deterministic TTL sweeper core
 - [ ] Milestone 3: Wire-visible read/write sweep integration
@@ -205,6 +205,12 @@ Acceptance criteria:
 - Existing persisted indexes without TTL metadata still deserialize as
   non-TTL.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed TTL metadata model and migration-safe persistence.
+  Verification passed: `cargo fmt -- --check`; `cargo test index`;
+  `cargo test create_indexes`. Commit: pending.
 
 Likely files:
 

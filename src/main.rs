@@ -218,6 +218,15 @@ fn ensure_index_metadata_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !columns
+        .iter()
+        .any(|column| column == "expire_after_seconds")
+    {
+        conn.execute(
+            "ALTER TABLE indexes ADD COLUMN expire_after_seconds INTEGER",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -3059,6 +3068,7 @@ struct IndexSpec {
     unique: bool,
     sparse: bool,
     partial_filter: Option<Document>,
+    expire_after_seconds: Option<i64>,
 }
 
 fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
@@ -3107,6 +3117,7 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
                 && existing.unique == spec.unique
                 && existing.sparse == spec.sparse
                 && existing.partial_filter == spec.partial_filter
+                && existing.expire_after_seconds == spec.expire_after_seconds
             {
                 continue;
             }
@@ -3319,6 +3330,7 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
         unique,
         sparse,
         partial_filter,
+        expire_after_seconds: None,
     })
 }
 
@@ -3455,7 +3467,7 @@ fn insert_index_tx(
     spec: &IndexSpec,
 ) -> std::result::Result<(), rusqlite::Error> {
     tx.execute(
-        "INSERT INTO indexes(namespace, name, key_bson, unique_index, sparse_index, partial_filter_bson) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO indexes(namespace, name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             namespace,
             spec.name,
@@ -3466,6 +3478,7 @@ fn insert_index_tx(
                 .as_ref()
                 .map(encode_document)
                 .transpose()?,
+            spec.expire_after_seconds,
         ],
     )?;
     Ok(())
@@ -3477,7 +3490,7 @@ fn index_by_name_tx(
     name: &str,
 ) -> Result<Option<IndexSpec>> {
     tx.query_row(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 AND name = ?2",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 AND name = ?2",
         params![namespace, name],
         |row| {
             let name = row.get::<_, String>(0)?;
@@ -3488,12 +3501,14 @@ fn index_by_name_tx(
                 .get::<_, Option<Vec<u8>>>(4)?
                 .map(decode_document_sql)
                 .transpose()?;
+            let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
             Ok(IndexSpec {
                 name,
                 key,
                 unique,
                 sparse,
                 partial_filter,
+                expire_after_seconds,
             })
         },
     )
@@ -3503,7 +3518,7 @@ fn index_by_name_tx(
 
 fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<IndexSpec>> {
     let mut stmt = conn.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -3514,12 +3529,14 @@ fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<Index
             .get::<_, Option<Vec<u8>>>(4)?
             .map(decode_document_sql)
             .transpose()?;
+        let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
         Ok(IndexSpec {
             name,
             key,
             unique,
             sparse,
             partial_filter,
+            expire_after_seconds,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -3539,7 +3556,7 @@ fn unique_indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -3550,12 +3567,14 @@ fn unique_indexes_for_namespace_tx(
             .get::<_, Option<Vec<u8>>>(4)?
             .map(decode_document_sql)
             .transpose()?;
+        let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
         Ok(IndexSpec {
             name,
             key,
             unique,
             sparse,
             partial_filter,
+            expire_after_seconds,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -4353,7 +4372,7 @@ fn indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson, expire_after_seconds FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
@@ -4364,12 +4383,14 @@ fn indexes_for_namespace_tx(
             .get::<_, Option<Vec<u8>>>(4)?
             .map(decode_document_sql)
             .transpose()?;
+        let expire_after_seconds = row.get::<_, Option<i64>>(5)?;
         Ok(IndexSpec {
             name,
             key,
             unique,
             sparse,
             partial_filter,
+            expire_after_seconds,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
@@ -9889,6 +9910,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
         let document = doc! {
             "_id": "u1",
@@ -9907,6 +9929,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
         assert_eq!(
             planner_key_for_document(&reversed, &document),
@@ -9932,6 +9955,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
 
         assert_eq!(
@@ -9972,6 +9996,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
         let compound = IndexSpec {
             name: "city_active_created_1".to_string(),
@@ -9979,6 +10004,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
         let created = IndexSpec {
             name: "created_1".to_string(),
@@ -9986,6 +10012,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
 
         assert!(matches!(
@@ -10045,6 +10072,7 @@ mod tests {
             unique: false,
             sparse: true,
             partial_filter: None,
+            expire_after_seconds: None,
         };
         let partial = IndexSpec {
             name: "email_active_partial".to_string(),
@@ -10052,6 +10080,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: Some(doc! { "active": true }),
+            expire_after_seconds: None,
         };
         let tags = IndexSpec {
             name: "tags_1".to_string(),
@@ -10059,6 +10088,7 @@ mod tests {
             unique: false,
             sparse: false,
             partial_filter: None,
+            expire_after_seconds: None,
         };
 
         assert!(matches!(
