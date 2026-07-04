@@ -9734,6 +9734,158 @@ mod tests {
     }
 
     #[test]
+    fn collation_read_commands_match_sort_count_distinct_and_aggregate() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada", "city": "ROME" },
+                    { "_id": "u2", "name": "ada", "city": "rome" },
+                    { "_id": "u3", "name": "Grace", "city": "London" },
+                ],
+            },
+        )
+        .unwrap();
+        let collation = doc! { "locale": "en", "strength": 2_i32 };
+
+        let found = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "ADA" },
+                "sort": { "name": 1_i32 },
+                "projection": { "_id": 1_i32 },
+                "collation": collation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&found)
+                .iter()
+                .map(|document| document.get_str("_id").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u2"]
+        );
+
+        let simple = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "ada" },
+                "sort": { "_id": 1_i32 },
+                "projection": { "_id": 1_i32 },
+                "collation": { "locale": "simple" },
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&simple), vec![doc! { "_id": "u2" }]);
+
+        let count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "users",
+                "$db": "app",
+                "query": { "city": "rome" },
+                "collation": collation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get_i64("n").unwrap(), 2);
+
+        let distinct = distinct_command(
+            &conn,
+            &doc! {
+                "distinct": "users",
+                "$db": "app",
+                "key": "name",
+                "collation": collation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            distinct.get_array("values").unwrap(),
+            &vec![
+                Bson::String("Ada".to_string()),
+                Bson::String("Grace".to_string()),
+            ]
+        );
+
+        let aggregate = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "city": "rome" } },
+                    { "$sort": { "name": 1_i32 } },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+                "collation": collation,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&aggregate)
+                .iter()
+                .map(|document| document.get_str("_id").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u2"]
+        );
+    }
+
+    #[test]
+    fn invalid_read_collation_returns_error_before_ttl_sweep() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "expiresAt": bson::DateTime::from_millis(1_700_000_000_000_i64), "name": "Ada" },
+                    { "_id": "live", "expiresAt": bson::DateTime::now(), "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 0_i32 }],
+            },
+        )
+        .unwrap();
+
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "name": "ada" },
+                "collation": { "locale": "en" },
+            },
+        )
+        .unwrap();
+        assert_command_error(&response);
+        assert_eq!(response.get_i32("code").unwrap(), 72);
+
+        let raw_documents = documents_for_namespace(&conn, "app.events").unwrap();
+        assert!(
+            raw_documents
+                .iter()
+                .any(|document| document.get_str("_id").unwrap() == "expired")
+        );
+    }
+
+    #[test]
     fn generated_ids_are_persistable_keys() {
         let mut document = doc! { "name": "Ada" };
         ensure_document_id(&mut document);

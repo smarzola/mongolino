@@ -191,7 +191,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Collation parser and comparison model
-- [ ] Milestone 1: Collation-aware read matching, sorting, and distinct
+- [x] Milestone 1: Collation-aware read matching, sorting, and distinct
 - [ ] Milestone 2: Collation-aware write target selection and no-mutation errors
 - [ ] Milestone 3: Index metadata, unique enforcement, and safe planning
 - [ ] Milestone 4: PyMongo/spec-corpus adversarial coverage
@@ -240,7 +240,7 @@ Status 2026-07-04: Complete. Added the internal collation parser/model,
 case-insensitive equality/order helpers, matcher/sort threading, and
 collation-aware index key metadata scaffolding. Verified with
 `cargo fmt -- --check`, `cargo test collation`, `cargo test matcher`, and
-`cargo test sort`. Commit: pending.
+`cargo test sort`. Commit: `8e49905`.
 
 ## Milestone 1: Collation-Aware Read Matching, Sorting, And Distinct
 
@@ -287,6 +287,13 @@ cargo test count
 cargo test aggregate
 cargo test distinct
 ```
+
+Status 2026-07-04: Complete. `find`, `count`, `distinct`, and `aggregate`
+accept the supported collation subset, use it for matching/sorting/distinct
+deduplication, preserve `{locale: "simple"}` binary behavior, and reject
+invalid collation before TTL sweeps. Verified with `cargo fmt -- --check`,
+`cargo test collation`, `cargo test find`, `cargo test count`,
+`cargo test aggregate`, and `cargo test distinct`. Commit: pending.
 
 ## Milestone 2: Collation-Aware Write Target Selection And No-Mutation Errors
 
