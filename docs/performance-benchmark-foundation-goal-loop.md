@@ -101,7 +101,7 @@ When a milestone is complete:
 - [x] Milestone 0: Benchmark harness design and workload seeding
 - [x] Milestone 1: Benchmark command and machine-readable output
 - [x] Milestone 2: CI-friendly performance budget smoke
-- [ ] Milestone 3: Baseline results and SQLite pushdown roadmap
+- [x] Milestone 3: Baseline results and SQLite pushdown roadmap
 - [ ] Milestone 4: Final correctness verification and docs
 
 ## Milestone 0: Benchmark Harness Design And Workload Seeding
@@ -219,7 +219,7 @@ Status note:
   `cargo build`, and documented that thresholds are intentionally coarse enough
   for CI variance while still catching severe regressions. Verification run:
   `cargo fmt -- --check`; `cargo run --bin mongolino-bench -- --profile ci
-  --check-budget`; `cargo test`. Commit hash: pending.
+  --check-budget`; `cargo test`. Commit hash: `ab487d3`.
 
 Problem:
 
@@ -258,6 +258,18 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 3: Baseline Results And SQLite Pushdown Roadmap
+
+Status note:
+
+- 2026-07-04: Added `docs/performance-baseline.md` with smoke and local
+  benchmark results from commit `ab487d3`, macOS/Darwin machine notes,
+  interpretation of full namespace decode workloads, and prioritized SQLite
+  pushdown candidates for count, indexed/equality find, aggregation
+  `$match`/`$count`, and future `$unwind`/`$group` exploration. Verification
+  run: `cargo run --bin mongolino-bench -- --profile smoke --json
+  /tmp/mongolino-bench-smoke.json`; `cargo run --bin mongolino-bench --
+  --profile local --json /tmp/mongolino-bench-local.json`; `cargo fmt --
+  --check`. Commit hash: pending.
 
 Problem:
 

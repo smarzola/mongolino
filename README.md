@@ -176,6 +176,9 @@ index-entry refresh, and aggregation paths. Budget thresholds are intentionally
 coarse: they are meant to catch severe regressions in CI, not to decide small
 performance wins.
 
+Current baseline results and SQLite pushdown targets are recorded in
+`docs/performance-baseline.md`.
+
 Run the PyMongo end-to-end suite with `uv`:
 
 ```sh
