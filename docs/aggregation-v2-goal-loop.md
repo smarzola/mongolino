@@ -174,7 +174,7 @@ When a milestone is complete:
 - [x] Milestone 2: `$replaceRoot`, `$replaceWith`, and group operand expansion
 - [x] Milestone 3: Simple equality `$lookup`
 - [x] Milestone 4: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
-- [ ] Milestone 5: Final verification and handoff
+- [x] Milestone 5: Final verification and handoff
 
 ## Milestone 0: Expression Evaluator v2
 
@@ -624,6 +624,54 @@ Likely files:
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note (2026-07-05):
+
+- Exact commands run:
+  - `cargo fmt -- --check` - passed.
+  - `cargo test` - passed; Rust test counts were 179 unit/integration tests in
+    `src/main.rs` target coverage and 181 tests in the benchmark target build.
+  - `cargo build` - passed with existing `dead_code` warnings for planner
+    diagnostics helpers.
+  - `cargo run --bin mongolino-bench -- --profile ci --check-budget` - passed
+    the CI performance budget.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` - passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` -
+    passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+    - sandboxed run failed before server startup because the sandbox could not
+    bind `127.0.0.1` (`PermissionError: [Errno 1] Operation not permitted`).
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+    - rerun unsandboxed and passed: 204 PyMongo e2e tests passed in 106.12s.
+- Benchmark summary:
+  - `aggregation_expression_add_fields`: 254.23 ms total, 8.474 ms mean
+    latency.
+  - `aggregation_lookup_single_document`: 469.66 ms total, 15.655 ms mean
+    latency.
+  - Full CI profile budget passed with aggregation, indexed find/count, update,
+    collation, and cursor rows.
+- Milestone commits:
+  - Milestone 0: `2e68da5` Add aggregation expression evaluator v2.
+  - Milestone 1: `1046999` Add computed aggregation shaping stages.
+  - Milestone 2: `789fb7a` Add aggregation root replacement and computed group
+    operands.
+  - Milestone 3: `1598417` Add simple aggregation lookup.
+  - Milestone 4: `8b5ca9a` Document and benchmark aggregation v2.
+  - Milestone 5: final status note commit created after this note.
+- Residual unsupported aggregation behavior:
+  - `$lookup` remains limited to same-database equality joins using `from`,
+    `localField`, `foreignField`, and `as`; `pipeline`, `let`, and cross-db
+    forms return explicit command errors.
+  - Advanced stages such as `$facet`, `$bucket`, `$sortByCount`, `$graphLookup`,
+    `$out`, `$merge`, `$geoNear`, `$redact`, window stages, and JavaScript
+    execution are still unsupported.
+  - Command options such as aggregation `allowDiskUse`, `hint`, `explain`,
+    `maxTimeMS`, command-level `let`, read concern, and write concern are still
+    explicit unsupported behavior.
+  - Expression support is intentionally bounded and does not claim full MongoDB
+    numeric promotion, conversion, or ICU/collation parity.
+  - Aggregation execution remains in Rust over materialized documents; lookup
+    and computed expressions are not pushed down into SQLite query plans.
 
 ## Final Response Requirements
 
