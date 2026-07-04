@@ -9886,6 +9886,217 @@ mod tests {
     }
 
     #[test]
+    fn collation_write_commands_target_case_insensitive_matches() {
+        let conn = test_conn();
+        let collation = doc! { "locale": "en", "strength": 2_i32 };
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada", "city": "ROME" },
+                    { "_id": "u2", "name": "ada", "city": "rome" },
+                    { "_id": "u3", "name": "Grace", "city": "London" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let update_one = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "name": "ADA" },
+                        "u": { "$set": { "one": true } },
+                        "multi": false,
+                        "collation": collation.clone(),
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(update_one.get_i32("n").unwrap(), 1);
+        assert_eq!(update_one.get_i32("nModified").unwrap(), 1);
+
+        let update_many = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "city": "rome" },
+                        "u": { "$set": { "many": true } },
+                        "multi": true,
+                        "collation": collation.clone(),
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(update_many.get_i32("n").unwrap(), 2);
+        assert_eq!(update_many.get_i32("nModified").unwrap(), 2);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! {
+                        "find": "users",
+                        "$db": "app",
+                        "filter": { "many": true },
+                        "sort": { "_id": 1_i32 },
+                        "projection": { "_id": 1_i32, "one": 1_i32 },
+                    },
+                )
+                .unwrap()
+            ),
+            vec![doc! { "_id": "u1", "one": true }, doc! { "_id": "u2" }]
+        );
+
+        let delete_one = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "name": "ADA" }, "limit": 1_i32, "collation": collation.clone() }],
+            },
+        )
+        .unwrap();
+        assert_eq!(delete_one.get_i32("n").unwrap(), 1);
+
+        let delete_many = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "city": "ROME" }, "limit": 0_i32, "collation": collation.clone() }],
+            },
+        )
+        .unwrap();
+        assert_eq!(delete_many.get_i32("n").unwrap(), 1);
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "modify",
+                "$db": "app",
+                "documents": [
+                    { "_id": "b", "name": "Ada" },
+                    { "_id": "a", "name": "ada" },
+                    { "_id": "c", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+        let modified = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "modify",
+                "$db": "app",
+                "query": { "name": "ADA" },
+                "sort": { "name": 1_i32 },
+                "update": { "$set": { "winner": true } },
+                "new": true,
+                "collation": collation,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            modified
+                .get_document("value")
+                .unwrap()
+                .get_str("_id")
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            modified
+                .get_document("value")
+                .unwrap()
+                .get_bool("winner")
+                .unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn invalid_write_collation_does_not_mutate_or_sweep_ttl() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "expiresAt": bson::DateTime::from_millis(1_700_000_000_000_i64), "name": "Ada" },
+                    { "_id": "live", "expiresAt": bson::DateTime::now(), "name": "Ada" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 0_i32 }],
+            },
+        )
+        .unwrap();
+
+        let update = update_documents(
+            &conn,
+            &doc! {
+                "update": "events",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "name": "ada" },
+                        "u": { "$set": { "mutated": true } },
+                        "multi": true,
+                        "collation": { "locale": "en" },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        let errors = write_errors(&update);
+        assert_eq!(errors[0].get_i32("code").unwrap(), 2);
+
+        let raw_documents = documents_for_namespace(&conn, "app.events").unwrap();
+        assert_eq!(raw_documents.len(), 2);
+        assert!(
+            raw_documents
+                .iter()
+                .all(|document| !document.contains_key("mutated"))
+        );
+
+        let find_and_modify_error = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "events",
+                "$db": "app",
+                "query": { "name": "ada" },
+                "update": { "$set": { "mutated": true } },
+                "collation": { "locale": "en" },
+            },
+        )
+        .unwrap();
+        assert_command_error(&find_and_modify_error);
+        assert_eq!(find_and_modify_error.get_i32("code").unwrap(), 72);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.events").unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
     fn generated_ids_are_persistable_keys() {
         let mut document = doc! { "name": "Ada" };
         ensure_document_id(&mut document);

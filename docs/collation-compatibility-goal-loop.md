@@ -192,7 +192,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Collation parser and comparison model
 - [x] Milestone 1: Collation-aware read matching, sorting, and distinct
-- [ ] Milestone 2: Collation-aware write target selection and no-mutation errors
+- [x] Milestone 2: Collation-aware write target selection and no-mutation errors
 - [ ] Milestone 3: Index metadata, unique enforcement, and safe planning
 - [ ] Milestone 4: PyMongo/spec-corpus adversarial coverage
 - [ ] Milestone 5: Benchmarks, docs, scorecard, final verification
@@ -293,7 +293,7 @@ accept the supported collation subset, use it for matching/sorting/distinct
 deduplication, preserve `{locale: "simple"}` binary behavior, and reject
 invalid collation before TTL sweeps. Verified with `cargo fmt -- --check`,
 `cargo test collation`, `cargo test find`, `cargo test count`,
-`cargo test aggregate`, and `cargo test distinct`. Commit: pending.
+`cargo test aggregate`, and `cargo test distinct`. Commit: `19108aa`.
 
 ## Milestone 2: Collation-Aware Write Target Selection And No-Mutation Errors
 
@@ -336,6 +336,13 @@ cargo test delete
 cargo test find_and_modify
 cargo test ttl
 ```
+
+Status 2026-07-04: Complete. Update/delete entry collation and findAndModify
+command collation now drive write target matching and findAndModify sort
+selection, while invalid collation documents return errors before TTL sweeps or
+mutations. Verified with `cargo fmt -- --check`, `cargo test collation`,
+`cargo test update`, `cargo test delete`, `cargo test find_and_modify`, and
+`cargo test ttl`. Commit: pending.
 
 ## Milestone 3: Index Metadata, Unique Enforcement, And Safe Planning
 
