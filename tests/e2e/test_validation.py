@@ -116,6 +116,46 @@ def test_coll_mod_updates_and_clears_validator(mongo_client):
     assert "validationAction" not in options
 
 
+def test_coll_mod_combines_validator_and_ttl_index_update(mongo_client):
+    db = mongo_client["validation_metadata_collmod_ttl"]
+    db.create_collection("events")
+    collection = db.events
+    collection.create_index("expiresAt", name="expires_ttl", expireAfterSeconds=60)
+
+    response = db.command(
+        {
+            "collMod": "events",
+            "validator": {
+                "$jsonSchema": {
+                    "bsonType": "object",
+                    "required": ["expiresAt"],
+                    "properties": {"expiresAt": {"bsonType": "date"}},
+                }
+            },
+            "index": {"name": "expires_ttl", "expireAfterSeconds": 30},
+        }
+    )
+    assert response["ok"] == 1.0
+    assert response["expireAfterSeconds_old"] == 60
+    assert response["expireAfterSeconds_new"] == 30
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["expires_ttl"]["expireAfterSeconds"] == 30
+    assert "validator" in listed_options(db, "events")
+
+    with pytest.raises(OperationFailure):
+        db.command(
+            {
+                "collMod": "events",
+                "validator": user_validator(),
+                "index": {"name": "expires_ttl", "expireAfterSeconds": "bad"},
+            }
+        )
+
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["expires_ttl"]["expireAfterSeconds"] == 30
+    assert listed_options(db, "events")["validator"] != user_validator()
+
+
 def test_coll_mod_rejects_missing_collection_and_bad_shapes(mongo_client):
     db = mongo_client["validation_metadata_collmod_errors"]
     db.create_collection("users")

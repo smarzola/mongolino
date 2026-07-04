@@ -169,6 +169,46 @@ def test_ttl_index_metadata_roundtrip_and_invalid_specs(collection, mongolino_se
         assert index_entry_count(mongolino_server.db_path, namespace, spec["name"]) == 0
 
 
+def test_coll_mod_updates_ttl_index_by_name(collection):
+    collection.create_index(
+        [("expiresAt", ASCENDING)],
+        name="expires_ttl",
+        expireAfterSeconds=60,
+    )
+
+    response = collection.database.command(
+        {
+            "collMod": collection.name,
+            "index": {"name": "expires_ttl", "expireAfterSeconds": 120},
+        }
+    )
+    assert response["ok"] == 1.0
+    assert response["expireAfterSeconds_old"] == 60
+    assert response["expireAfterSeconds_new"] == 120
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["expires_ttl"]["expireAfterSeconds"] == 120
+
+    collection.create_index([("name", ASCENDING)], name="name_1")
+    invalid_updates = [
+        {"name": "expires_ttl"},
+        {"name": "expires_ttl", "expireAfterSeconds": -1},
+        {"name": "expires_ttl", "expireAfterSeconds": "30"},
+        {"name": "missing", "expireAfterSeconds": 30},
+        {"name": "name_1", "expireAfterSeconds": 30},
+        {"name": "_id_", "expireAfterSeconds": 30},
+        {"keyPattern": {"expiresAt": ASCENDING}, "expireAfterSeconds": 30},
+        {"name": "expires_ttl", "expireAfterSeconds": 30, "hidden": True},
+    ]
+    for index_update in invalid_updates:
+        with pytest.raises(OperationFailure):
+            collection.database.command(
+                {"collMod": collection.name, "index": index_update}
+            )
+
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["expires_ttl"]["expireAfterSeconds"] == 120
+
+
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
     collection.create_index([("email", ASCENDING)], name="email_1")
     assert collection.create_index([("email", ASCENDING)], name="email_1") == "email_1"

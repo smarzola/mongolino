@@ -647,6 +647,7 @@ fn create_collection(conn: &Connection, command: &Document) -> Result<Document> 
             "validator",
             "validationLevel",
             "validationAction",
+            "index",
             "$db",
             "lsid",
         ],
@@ -778,6 +779,7 @@ fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
             "validator",
             "validationLevel",
             "validationAction",
+            "index",
             "$db",
             "lsid",
         ],
@@ -787,10 +789,11 @@ fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
     if !command.contains_key("validator")
         && !command.contains_key("validationLevel")
         && !command.contains_key("validationAction")
+        && !command.contains_key("index")
     {
         return Ok(command_error(
             9,
-            "collMod requires validator, validationLevel, or validationAction",
+            "collMod requires validator, validationLevel, validationAction, or index",
         ));
     }
 
@@ -822,9 +825,93 @@ fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
     if let Err(errmsg) = parse_collection_options(options.clone()) {
         return Ok(command_error(72, &errmsg));
     }
+    let ttl_update = match command.get("index") {
+        Some(value) => match parse_coll_mod_ttl_index_update(&tx, &ns, value) {
+            Ok(update) => Some(update),
+            Err(response) => return Ok(response),
+        },
+        None => None,
+    };
     set_collection_options_tx(&tx, &ns, &options)?;
+    let ttl_response = if let Some(update) = ttl_update {
+        update_index_expire_after_seconds_tx(&tx, &ns, &update.name, update.new_expire_after)?;
+        Some(doc! {
+            "expireAfterSeconds_old": update.old_expire_after,
+            "expireAfterSeconds_new": update.new_expire_after,
+        })
+    } else {
+        None
+    };
     tx.commit()?;
-    Ok(doc! { "ok": 1.0 })
+    let mut response = doc! { "ok": 1.0 };
+    if let Some(ttl_response) = ttl_response {
+        response.extend(ttl_response);
+    }
+    Ok(response)
+}
+
+struct CollModTtlIndexUpdate {
+    name: String,
+    old_expire_after: i64,
+    new_expire_after: i64,
+}
+
+fn parse_coll_mod_ttl_index_update(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    value: &Bson,
+) -> std::result::Result<CollModTtlIndexUpdate, Document> {
+    let Bson::Document(index) = value else {
+        return Err(command_error(72, "collMod index must be a document"));
+    };
+    if let Some(key) = index
+        .keys()
+        .find(|key| !matches!(key.as_str(), "name" | "expireAfterSeconds"))
+    {
+        return Err(command_error(
+            72,
+            &format!("collMod index option {key} is not supported"),
+        ));
+    }
+    let name = match index.get_str("name") {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        Ok(_) => return Err(command_error(9, "collMod index name must not be empty")),
+        Err(_) => return Err(command_error(9, "collMod index requires name")),
+    };
+    if name == "_id_" {
+        return Err(command_error(72, "collMod cannot update _id_ index TTL"));
+    }
+    let new_expire_after = match index.get("expireAfterSeconds") {
+        Some(value) => parse_expire_after_seconds(value)?,
+        None => {
+            return Err(command_error(
+                9,
+                "collMod index requires expireAfterSeconds",
+            ));
+        }
+    };
+    let existing = match index_by_name_tx(tx, namespace, &name) {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return Err(command_error(27, "index not found")),
+        Err(err) => return Err(command_error(2, &err.to_string())),
+    };
+    let Some(old_expire_after) = existing.expire_after_seconds else {
+        return Err(command_error(
+            72,
+            "collMod TTL updates require an existing TTL index",
+        ));
+    };
+    validate_ttl_index_spec(
+        &existing.key,
+        &existing.name,
+        existing.sparse,
+        existing.partial_filter.as_ref(),
+    )?;
+    Ok(CollModTtlIndexUpdate {
+        name,
+        old_expire_after,
+        new_expire_after,
+    })
 }
 
 fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
@@ -3552,6 +3639,19 @@ fn insert_index_tx(
                 .transpose()?,
             spec.expire_after_seconds,
         ],
+    )?;
+    Ok(())
+}
+
+fn update_index_expire_after_seconds_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    name: &str,
+    expire_after_seconds: i64,
+) -> std::result::Result<(), rusqlite::Error> {
+    tx.execute(
+        "UPDATE indexes SET expire_after_seconds = ?1 WHERE namespace = ?2 AND name = ?3",
+        params![expire_after_seconds, namespace, name],
     )?;
     Ok(())
 }
@@ -9166,6 +9266,150 @@ mod tests {
         assert!(!options.contains_key("validator"));
         assert_eq!(options.get_str("validationLevel").unwrap(), "strict");
         assert!(!options.contains_key("validationAction"));
+    }
+
+    #[test]
+    fn coll_mod_updates_ttl_index_by_name_and_can_combine_with_validator() {
+        let conn = test_conn();
+        create_collection(&conn, &doc! { "create": "events", "$db": "app" }).unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 }],
+            },
+        )
+        .unwrap();
+
+        let updated = coll_mod(
+            &conn,
+            &doc! {
+                "collMod": "events",
+                "$db": "app",
+                "index": { "name": "expires_ttl", "expireAfterSeconds": 120_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_f64("ok").unwrap(), 1.0, "{updated:?}");
+        assert_eq!(updated.get_i64("expireAfterSeconds_old").unwrap(), 60);
+        assert_eq!(updated.get_i64("expireAfterSeconds_new").unwrap(), 120);
+        let listed = list_indexes(&conn, &doc! { "listIndexes": "events", "$db": "app" }).unwrap();
+        let ttl = first_batch(&listed)
+            .into_iter()
+            .find(|index| index.get_str("name").unwrap() == "expires_ttl")
+            .unwrap();
+        assert_eq!(ttl.get_i64("expireAfterSeconds").unwrap(), 120);
+
+        let validator = doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["expiresAt"],
+                "properties": { "expiresAt": { "bsonType": "date" } }
+            }
+        };
+        let combined = coll_mod(
+            &conn,
+            &doc! {
+                "collMod": "events",
+                "$db": "app",
+                "validator": validator.clone(),
+                "index": { "name": "expires_ttl", "expireAfterSeconds": 30_i64 },
+            },
+        )
+        .unwrap();
+        assert_eq!(combined.get_f64("ok").unwrap(), 1.0);
+        let listed = list_indexes(&conn, &doc! { "listIndexes": "events", "$db": "app" }).unwrap();
+        let ttl = first_batch(&listed)
+            .into_iter()
+            .find(|index| index.get_str("name").unwrap() == "expires_ttl")
+            .unwrap();
+        assert_eq!(ttl.get_i64("expireAfterSeconds").unwrap(), 30);
+        let collections =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        assert_eq!(
+            first_batch(&collections)[0]
+                .get_document("options")
+                .unwrap()
+                .get_document("validator")
+                .unwrap(),
+            &validator
+        );
+    }
+
+    #[test]
+    fn coll_mod_ttl_rejects_bad_shapes_without_mutation() {
+        let conn = test_conn();
+        create_collection(&conn, &doc! { "create": "events", "$db": "app" }).unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                    { "key": { "name": 1_i32 }, "name": "name_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        for index_update in [
+            Bson::String("expires_ttl".to_string()),
+            Bson::Document(doc! {}),
+            Bson::Document(doc! { "name": "", "expireAfterSeconds": 30_i32 }),
+            Bson::Document(doc! { "name": "expires_ttl" }),
+            Bson::Document(doc! { "name": "expires_ttl", "expireAfterSeconds": -1_i32 }),
+            Bson::Document(doc! { "name": "missing", "expireAfterSeconds": 30_i32 }),
+            Bson::Document(doc! { "name": "_id_", "expireAfterSeconds": 30_i32 }),
+            Bson::Document(doc! { "name": "name_1", "expireAfterSeconds": 30_i32 }),
+            Bson::Document(
+                doc! { "keyPattern": { "expiresAt": 1_i32 }, "expireAfterSeconds": 30_i32 },
+            ),
+            Bson::Document(
+                doc! { "name": "expires_ttl", "expireAfterSeconds": 30_i32, "hidden": true },
+            ),
+        ] {
+            let response = coll_mod(
+                &conn,
+                &doc! { "collMod": "events", "$db": "app", "index": index_update },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+
+        let invalid_combined = coll_mod(
+            &conn,
+            &doc! {
+                "collMod": "events",
+                "$db": "app",
+                "validator": {
+                    "$jsonSchema": {
+                        "bsonType": "object",
+                        "required": ["expiresAt"],
+                        "properties": { "expiresAt": { "bsonType": "date" } }
+                    }
+                },
+                "index": { "name": "expires_ttl", "expireAfterSeconds": "30" },
+            },
+        )
+        .unwrap();
+        assert_command_error(&invalid_combined);
+
+        let listed = list_indexes(&conn, &doc! { "listIndexes": "events", "$db": "app" }).unwrap();
+        let ttl = first_batch(&listed)
+            .into_iter()
+            .find(|index| index.get_str("name").unwrap() == "expires_ttl")
+            .unwrap();
+        assert_eq!(ttl.get_i64("expireAfterSeconds").unwrap(), 60);
+        let collections =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        assert!(
+            !first_batch(&collections)[0]
+                .get_document("options")
+                .unwrap()
+                .contains_key("validator")
+        );
     }
 
     #[test]

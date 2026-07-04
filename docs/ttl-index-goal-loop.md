@@ -180,7 +180,7 @@ When a milestone is complete:
 - [x] Milestone 1: `createIndexes` TTL validation and listing
 - [x] Milestone 2: Deterministic TTL sweeper core
 - [x] Milestone 3: Wire-visible read/write sweep integration
-- [ ] Milestone 4: `collMod` TTL update subset
+- [x] Milestone 4: `collMod` TTL update subset
 - [ ] Milestone 5: Adversarial PyMongo/spec-corpus coverage
 - [ ] Milestone 6: Benchmarks, docs, scorecard, final verification
 
@@ -378,7 +378,7 @@ Status:
   sweep on invalid read hints. Verification passed: `cargo fmt -- --check`;
   `cargo test ttl`; `cargo test count`; `cargo test hint`;
   `cargo test find_and_modify`; `cargo test update`; `cargo test delete`.
-  Commit: pending.
+  Commit: `916439b`.
 
 Likely files:
 
@@ -435,6 +435,17 @@ Acceptance criteria:
 - Existing validation e2e tests are updated from "TTL collMod is unsupported"
   to the new narrower behavior.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed narrow `collMod` TTL updates by index name, including
+  validator-only preservation, combined valid validator plus TTL update,
+  explicit errors for malformed/unknown/non-TTL index updates, and
+  no-mutation behavior for invalid combined input. Verification passed:
+  `cargo fmt -- --check`; `cargo test coll_mod`; `cargo test ttl`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_validation.py tests/e2e/test_indexes.py` (42 passed,
+  outside sandbox due localhost bind). Commit: pending.
 
 Likely files:
 
