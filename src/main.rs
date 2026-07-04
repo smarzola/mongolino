@@ -851,102 +851,132 @@ fn aggregate_command(conn: &Connection, command: &Document) -> Result<Document> 
         Ok(pipeline) => pipeline,
         Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
     };
-    let (filter, skip, limit) = match parse_count_documents_pipeline(pipeline) {
-        Ok(parsed) => parsed,
+    let documents = match aggregate_pipeline_documents(conn, &namespace(db, collection), pipeline)?
+    {
+        Ok(documents) => documents,
         Err(response) => return Ok(response),
-    };
-    let documents = documents_for_namespace(conn, &namespace(db, collection))?;
-    let count = match count_matching_documents(documents, &filter, skip, limit) {
-        Ok(count) => count,
-        Err(err) => return Ok(command_error(err.code, &err.errmsg)),
     };
 
     Ok(doc! {
         "cursor": {
             "id": 0_i64,
             "ns": namespace(db, collection),
-            "firstBatch": [{ "_id": 1_i32, "n": count }],
+            "firstBatch": documents.into_iter().map(Bson::Document).collect::<Vec<_>>(),
         },
         "ok": 1.0,
     })
 }
 
-fn parse_count_documents_pipeline(
+fn aggregate_pipeline_documents(
+    conn: &Connection,
+    namespace: &str,
     pipeline: &[Bson],
-) -> std::result::Result<(Document, usize, Option<usize>), Document> {
-    let mut filter = Document::new();
-    let mut skip = 0_usize;
-    let mut limit = None;
-    let mut saw_group = false;
+) -> Result<std::result::Result<Vec<Document>, Document>> {
+    let mut documents = documents_for_namespace(conn, namespace)?;
 
     for stage in pipeline {
         let Bson::Document(stage) = stage else {
-            return Err(command_error(
+            return Ok(Err(command_error(
                 9,
                 "aggregate pipeline stages must be documents",
-            ));
+            )));
         };
         if stage.len() != 1 {
-            return Err(command_error(
+            return Ok(Err(command_error(
                 72,
                 "aggregate stages must contain one operator",
-            ));
+            )));
         }
-        if let Some(Bson::Document(match_filter)) = stage.get("$match") {
-            if saw_group {
-                return Err(command_error(
-                    72,
-                    "$match after count group is not supported",
-                ));
+        let (operator, operand) = stage.iter().next().expect("stage len checked above");
+        match operator.as_str() {
+            "$match" => {
+                let Bson::Document(filter) = operand else {
+                    return Ok(Err(command_error(9, "$match requires a document")));
+                };
+                documents = match shape_documents(documents, filter, None, 0, None, None) {
+                    Ok(documents) => documents,
+                    Err(err) => return Ok(Err(command_error(err.code, &err.errmsg))),
+                };
             }
-            filter = match_filter.clone();
-        } else if let Some(skip_value) = stage.get("$skip") {
-            if saw_group {
-                return Err(command_error(
-                    72,
-                    "$skip after count group is not supported",
-                ));
+            "$sort" => {
+                let Bson::Document(sort) = operand else {
+                    return Ok(Err(command_error(9, "$sort requires a document")));
+                };
+                let sort = match parse_sort_document(sort) {
+                    Ok(sort) => sort,
+                    Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
+                };
+                sort_documents(&mut documents, &sort);
             }
-            skip = match non_negative_stage_usize(skip_value, "$skip") {
-                Ok(value) => value,
-                Err(err) => return Err(err),
-            };
-        } else if let Some(limit_value) = stage.get("$limit") {
-            if saw_group {
-                return Err(command_error(
-                    72,
-                    "$limit after count group is not supported",
-                ));
+            "$skip" => {
+                let skip = match non_negative_stage_usize(operand, "$skip") {
+                    Ok(skip) => skip,
+                    Err(response) => return Ok(Err(response)),
+                };
+                documents = documents.into_iter().skip(skip).collect();
             }
-            limit = Some(match non_negative_stage_usize(limit_value, "$limit") {
-                Ok(value) => value,
-                Err(err) => return Err(err),
-            });
-        } else if let Some(Bson::Document(group)) = stage.get("$group") {
-            if is_count_documents_group(group) {
-                saw_group = true;
-            } else {
-                return Err(command_error(
-                    72,
-                    "aggregate only supports PyMongo count_documents group shape",
-                ));
+            "$limit" => {
+                let limit = match non_negative_stage_usize(operand, "$limit") {
+                    Ok(limit) => limit,
+                    Err(response) => return Ok(Err(response)),
+                };
+                documents.truncate(limit);
             }
-        } else {
-            return Err(command_error(
-                72,
-                "aggregate only supports count_documents pipeline stages",
-            ));
+            "$project" => {
+                let Bson::Document(projection) = operand else {
+                    return Ok(Err(command_error(9, "$project requires a document")));
+                };
+                let projection = match parse_projection_document(projection) {
+                    Ok(Some(projection)) => projection,
+                    Ok(None) => continue,
+                    Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
+                };
+                documents = documents
+                    .into_iter()
+                    .map(|document| apply_projection(&document, &projection))
+                    .collect();
+            }
+            "$count" => {
+                let Bson::String(field) = operand else {
+                    return Ok(Err(command_error(
+                        9,
+                        "$count requires a non-empty string field name",
+                    )));
+                };
+                if field.is_empty() {
+                    return Ok(Err(command_error(
+                        9,
+                        "$count requires a non-empty string field name",
+                    )));
+                }
+                documents = if documents.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![doc! { field: documents.len() as i64 }]
+                };
+            }
+            "$group" => {
+                let Bson::Document(group) = operand else {
+                    return Ok(Err(command_error(9, "$group requires a document")));
+                };
+                if !is_count_documents_group(group) {
+                    return Ok(Err(command_error(
+                        72,
+                        "aggregate only supports PyMongo count_documents group shape",
+                    )));
+                }
+                documents = vec![doc! { "_id": 1_i32, "n": documents.len() as i64 }];
+            }
+            _ => {
+                return Ok(Err(command_error(
+                    72,
+                    &format!("aggregate stage {operator} is not supported"),
+                )));
+            }
         }
     }
 
-    if !saw_group {
-        return Err(command_error(
-            72,
-            "aggregate only supports count_documents pipeline",
-        ));
-    }
-
-    Ok((filter, skip, limit))
+    Ok(Ok(documents))
 }
 
 fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> Result<Document> {
@@ -3137,6 +3167,10 @@ fn parse_sort(command: &Document) -> std::result::Result<Option<Vec<(String, i32
     let Bson::Document(sort) = value else {
         return Err("sort must be a document".to_string());
     };
+    parse_sort_document(sort).map(Some)
+}
+
+fn parse_sort_document(sort: &Document) -> std::result::Result<Vec<(String, i32)>, String> {
     let mut spec = Vec::new();
     for (field, direction) in sort {
         if field.starts_with('$') {
@@ -3149,7 +3183,7 @@ fn parse_sort(command: &Document) -> std::result::Result<Option<Vec<(String, i32
         };
         spec.push((field.to_string(), direction));
     }
-    Ok(Some(spec))
+    Ok(spec)
 }
 
 fn sort_documents(documents: &mut [Document], sort: &[(String, i32)]) {
@@ -4398,6 +4432,144 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_pipeline_match_sort_project_skip_limit_and_count() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "active": true } },
+                    { "$sort": { "age": -1_i32 } },
+                    { "$project": { "name": 1_i32, "age": 1_i32, "_id": 0_i32 } },
+                    { "$skip": 1_i32 },
+                    { "$limit": 1_i32 },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        let batch = first_batch(&response);
+        assert_eq!(batch, vec![doc! { "name": "Ada", "age": 37_i32 }]);
+
+        let count = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "profile.city": "Rome" } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&count), vec![doc! { "total": 2_i64 }]);
+    }
+
+    #[test]
+    fn aggregate_pipeline_stage_order_is_sequential() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let limit_then_skip = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$limit": 1_i32 },
+                    { "$skip": 1_i32 },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&limit_then_skip), Vec::<Document>::new());
+
+        let skip_then_limit = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$skip": 1_i32 },
+                    { "$limit": 1_i32 },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&skip_then_limit), vec![doc! { "_id": "u2" }]);
+    }
+
+    #[test]
+    fn aggregate_count_empty_match_returns_empty_count_batch() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "profile.city": "Nowhere" } },
+                    { "$count": "total" },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first_batch(&response), Vec::<Document>::new());
+    }
+
+    #[test]
+    fn aggregate_pipeline_rejects_malformed_and_unsupported_stages() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for pipeline in [
+            vec![Bson::Int32(1)],
+            vec![Bson::Document(doc! {})],
+            vec![Bson::Document(
+                doc! { "$match": {}, "$sort": { "_id": 1_i32 } },
+            )],
+            vec![Bson::Document(doc! { "$match": "bad" })],
+            vec![Bson::Document(doc! { "$sort": "bad" })],
+            vec![Bson::Document(doc! { "$sort": { "age": 2_i32 } })],
+            vec![Bson::Document(doc! { "$skip": -1_i32 })],
+            vec![Bson::Document(doc! { "$limit": "bad" })],
+            vec![Bson::Document(doc! { "$project": "bad" })],
+            vec![Bson::Document(
+                doc! { "$project": { "name": { "$literal": 1_i32 } } },
+            )],
+            vec![Bson::Document(doc! { "$count": "" })],
+            vec![Bson::Document(doc! { "$count": 1_i32 })],
+            vec![Bson::Document(doc! { "$lookup": { "from": "other" } })],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": "$state", "n": { "$sum": 1_i32 } } },
+            )],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! { "aggregate": "users", "$db": "app", "pipeline": pipeline, "cursor": {} },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
     fn distinct_command_supports_scalar_dotted_and_array_values() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -4455,7 +4627,7 @@ mod tests {
                 &doc! {
                     "aggregate": "users",
                     "$db": "app",
-                    "pipeline": [{ "$project": { "name": 1_i32 } }],
+                    "pipeline": [{ "$lookup": { "from": "other" } }],
                     "cursor": {},
                 },
             )
