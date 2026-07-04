@@ -9696,6 +9696,110 @@ mod tests {
     }
 
     #[test]
+    fn compound_planner_entries_are_rebuilt_refreshed_and_dropped() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "unsafe_numeric", "profile": { "city": "Rome" }, "active": 1_i32 },
+                    { "_id": "unsafe_array", "profile": { "city": "Rome" }, "active": [true] },
+                    { "_id": "unsafe_missing", "profile": { "city": "Rome" } },
+                    { "_id": "unsafe_document", "profile": { "city": "Rome" }, "active": { "nested": true } },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" }],
+            },
+        )
+        .unwrap();
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'city_active_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
+            vec!["u1", "u3"]
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "profile.city": "Milan" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
+            vec!["u3"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Milan", "active": true }),
+            vec!["u1"]
+        );
+
+        find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u3" },
+                "update": { "$set": { "active": false } },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": false }),
+            vec!["u3"]
+        );
+
+        delete_documents(
+            &conn,
+            &doc! { "delete": "users", "$db": "app", "deletes": [{ "q": { "_id": "u3" }, "limit": 1_i32 }] },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome", "active": false }),
+            Vec::<String>::new()
+        );
+
+        drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "city_active_1" },
+        )
+        .unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'city_active_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn empty_and_unknown_commands_are_command_errors() {
         let conn = test_conn();
 

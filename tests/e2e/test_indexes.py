@@ -16,15 +16,25 @@ def test_create_list_and_drop_indexes(collection):
 
     email = collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
     city = collection.create_index([("profile.city", DESCENDING)])
+    compound = collection.create_index(
+        [("profile.city", ASCENDING), ("active", DESCENDING)],
+        name="city_active_1",
+    )
 
     assert email == "email_1"
     assert city == "profile.city_-1"
-    assert index_names(collection) == ["_id_", "email_1", "profile.city_-1"]
+    assert compound == "city_active_1"
+    assert index_names(collection) == ["_id_", "city_active_1", "email_1", "profile.city_-1"]
     assert any(index.get("unique") for index in collection.list_indexes() if index["name"] == "email_1")
+    assert any(
+        list(index["key"].items()) == [("profile.city", 1), ("active", -1)]
+        for index in collection.list_indexes()
+        if index["name"] == "city_active_1"
+    )
 
     collection.drop_index("email_1")
 
-    assert index_names(collection) == ["_id_", "profile.city_-1"]
+    assert index_names(collection) == ["_id_", "city_active_1", "profile.city_-1"]
 
 
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
@@ -209,6 +219,52 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
         "u1"
     ]
     assert collection.count_documents({"profile.city": "Milan"}) == 1
+
+
+def test_compound_indexed_query_results_stay_correct_after_mutations(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test", "profile": {"city": "Rome"}, "active": True},
+            {"_id": "u2", "email": "grace@example.test", "profile": {"city": "London"}, "active": True},
+            {"_id": "u3", "email": "katherine@example.test", "profile": {"city": "Rome"}, "active": True},
+            {"_id": "u4", "email": "unsafe@example.test", "profile": {"city": "Rome"}, "active": 1},
+        ]
+    )
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome", "active": True}).sort("_id", 1)] == [
+        "u1",
+        "u3",
+    ]
+    assert collection.count_documents({"profile.city": "Rome", "active": True}) == 2
+    assert collection.count_documents({"profile.city": "Rome", "active": 1}) == 1
+
+    collection.update_one({"_id": "u1"}, {"$set": {"profile.city": "Milan"}})
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome", "active": True}).sort("_id", 1)] == [
+        "u3"
+    ]
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Milan", "active": True}).sort("_id", 1)] == [
+        "u1"
+    ]
+
+    collection.update_one(
+        {"email": "grace@example.test"},
+        {"$set": {"profile.city": "Rome"}},
+    )
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome", "active": True}).sort("_id", 1)] == [
+        "u2",
+        "u3",
+    ]
+
+    collection.delete_one({"profile.city": "Rome", "active": True})
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome", "active": True}).sort("_id", 1)] == [
+        "u3"
+    ]
+
+    collection.drop_index("city_active_1")
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome", "active": True}).sort("_id", 1)] == [
+        "u3"
+    ]
 
 
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):

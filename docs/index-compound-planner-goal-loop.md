@@ -160,7 +160,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Compound key encoding and planner classification
-- [ ] Milestone 1: Compound index entry maintenance
+- [x] Milestone 1: Compound index entry maintenance
 - [ ] Milestone 2: Compound read and count pushdown
 - [ ] Milestone 3: Compound write target and unique pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
@@ -250,6 +250,19 @@ cargo test planner
 cargo test find_and_modify
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py
 ```
+
+Status:
+
+- 2026-07-04: Compound indexes now rebuild and refresh maintained
+  `index_entries` through the existing create, insert, update, delete, upsert,
+  and findAndModify hooks. Unsafe compound key parts are omitted from planner
+  entries and remain matcher fallback behavior. Verified with `cargo fmt --
+  --check`; `cargo test index`; `cargo test planner`; `cargo test
+  find_and_modify`; sandboxed PyMongo e2e failed at localhost bind with
+  `PermissionError: [Errno 1] Operation not permitted`; unsandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py` passed. Commit
+  hash: pending.
 
 ## Milestone 2: Compound Read And Count Pushdown
 

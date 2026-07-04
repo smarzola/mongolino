@@ -139,6 +139,33 @@ def test_find_and_modify_targets_id_indexed_scalar_and_fallback_filters(collecti
     assert fallback["state"] == "fallback"
 
 
+def test_find_and_modify_refreshes_compound_index_entries(collection):
+    seed_jobs(collection)
+    collection.create_index([("state", ASCENDING), ("priority", ASCENDING)], name="state_priority_1")
+
+    updated = collection.find_one_and_update(
+        {"state": "queued", "priority": 3},
+        {"$set": {"state": "running"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j2"
+    assert collection.find_one({"state": "queued", "priority": 3}) is None
+    assert collection.find_one({"state": "running", "priority": 3})["_id"] == "j2"
+
+    replaced = collection.find_one_and_replace(
+        {"state": "running", "priority": 3},
+        {"owner": "b", "priority": 4, "state": "queued", "email": "b@example.test"},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert replaced["_id"] == "j2"
+    assert collection.find_one({"state": "running", "priority": 3}) is None
+    assert collection.find_one({"state": "queued", "priority": 4})["_id"] == "j2"
+
+    removed = collection.find_one_and_delete({"state": "queued", "priority": 4})
+    assert removed["_id"] == "j2"
+    assert collection.find_one({"state": "queued", "priority": 4}) is None
+
+
 def test_find_one_and_update_upsert_returns_inserted_document(collection):
     result = collection.find_one_and_update(
         {"_id": "counter", "kind": "local"},
