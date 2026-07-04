@@ -108,6 +108,41 @@ def test_find_logical_operators(collection):
     assert ids(collection.find({"age": {"$not": {"$lt": 39}}}).sort("_id", ASCENDING)) == ["u2", "u3"]
 
 
+def test_regex_predicates_find_count_update_and_delete_targets(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "u1",
+                "name": "Ada Lovelace",
+                "bio": "first\nprogrammer",
+                "tags": ["Math", "logic"],
+            },
+            {"_id": "u2", "name": "Grace Hopper", "bio": "COBOL\npioneer", "tags": ["navy"]},
+            {"_id": "u3", "name": "Katherine Johnson", "bio": "orbital math", "tags": ["space"]},
+            {"_id": "u4", "name": 42, "tags": [1, 2]},
+        ]
+    )
+
+    assert ids(collection.find({"name": {"$regex": "^Ada"}})) == ["u1"]
+    assert ids(collection.find({"name": {"$regex": "^grace", "$options": "i"}})) == ["u2"]
+    assert ids(collection.find({"bio": {"$regex": "^programmer$", "$options": "m"}})) == ["u1"]
+    assert ids(collection.find({"bio": {"$regex": "COBOL.*pioneer", "$options": "s"}})) == ["u2"]
+    assert ids(collection.find({"tags": {"$regex": "^mat", "$options": "i"}})) == ["u1"]
+    assert collection.count_documents({"name": {"$regex": "o"}}) == 3
+    assert collection.count_documents({"name": {"$regex": "^42"}}) == 0
+
+    updated = collection.update_one(
+        {"name": {"$regex": "hopper$", "$options": "i"}},
+        {"$set": {"matched": "regex"}},
+    )
+    assert updated.matched_count == 1
+    assert collection.find_one({"_id": "u2"})["matched"] == "regex"
+
+    deleted = collection.delete_many({"name": {"$regex": "son$"}})
+    assert deleted.deleted_count == 1
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u1", "u2", "u4"]
+
+
 def test_find_projection_edges(collection):
     seed_users(collection)
 

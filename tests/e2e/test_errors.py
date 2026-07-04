@@ -9,10 +9,24 @@ def test_unsupported_query_operator_is_explicit_error(collection):
     collection.insert_one({"_id": "u1", "name": "Ada"})
 
     with pytest.raises(OperationFailure) as excinfo:
-        list(collection.find({"name": {"$regex": "A"}}))
+        list(collection.find({"$where": "this.name == 'Ada'"}))
 
     assert excinfo.value.code == 2
-    assert "unsupported query operator $regex" in str(excinfo.value)
+    assert "unsupported top-level query operator $where" in str(excinfo.value)
+
+
+def test_invalid_regex_predicate_is_explicit_error(collection):
+    collection.insert_one({"_id": "u1", "name": "Ada"})
+
+    with pytest.raises(OperationFailure) as invalid_pattern:
+        list(collection.find({"name": {"$regex": "("}}))
+    assert invalid_pattern.value.code == 2
+    assert "invalid $regex pattern" in str(invalid_pattern.value)
+
+    with pytest.raises(OperationFailure) as unsupported_option:
+        list(collection.find({"name": {"$regex": "A", "$options": "x"}}))
+    assert unsupported_option.value.code == 2
+    assert "$regex option x is not supported" in str(unsupported_option.value)
 
 
 def test_unsupported_push_option_is_write_error(collection):

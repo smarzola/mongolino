@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use bson::{Bson, Document, doc, oid::ObjectId};
+use regex::RegexBuilder;
 use rusqlite::{Connection, OptionalExtension, params};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -6204,6 +6205,9 @@ fn matches_field_condition(
         };
         return matches_operator_document(&values, operators);
     }
+    if matches!(condition, Bson::RegularExpression(_)) {
+        return matches_regex_predicate(&values, condition, None);
+    }
 
     Ok(values
         .iter()
@@ -6217,9 +6221,20 @@ fn matches_operator_document(values: &[&Bson], operators: &Document) -> MatchRes
             "field predicate cannot mix operators and literal document fields",
         ));
     }
+    if operators.contains_key("$options") && !operators.contains_key("$regex") {
+        return Err(match_error(2, "$options requires $regex"));
+    }
 
     for (operator, operand) in operators {
-        if !matches_operator_predicate(values, operator, operand)? {
+        if operator == "$options" {
+            continue;
+        }
+        let matched = if operator == "$regex" {
+            matches_regex_predicate(values, operand, operators.get("$options"))?
+        } else {
+            matches_operator_predicate(values, operator, operand)?
+        };
+        if !matched {
             return Ok(false);
         }
     }
@@ -6286,6 +6301,63 @@ fn matches_operator_predicate(
             2,
             format!("unsupported query operator {operator}"),
         )),
+    }
+}
+
+fn matches_regex_predicate(
+    values: &[&Bson],
+    operand: &Bson,
+    extra_options: Option<&Bson>,
+) -> MatchResult<bool> {
+    let (pattern, regex_options) = match operand {
+        Bson::String(pattern) => (pattern.as_str(), ""),
+        Bson::RegularExpression(regex) => (regex.pattern.as_str(), regex.options.as_str()),
+        _ => return Err(match_error(2, "$regex requires a string or BSON regex")),
+    };
+    let extra_options = match extra_options {
+        None => "",
+        Some(Bson::String(options)) => options.as_str(),
+        Some(_) => return Err(match_error(2, "$options requires a string")),
+    };
+    let regex = build_query_regex(pattern, &[regex_options, extra_options])?;
+    Ok(values
+        .iter()
+        .any(|candidate| regex_matches_bson(&regex, candidate)))
+}
+
+fn build_query_regex(pattern: &str, option_sets: &[&str]) -> MatchResult<regex::Regex> {
+    let mut builder = RegexBuilder::new(pattern);
+    for options in option_sets {
+        for option in options.chars() {
+            match option {
+                'i' => {
+                    builder.case_insensitive(true);
+                }
+                'm' => {
+                    builder.multi_line(true);
+                }
+                's' => {
+                    builder.dot_matches_new_line(true);
+                }
+                other => {
+                    return Err(match_error(
+                        2,
+                        format!("$regex option {other} is not supported"),
+                    ));
+                }
+            }
+        }
+    }
+    builder
+        .build()
+        .map_err(|err| match_error(2, format!("invalid $regex pattern: {err}")))
+}
+
+fn regex_matches_bson(regex: &regex::Regex, value: &Bson) -> bool {
+    match value {
+        Bson::String(value) => regex.is_match(value),
+        Bson::Array(values) => values.iter().any(|value| regex_matches_bson(regex, value)),
+        _ => false,
     }
 }
 
@@ -11540,6 +11612,81 @@ mod tests {
     }
 
     #[test]
+    fn find_matcher_supports_regex_predicates() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada Lovelace", "bio": "first\nprogrammer", "tags": ["Math", "logic"], "age": 37_i32 },
+                    { "_id": "u2", "name": "Grace Hopper", "bio": "COBOL\npioneer", "tags": ["navy"], "age": 39_i32 },
+                    { "_id": "u3", "name": "Katherine Johnson", "bio": "orbital math", "tags": ["space"], "age": 41_i32 },
+                    { "_id": "u4", "name": 42_i32, "tags": [1_i32, 2_i32] },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_ids(&conn, doc! { "name": { "$regex": "^Ada" } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "name": { "$regex": "^ada", "$options": "i" } }
+            ),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "bio": { "$regex": "^programmer$", "$options": "m" } }
+            ),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "bio": { "$regex": "COBOL.*pioneer", "$options": "s" } }
+            ),
+            vec!["u2"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "tags": { "$regex": "^mat", "$options": "i" } }
+            ),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "name": Bson::RegularExpression(bson::Regex { pattern: "hopper$".to_string(), options: "i".to_string() }) }
+            ),
+            vec!["u2"]
+        );
+        assert!(find_ids(&conn, doc! { "age": { "$regex": "^37" } }).is_empty());
+
+        for filter in [
+            doc! { "name": { "$regex": "(" } },
+            doc! { "name": { "$regex": "Ada", "$options": "x" } },
+            doc! { "name": { "$regex": 1_i32 } },
+            doc! { "name": { "$options": "i" } },
+            doc! { "name": { "$regex": "Ada", "$options": 1_i32 } },
+        ] {
+            let response = find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": filter },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
     fn find_matcher_supports_logical_operators() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -11571,7 +11718,6 @@ mod tests {
 
         for filter in [
             doc! { "$where": "this.age > 1" },
-            doc! { "name": { "$regex": "A" } },
             doc! { "tags": { "$elemMatch": { "$eq": "math" } } },
             doc! { "tags": { "$all": ["math"] } },
             doc! { "age": { "$in": "Ada" } },
@@ -12257,6 +12403,10 @@ mod tests {
                         { "kind": "active", "score": 5_i32 },
                         { "kind": "review", "score": 3_i32 },
                     ],
+                    "regex_items": [
+                        { "name": "Ada" },
+                        { "name": "Grace" },
+                    ],
                     "scores": [1_i32, 3_i32, 5_i32],
                     "docs": [{ "kind": "a" }, { "kind": "b" }],
                 }],
@@ -12292,6 +12442,7 @@ mod tests {
                                 ],
                             },
                             "none_items": { "$or": [{ "kind": "missing" }] },
+                            "regex_items": { "name": { "$regex": "^a", "$options": "i" } },
                             "scores": { "$gte": 3_i32 },
                             "docs": { "$eq": { "kind": "a" } },
                         },
@@ -12337,6 +12488,10 @@ mod tests {
                 doc! { "kind": "active", "score": 5_i32 },
                 doc! { "kind": "review", "score": 3_i32 },
             ])
+        );
+        assert_eq!(
+            document.get_array("regex_items").unwrap(),
+            &bson_documents(vec![doc! { "name": "Grace" }])
         );
         assert_eq!(document.get_array("scores").unwrap(), &bson_ints(&[1]));
         assert_eq!(
@@ -12588,7 +12743,7 @@ mod tests {
             doc! { "$pullAll": { "tags": "x" } },
             doc! { "$push": { "name": "x" } },
             doc! { "$pull": { "name": "Ada" } },
-            doc! { "$pull": { "docs": { "name": { "$regex": "^A" } } } },
+            doc! { "$pull": { "docs": { "name": { "$regex": "^A", "$options": "x" } } } },
             doc! { "$pull": { "docs": { "$or": [{ "name": "Ada" }], "$where": "bad" } } },
             doc! { "$pull": { "docs": { "$and": [] } } },
             doc! { "$pull": { "docs": { "$nor": [{ "name": "Ada" }, "bad"] } } },

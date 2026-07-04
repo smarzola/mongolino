@@ -1,0 +1,135 @@
+{
+  "name": "query language v2 regex predicates",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "name": "Ada Lovelace",
+      "bio": "first\nprogrammer",
+      "tags": [
+        "Math",
+        "logic"
+      ]
+    },
+    {
+      "_id": "u2",
+      "name": "Grace Hopper",
+      "bio": "COBOL\npioneer",
+      "tags": [
+        "navy"
+      ]
+    },
+    {
+      "_id": "u3",
+      "name": "Katherine Johnson",
+      "bio": "orbital math",
+      "tags": [
+        "space"
+      ]
+    },
+    {
+      "_id": "u4",
+      "name": 42,
+      "tags": [
+        1,
+        2
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "find",
+      "filter": {
+        "name": {
+          "$regex": "^ada",
+          "$options": "i"
+        }
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "name": "Ada Lovelace",
+          "bio": "first\nprogrammer",
+          "tags": [
+            "Math",
+            "logic"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "count_documents",
+      "filter": {
+        "tags": {
+          "$regex": "^mat",
+          "$options": "i"
+        }
+      },
+      "expect_result": {
+        "count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "name": {
+          "$regex": "hopper$",
+          "$options": "i"
+        }
+      },
+      "update": {
+        "$set": {
+          "matched": "regex"
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "delete_many",
+      "filter": {
+        "name": {
+          "$regex": "son$"
+        }
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "bio": {
+          "$regex": "COBOL.*pioneer",
+          "$options": "s"
+        }
+      },
+      "projection": {
+        "_id": 1,
+        "matched": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u2",
+          "matched": "regex"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "name": {
+          "$regex": "("
+        }
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 2,
+        "contains": "invalid $regex pattern"
+      }
+    }
+  ]
+}

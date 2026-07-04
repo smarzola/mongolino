@@ -132,7 +132,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Matcher architecture and error model
-- [ ] Milestone 1: Regex predicate support
+- [x] Milestone 1: Regex predicate support
 - [ ] Milestone 2: `$type`, `$size`, and `$all`
 - [ ] Milestone 3: `$elemMatch` scalar and document semantics
 - [ ] Milestone 4: Cross-command/e2e/spec coverage and docs
@@ -175,7 +175,7 @@ Status 2026-07-04: Complete. Split field-operator predicate evaluation into a
 single helper while preserving the existing matcher error model and supported
 operator behavior. Verification: `cargo fmt -- --check`, `cargo test
 find_matcher`, `cargo test update_array`, and `cargo test` passed. Commit:
-pending.
+`9e8a024`.
 
 ## Milestone 1: Regex Predicate Support
 
@@ -219,6 +219,16 @@ cargo test find_matcher
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_errors.py tests/e2e/test_crud.py
 cargo test
 ```
+
+Status 2026-07-04: Complete. Added `$regex` support for string operands, BSON
+regex operands, `$options` `i`/`m`/`s`, string-array traversal, invalid-pattern
+errors, unsupported-option errors, and `$pull` document predicate reuse.
+Verification: `cargo fmt -- --check` passed; `cargo test regex` passed; `cargo
+test find_matcher` passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+uv run --locked pytest tests/e2e/test_errors.py tests/e2e/test_crud.py` failed
+at localhost bind with `PermissionError: [Errno 1] Operation not permitted`;
+after `cargo build`, the same PyMongo command passed unsandboxed with 31 tests;
+`cargo test` passed. Commit: pending.
 
 ## Milestone 2: `$type`, `$size`, And `$all`
 
