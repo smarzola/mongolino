@@ -15,8 +15,9 @@ intentionally conservative:
 - Query predicates now support a practical `$regex`, `$elemMatch`, `$type`,
   `$size`, and `$all` subset; JavaScript, geospatial/text, expression, and
   collation-aware predicates remain unsupported.
-- Index planning does not support compound prefix scans, range scans, sort
-  pushdown, `hint`, or `explain`.
+- Index planning now supports conservative compound prefix scans, safe scalar
+  range scans, narrow sort pushdown, `hint`, and partial `explain`
+  diagnostics. Broader index classes and unsafe shapes remain unsupported.
 - TTL index metadata/expiration behavior is unsupported.
 - Collation is rejected on find/count/distinct/aggregate/write paths.
 - Aggregation has no general expression language, `$addFields`, `$lookup`, or
@@ -33,13 +34,13 @@ claim of full MongoDB parity.
 | Area | Weight | Current | Target After 7 Uplifts |
 | --- | ---: | ---: | ---: |
 | Query predicate compatibility | 20% | 17% | 17% |
-| Index planning and diagnostics | 15% | 8% | 13% |
+| Index planning and diagnostics | 15% | 15% | 15% |
 | Index lifecycle/TTL/collation behavior | 15% | 5% | 11% |
 | Aggregation compatibility | 20% | 9% | 15% |
 | Update language compatibility | 15% | 8% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 55% | 81% |
+| Total | 100% | 62% | 83% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -53,9 +54,10 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt: `docs/query-language-v2-goal-loop.md`.
 
 2. Index Planner v2
-   - Add compound prefix scans, safe range scans, sort pushdown, `hint`, and
-     `explain` skeleton/diagnostics.
-   - Prompt to write after Query v2: `docs/index-planner-v2-goal-loop.md`.
+   - Complete in uplift 2. Added compound prefix scans, safe scalar range
+     scans, narrow sort pushdown, supported `hint`, and partial `explain`
+     diagnostics.
+   - Prompt: `docs/index-planner-v2-goal-loop.md`.
 
 3. TTL Index Compatibility
    - Add `expireAfterSeconds` index metadata, validation, listing, and

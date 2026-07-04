@@ -456,3 +456,54 @@ CI profile budget check passed with:
 | find_multikey_scalar_equality | 30 | 14.35 | 2091.19 | 0.478 |
 | count_multikey_scalar_equality | 30 | 0.88 | 34228.64 | 0.029 |
 | update_multikey_target | 30 | 23.76 | 1262.72 | 0.792 |
+
+## Index Planner v2 Uplift Results
+
+Recorded on 2026-07-04 after conservative prefix, range, hint, explain, and
+sort-aware planner support. Benchmarks used the debug
+`cargo run --bin mongolino-bench -- --profile smoke --check-budget --json
+/private/tmp/mongolino-index-planner-v2-smoke.json` command.
+
+Delivered implementation:
+
+- Maintains compound-prefix and range-capable `index_entries` for safe scalar
+  index keys.
+- Uses equality-prefix and range candidates for `find`, update/delete target
+  selection, and findAndModify while retaining Rust matcher validation.
+- Uses count pushdown for exact and fully covered safe range predicates.
+- Accepts supported `hint` by name or key pattern on `find`, command `count`,
+  update, delete, and findAndModify.
+- Returns partial `queryPlanner` diagnostics for `find` and command `count`
+  with collection scan, `_id`, exact equality, prefix, range, hint, and sort
+  strategies.
+- Uses index order for only unique, fully covered bool/ObjectId/date scalar
+  sort keys; strings, missing values, duplicate sort keys, sparse/partial
+  indexes, multikey omissions, broad filters, and unsupported index classes
+  fall back to the existing in-memory sort or explicit errors.
+
+Smoke profile after Index Planner v2:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| find_collection_scan | 25 | 128.18 | 195.04 | 5.127 |
+| find_compound_prefix | 25 | 41.73 | 599.03 | 1.669 |
+| find_indexed_range | 25 | 70.27 | 355.78 | 2.811 |
+| find_compound_prefix_range | 25 | 43.82 | 570.47 | 1.753 |
+| find_hint_exact | 25 | 9.17 | 2725.06 | 0.367 |
+| find_hint_prefix | 25 | 41.78 | 598.32 | 1.671 |
+| find_hint_range | 25 | 69.86 | 357.84 | 2.795 |
+| find_sort_index_skip_limit | 25 | 139.16 | 179.65 | 5.566 |
+| count_indexed_range | 25 | 2.77 | 9014.01 | 0.111 |
+
+Headline movement:
+
+- `find_compound_prefix` is about `3.1x` faster than `find_collection_scan` on
+  this smoke run while still decoding and matcher-validating narrowed
+  candidates.
+- `find_compound_prefix_range` is about `2.9x` faster than collection scan for
+  the representative equality-prefix plus range shape.
+- `count_indexed_range` is below the `0.25 ms/op` target for fully covered safe
+  range count pushdown.
+- `find_sort_index_skip_limit` is budgeted as a gross-regression guard; the
+  conservative proof avoids unsafe sorts, but this debug smoke run is not yet a
+  headline latency win.

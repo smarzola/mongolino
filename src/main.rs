@@ -9044,7 +9044,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries_before_drop, 2);
+        assert_eq!(entries_before_drop, 3);
         let omissions_before_drop: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
@@ -11738,7 +11738,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries, 2);
+        assert_eq!(entries, 3);
 
         insert_documents(
             &conn,
@@ -11816,7 +11816,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries, 4);
+        assert_eq!(entries, 8);
         let duplicate = insert_documents(
             &conn,
             &doc! {
@@ -11867,7 +11867,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries, 1);
+        assert_eq!(entries, 2);
 
         let inactive = insert_documents(
             &conn,
@@ -11937,7 +11937,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries, 1);
+        assert_eq!(entries, 2);
     }
 
     #[test]

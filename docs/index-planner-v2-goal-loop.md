@@ -172,7 +172,7 @@ When a milestone is complete:
 - [x] Milestone 3: Hint command semantics
 - [x] Milestone 4: Explain diagnostics
 - [x] Milestone 5: Sort-aware read planning
-- [ ] Milestone 6: Benchmarks, docs, final e2e verification
+- [x] Milestone 6: Benchmarks, docs, final e2e verification
 
 ## Milestone 0: Planner v2 Architecture And Diagnostics Model
 
@@ -572,6 +572,17 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 ```
+
+Status 2026-07-04: Added prefix, range, hint, range-count, and sort-aware
+planner benchmark cases and CI budget thresholds; updated README planner
+compatibility docs, the performance baseline, and the roadmap scorecard from
+55% to 62%. Final verification passed with `cargo fmt -- --check`, `cargo
+test`, `cargo build`, `cargo run --bin mongolino-bench -- --profile smoke
+--check-budget`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock
+--check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
+--dev`, and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+--locked pytest tests/e2e` because the sandboxed e2e path cannot bind
+localhost. Commit: reported in goal-loop status after commit creation.
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.

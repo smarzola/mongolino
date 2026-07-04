@@ -146,6 +146,85 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "find_compound_prefix",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": { "team": compound_target_team(args.profile.documents) },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_indexed_range",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": { "createdAt": { "$gte": target_created_at(args.profile.documents) } },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_compound_prefix_range",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": {
+                "team": compound_target_team(args.profile.documents),
+                "createdAt": { "$gte": target_created_at(args.profile.documents) },
+            },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_hint_exact",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": { "email": format!("user{}@example.test", args.profile.documents / 2) },
+            "hint": "email_1",
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_hint_prefix",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": { "team": compound_target_team(args.profile.documents) },
+            "hint": "team_email_1",
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_hint_range",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": { "createdAt": { "$gte": target_created_at(args.profile.documents) } },
+            "hint": "createdAt_1",
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_sort_index_skip_limit",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": {},
+            "sort": { "createdAt": 1_i32 },
+            "skip": 10_i32,
+            "limit": 10_i32,
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "find_partial_index_equality",
         args.profile.iterations,
         doc! {
@@ -195,6 +274,15 @@ fn run() -> Result<()> {
                 "team": compound_target_team(args.profile.documents),
                 "email": compound_target_email(args.profile.documents),
             },
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "count_indexed_range",
+        args.profile.iterations,
+        doc! {
+            "count": COLL,
+            "query": { "createdAt": { "$gte": target_created_at(args.profile.documents) } },
             "$db": DB,
         },
     )?);
@@ -333,7 +421,9 @@ impl Harness {
                 { "key": { "email": 1_i32 }, "name": "email_1" },
                 { "key": { "team": 1_i32 }, "name": "team_1" },
                 { "key": { "active": 1_i32 }, "name": "active_1" },
+                { "key": { "createdAt": 1_i32 }, "name": "createdAt_1" },
                 { "key": { "team": 1_i32, "email": 1_i32 }, "name": "team_email_1" },
+                { "key": { "team": 1_i32, "createdAt": 1_i32 }, "name": "team_createdAt_1" },
             ],
             "$db": DB,
         })?;
@@ -726,12 +816,21 @@ fn seed_document(i: usize) -> Document {
         "team": team,
         "active": i % 2 == 0,
         "score": (i % 1_000) as i32,
+        "createdAt": created_at_for_index(i),
         "profile": {
             "city": city,
             "level": (i % 7) as i32,
         },
         "tags": tags,
     }
+}
+
+fn created_at_for_index(i: usize) -> bson::DateTime {
+    bson::DateTime::from_millis(1_700_000_000_000_i64 + i as i64)
+}
+
+fn target_created_at(documents: usize) -> bson::DateTime {
+    created_at_for_index(documents / 2)
 }
 
 fn compound_target_index(documents: usize) -> usize {
@@ -927,10 +1026,18 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "find_id_equality" => (25.0, 40.0),
         "find_collection_scan" => (250.0, 4.0),
         "find_indexed_scalar_equality" => (80.0, 12.0),
+        "find_compound_prefix" => (120.0, 8.0),
+        "find_indexed_range" => (120.0, 8.0),
+        "find_compound_prefix_range" => (120.0, 8.0),
+        "find_hint_exact" => (80.0, 12.0),
+        "find_hint_prefix" => (120.0, 8.0),
+        "find_hint_range" => (120.0, 8.0),
+        "find_sort_index_skip_limit" => (80.0, 12.0),
         "find_partial_index_equality" => (80.0, 12.0),
         "count_empty_filter" => (250.0, 4.0),
         "count_simple_equality" => (250.0, 4.0),
         "count_compound_equality" => (25.0, 40.0),
+        "count_indexed_range" => (25.0, 40.0),
         "count_partial_index_equality" => (25.0, 40.0),
         "count_multikey_scalar_equality" => (25.0, 40.0),
         "update_index_refresh" => (150.0, 6.0),
