@@ -23,7 +23,7 @@ use app
 db.users.insertOne({ _id: "u1", name: "Ada" })
 db.users.insertOne({ _id: "u2", name: "Grace", age: 39, profile: { city: "London" } })
 db.users.find({ age: { $gte: 38 } }, { name: 1, _id: 0 }).sort({ age: -1 }).toArray()
-db.users.updateOne({ _id: "u1" }, { $set: { name: "Ada Lovelace" }, $inc: { score: 1 } })
+db.users.updateOne({ _id: "u1" }, { $set: { name: "Ada Lovelace" }, $inc: { score: 1 }, $push: { tags: "logic" } })
 db.users.findOneAndUpdate({ _id: "u1" }, { $inc: { score: 1 } }, { returnDocument: "after" })
 db.users.aggregate([{ $match: { age: { $gte: 38 } } }, { $sort: { age: -1 } }, { $project: { name: 1 } }]).toArray()
 db.users.deleteOne({ _id: "u2" })
@@ -61,10 +61,10 @@ Compatibility flags:
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order. | No collation, hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key and validation `writeErrors`, supports ordered/unordered batches, and honors `bypassDocumentValidation: true`. | No write concern, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, and conservative scalar equality lookup through supported indexes. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, or tailable cursors. Unsupported operators return command errors. |
-| `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, `fields`/`projection`, pre-image or post-image return, update/replacement upsert, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, unique-index enforcement, and maintained index entries. | No array filters, pipeline updates, positional updates, collation, hint, write concern, maxTimeMS, `let`, retryable writes, or transaction semantics. Unsupported shapes return command errors. |
+| `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, `fields`/`projection`, pre-image or post-image return, update/replacement upsert, supported update modifiers, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, unique-index enforcement, and maintained index entries. | No array filters, pipeline updates, positional updates, collation, hint, write concern, maxTimeMS, `let`, retryable writes, or transaction semantics. Unsupported shapes return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
 | `killCursors` | Partial | Removes live per-client cursors and reports `cursorsKilled` or `cursorsNotFound`. | No cross-connection cursor lookup. Malformed cursor ids return command errors. |
-| `update` | Partial | Supports replacement updates, `$set`, `$unset`, `$inc`, upsert, single-update, multi-update, ordered/unordered batches, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, and duplicate-key write errors. | No array filters, positional operators, pipeline updates, `$rename`, `$push`, `$pull`, hints, collation, write concern, retryable writes, or transactions. |
+| `update` | Partial | Supports replacement updates; `$set`, `$unset`, `$inc`, `$rename`, `$min`, `$max`, `$mul`, `$setOnInsert`; array modifiers `$push`, `$addToSet`, `$pop`, `$pull`, and `$pullAll` for the documented subset; upsert; single-update; multi-update; ordered/unordered batches; `_id` immutability; validator enforcement; `bypassDocumentValidation: true`; and duplicate-key write errors. | No array filters, positional operators, update pipelines, `$push` `$position`/`$slice`/`$sort`, hints, collation, write concern, retryable writes, or transactions. |
 | `delete` | Partial | Supports batch deletes with `q` and `limit`; `limit: 1` deletes one deterministic match and `limit: 0` deletes all matches. | No hints, collation, write concern, retryable writes, or explain behavior. |
 | Cursors | Partial | `find` and `aggregate` store remaining results under a positive cursor id, PyMongo can iterate across multiple batches, exhausted cursors close with `id: 0`, and `killCursors` explicitly closes live cursors. | No cursor timeout. Cursor state is not durable and is scoped to one client connection. Invalid or exhausted cursor ids return explicit command errors for `getMore`. |
 | BSON storage | Partial | Stores BSON blobs in SQLite, derives a stable primary key from `_id`, maintains scalar equality index entries for supported simple indexes, stores durable collection validator metadata, and enforces the supported validator subset on document-producing writes. Inserts with operator-shaped field names store those names as data. | No document size enforcement beyond message size, compound index planning, or range planning. |
@@ -100,8 +100,18 @@ mode override. Sort supports top-level or dotted fields with `1` or `-1`; missin
 fields sort deterministically before present fields in ascending order.
 
 Update paths support dotted document fields. Dotted updates through scalar
-parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, attempts to change
-`_id`, and unsupported update operators are rejected with write errors.
+parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, positional path
+segments, attempts to change `_id`, and unsupported update operators are
+rejected with write errors.
+
+Supported update modifiers are intentionally bounded. Scalar modifiers include
+`$set`, `$unset`, `$inc`, `$rename`, `$min`, `$max`, `$mul`, and `$setOnInsert`.
+Array modifiers include `$push` with scalar values or `$each`, `$addToSet` with
+scalar values or `$each`, `$pop` with `1` or `-1`, `$pull` with equality or the
+supported matcher predicate subset, and `$pullAll` with scalar/document equality.
+`$setOnInsert` applies only to inserted upserts. `$push` option documents using
+`$position`, `$slice`, `$sort`, or unknown options are rejected explicitly, as
+are update pipelines, array filters, and positional operators.
 
 `findAndModify` uses the same matcher, sort, projection, update application,
 duplicate-key checks, and maintained index entries as `find`, `update`, and
@@ -150,6 +160,7 @@ uv run --locked pytest tests/e2e/test_aggregation.py
 uv run --locked pytest tests/e2e/test_lifecycle.py
 uv run --locked pytest tests/e2e/test_indexes.py
 uv run --locked pytest tests/e2e/test_metadata.py
+uv run --locked pytest tests/e2e/test_update_operators.py
 ```
 
 The e2e suite builds or locates `target/debug/mongolino`, starts it on a
@@ -167,6 +178,6 @@ and the PyMongo e2e suite on pushes and pull requests.
 ## Scope
 
 This is not a full MongoDB replacement. The next major pieces are
-broader query/update operators, more aggregation stages, richer index planning,
+broader query/update edge cases, more aggregation stages, richer index planning,
 authentication behavior, transactions, retryable writes, and deeper driver
 compatibility testing.
