@@ -109,6 +109,18 @@ duplicate-key checks, and maintained index entries as `find`, `update`, and
 not implement MongoDB sessions, retryable writes, write concern durability
 semantics, or multi-document transactions.
 
+Validation supports a small `$jsonSchema` subset for object documents:
+root `bsonType: "object"`, `required`, and nested `properties` with `bsonType`
+values `object`, `array`, `string`, `int`, `long`, `double`, `number`, `bool`,
+`objectId`, `date`, and `null`. `number` matches int, long, and double. Nested
+object properties may define their own `required` and `properties`. Dotted
+validator property names, arrays/items, regex/patterns, numeric bounds, string
+lengths, combinators, dependencies, collation, `validationLevel` values other
+than `strict`, and `validationAction` values other than `error` are rejected
+explicitly. `collMod` clears validation with `validator: {}`. Insert, update,
+and find-and-modify enforce validators unless `bypassDocumentValidation: true`
+is present; bypass does not disable `_id` immutability or unique indexes.
+
 Aggregation is a document-stream subset. Each supported stage runs in order over
 the current stream, so `$limit` before `$skip` is intentionally different from
 `$skip` before `$limit`. Unsupported stages and projection expressions return

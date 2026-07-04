@@ -1,0 +1,211 @@
+{
+  "name": "schema validation metadata enforcement and bypass",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "command",
+      "command": {
+        "create": "$$collection",
+        "validator": {
+          "$jsonSchema": {
+            "bsonType": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "bsonType": "string"
+              },
+              "profile": {
+                "bsonType": "object",
+                "required": [
+                  "city"
+                ],
+                "properties": {
+                  "city": {
+                    "bsonType": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "validationLevel": "strict",
+        "validationAction": "error"
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "insert_one",
+      "document": {
+        "_id": "u1",
+        "name": "Ada",
+        "profile": {
+          "city": "Rome"
+        }
+      },
+      "expect_result": {
+        "inserted_id": "u1"
+      }
+    },
+    {
+      "name": "insert_one",
+      "document": {
+        "_id": "bad1",
+        "age": 1
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "code": 121,
+        "contains": "Document failed validation"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "insert": "$$collection",
+        "documents": [
+          {
+            "_id": "bad1",
+            "age": "old"
+          }
+        ],
+        "bypassDocumentValidation": true
+      },
+      "expect_result": {
+        "ok": 1.0,
+        "n": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$set": {
+          "name": 5
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "code": 121,
+        "contains": "Document failed validation"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "update": "$$collection",
+        "updates": [
+          {
+            "q": {
+              "_id": "u1"
+            },
+            "u": {
+              "$set": {
+                "name": 5
+              }
+            }
+          }
+        ],
+        "bypassDocumentValidation": true
+      },
+      "expect_result": {
+        "ok": 1.0,
+        "n": 1,
+        "nModified": 1
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "findAndModify": "$$collection",
+        "query": {
+          "_id": "u1"
+        },
+        "update": {
+          "$set": {
+            "profile": {}
+          }
+        },
+        "new": true
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 121,
+        "contains": "Document failed validation"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "findAndModify": "$$collection",
+        "query": {
+          "_id": "u1"
+        },
+        "update": {
+          "$set": {
+            "profile": {}
+          }
+        },
+        "new": true,
+        "bypassDocumentValidation": true
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "collMod": "$$collection",
+        "validator": {}
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "insert_one",
+      "document": {
+        "_id": "bad2",
+        "age": 2
+      },
+      "expect_result": {
+        "inserted_id": "bad2"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "collMod": "missing",
+        "validator": {}
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 26,
+        "contains": "collection does not exist"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "bad1",
+      "age": "old"
+    },
+    {
+      "_id": "bad2",
+      "age": 2
+    },
+    {
+      "_id": "u1",
+      "name": 5,
+      "profile": {}
+    }
+  ]
+}

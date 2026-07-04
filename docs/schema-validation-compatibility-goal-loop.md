@@ -143,7 +143,7 @@ When a milestone is complete:
 - [x] Milestone 0: Catalog metadata and validator parser
 - [x] Milestone 1: Create/listCollections/collMod validation metadata
 - [x] Milestone 2: Insert/update/findAndModify enforcement and bypass
-- [ ] Milestone 3: PyMongo e2e, spec corpus, docs, and final hardening
+- [x] Milestone 3: PyMongo e2e, spec corpus, docs, and final hardening
 
 ## Milestone 0: Catalog Metadata and Validator Parser
 
@@ -188,7 +188,7 @@ Commit requirement:
 
 Status:
 
-- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validator`, `cargo test`, and `cargo build`. All passed. Commit hash reported after commit.
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validator`, `cargo test`, and `cargo build`. All passed. Commit: `2d0978b`.
 
 ## Milestone 1: Create, listCollections, and collMod Validation Metadata
 
@@ -239,7 +239,7 @@ Commit requirement:
 
 Status:
 
-- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. `cargo fmt -- --check`, `cargo test validation`, `cargo build`, and `cargo test` passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit hash reported after commit.
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. `cargo fmt -- --check`, `cargo test validation`, `cargo build`, and `cargo test` passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit: `a491924`.
 
 ## Milestone 2: Write Enforcement and bypassDocumentValidation
 
@@ -293,7 +293,7 @@ Commit requirement:
 
 Status:
 
-- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo test unique`, `cargo test find_and_modify`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. Formatter, targeted Rust tests, build, and full Rust tests passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit hash reported after commit.
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo test unique`, `cargo test find_and_modify`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. Formatter, targeted Rust tests, build, and full Rust tests passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit: `545aa43`.
 
 ## Milestone 3: PyMongo e2e, Spec Corpus, Docs, and Final Hardening
 
@@ -348,6 +348,10 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`, and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked python -m json.tool tests/spec_corpus/schema_validation.json`. Formatter, Rust tests, Rust build, uv lock check, uv sync, and JSON parsing passed. The full PyMongo e2e command collected 101 items but failed in the sandbox on `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit hash reported after commit.
 
 ## Final Response Requirements
 
