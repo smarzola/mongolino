@@ -13,6 +13,7 @@ const OP_REPLY: i32 = 1;
 const OP_QUERY: i32 = 2004;
 const OP_MSG: i32 = 2013;
 const MAX_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
+const DOCUMENT_VALIDATION_ERROR_CODE: i32 = 121;
 
 static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -247,6 +248,25 @@ fn init_document_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_documents_namespace_created
             ON documents(namespace, created_at);
         "#,
+    )?;
+    migrate_collection_options_column(conn)?;
+    Ok(())
+}
+
+fn migrate_collection_options_column(conn: &Connection) -> Result<()> {
+    let has_options_bson = conn
+        .prepare("PRAGMA table_info(collections)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == "options_bson");
+
+    if !has_options_bson {
+        conn.execute("ALTER TABLE collections ADD COLUMN options_bson BLOB", [])?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(name) VALUES (?1)",
+        params!["collection_options_bson"],
     )?;
     Ok(())
 }
@@ -1877,6 +1897,349 @@ fn indexes_for_namespace_tx(
 
 fn sql_string_error(err: MongolinoError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+}
+
+#[derive(Clone, Debug)]
+struct CollectionOptions {
+    document: Document,
+    validator: Option<JsonSchemaValidator>,
+}
+
+impl CollectionOptions {
+    fn empty() -> Self {
+        Self {
+            document: Document::new(),
+            validator: None,
+        }
+    }
+}
+
+fn parse_collection_options(options: Document) -> std::result::Result<CollectionOptions, String> {
+    let validator = match options.get("validator") {
+        None => None,
+        Some(Bson::Document(validator)) if validator.is_empty() => None,
+        Some(Bson::Document(validator)) => Some(JsonSchemaValidator::parse(validator)?),
+        Some(_) => return Err("validator must be a document".to_string()),
+    };
+    match options.get("validationLevel") {
+        None => {}
+        Some(Bson::String(value)) if value == "strict" => {}
+        Some(Bson::String(value)) => {
+            return Err(format!("validationLevel {value} is not supported"));
+        }
+        Some(_) => return Err("validationLevel must be a string".to_string()),
+    }
+    match options.get("validationAction") {
+        None => {}
+        Some(Bson::String(value)) if value == "error" => {}
+        Some(Bson::String(value)) => {
+            return Err(format!("validationAction {value} is not supported"));
+        }
+        Some(_) => return Err("validationAction must be a string".to_string()),
+    }
+    Ok(CollectionOptions {
+        document: options,
+        validator,
+    })
+}
+
+fn collection_options(conn: &Connection, namespace: &str) -> Result<CollectionOptions> {
+    let Some(bytes) = conn
+        .query_row(
+            "SELECT options_bson FROM collections WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten()
+    else {
+        return Ok(CollectionOptions::empty());
+    };
+    parse_collection_options(decode_document(bytes)?).map_err(MongolinoError::Protocol)
+}
+
+fn collection_options_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<CollectionOptions> {
+    let Some(bytes) = tx
+        .query_row(
+            "SELECT options_bson FROM collections WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten()
+    else {
+        return Ok(CollectionOptions::empty());
+    };
+    parse_collection_options(decode_document(bytes)?).map_err(MongolinoError::Protocol)
+}
+
+fn collection_options_document(conn: &Connection, namespace: &str) -> Result<Document> {
+    Ok(collection_options(conn, namespace)?.document)
+}
+
+fn set_collection_options_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    options: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    let encoded = if options.is_empty() {
+        None
+    } else {
+        Some(encode_document(options)?)
+    };
+    tx.execute(
+        "UPDATE collections SET options_bson = ?1 WHERE namespace = ?2",
+        params![encoded, namespace],
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct JsonSchemaValidator {
+    root: SchemaNode,
+}
+
+impl JsonSchemaValidator {
+    fn parse(validator: &Document) -> std::result::Result<Self, String> {
+        if validator.len() != 1 {
+            return Err("validator only supports a single $jsonSchema document".to_string());
+        }
+        let schema = validator
+            .get_document("$jsonSchema")
+            .map_err(|_| "validator requires a $jsonSchema document".to_string())?;
+        let root = SchemaNode::parse(schema, "$jsonSchema", true)?;
+        if !root.bson_types.contains(&BsonTypeName::Object) {
+            return Err("$jsonSchema.bsonType must be object".to_string());
+        }
+        Ok(Self { root })
+    }
+
+    fn validate(&self, document: &Document) -> std::result::Result<(), String> {
+        self.root.validate_document(document, "$root")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SchemaNode {
+    bson_types: Vec<BsonTypeName>,
+    required: Vec<String>,
+    properties: HashMap<String, SchemaNode>,
+}
+
+impl SchemaNode {
+    fn parse(schema: &Document, path: &str, root: bool) -> std::result::Result<Self, String> {
+        if schema.is_empty() {
+            return Err(format!("{path} schema must not be empty"));
+        }
+        for key in schema.keys() {
+            if !["bsonType", "required", "properties"].contains(&key.as_str()) {
+                return Err(format!("{path}.{key} is not supported"));
+            }
+        }
+        let bson_types = match schema.get("bsonType") {
+            Some(value) => parse_bson_type_set(value, &format!("{path}.bsonType"))?,
+            None => return Err(format!("{path}.bsonType is required")),
+        };
+        if root && bson_types != vec![BsonTypeName::Object] {
+            return Err("$jsonSchema.bsonType must be object".to_string());
+        }
+        let required = match schema.get("required") {
+            None => Vec::new(),
+            Some(value) => parse_required(value, &format!("{path}.required"))?,
+        };
+        let properties = match schema.get("properties") {
+            None => HashMap::new(),
+            Some(Bson::Document(properties)) => {
+                let mut parsed = HashMap::new();
+                for (field, property_schema) in properties {
+                    if field.is_empty() || field.contains('.') {
+                        return Err(format!(
+                            "{path}.properties field names must be non-empty and must not contain dots"
+                        ));
+                    }
+                    let Bson::Document(property_schema) = property_schema else {
+                        return Err(format!("{path}.properties.{field} must be a document"));
+                    };
+                    parsed.insert(
+                        field.to_string(),
+                        SchemaNode::parse(
+                            property_schema,
+                            &format!("{path}.properties.{field}"),
+                            false,
+                        )?,
+                    );
+                }
+                parsed
+            }
+            Some(_) => return Err(format!("{path}.properties must be a document")),
+        };
+        if (!required.is_empty() || !properties.is_empty())
+            && !bson_types.contains(&BsonTypeName::Object)
+        {
+            return Err(format!(
+                "{path} required/properties are only supported for object schemas"
+            ));
+        }
+        Ok(Self {
+            bson_types,
+            required,
+            properties,
+        })
+    }
+
+    fn validate_bson(&self, value: &Bson, path: &str) -> std::result::Result<(), String> {
+        if !self
+            .bson_types
+            .iter()
+            .any(|expected| expected.matches(value))
+        {
+            return Err(format!(
+                "Document failed validation: {path} must be {}",
+                self.bson_types
+                    .iter()
+                    .map(BsonTypeName::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ));
+        }
+        if let Bson::Document(document) = value {
+            self.validate_document(document, path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_document(
+        &self,
+        document: &Document,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        for field in &self.required {
+            if !document.contains_key(field) {
+                return Err(format!(
+                    "Document failed validation: {path}.{field} is required"
+                ));
+            }
+        }
+        for (field, schema) in &self.properties {
+            if let Some(value) = document.get(field) {
+                schema.validate_bson(value, &format!("{path}.{field}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BsonTypeName {
+    Object,
+    Array,
+    String,
+    Int,
+    Long,
+    Double,
+    Number,
+    Bool,
+    ObjectId,
+    Date,
+    Null,
+}
+
+impl BsonTypeName {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "object" => Self::Object,
+            "array" => Self::Array,
+            "string" => Self::String,
+            "int" => Self::Int,
+            "long" => Self::Long,
+            "double" => Self::Double,
+            "number" => Self::Number,
+            "bool" => Self::Bool,
+            "objectId" => Self::ObjectId,
+            "date" => Self::Date,
+            "null" => Self::Null,
+            _ => return None,
+        })
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::String => "string",
+            Self::Int => "int",
+            Self::Long => "long",
+            Self::Double => "double",
+            Self::Number => "number",
+            Self::Bool => "bool",
+            Self::ObjectId => "objectId",
+            Self::Date => "date",
+            Self::Null => "null",
+        }
+    }
+
+    fn matches(&self, value: &Bson) -> bool {
+        match self {
+            Self::Object => matches!(value, Bson::Document(_)),
+            Self::Array => matches!(value, Bson::Array(_)),
+            Self::String => matches!(value, Bson::String(_)),
+            Self::Int => matches!(value, Bson::Int32(_)),
+            Self::Long => matches!(value, Bson::Int64(_)),
+            Self::Double => matches!(value, Bson::Double(_)),
+            Self::Number => matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)),
+            Self::Bool => matches!(value, Bson::Boolean(_)),
+            Self::ObjectId => matches!(value, Bson::ObjectId(_)),
+            Self::Date => matches!(value, Bson::DateTime(_)),
+            Self::Null => matches!(value, Bson::Null),
+        }
+    }
+}
+
+fn parse_bson_type_set(value: &Bson, path: &str) -> std::result::Result<Vec<BsonTypeName>, String> {
+    let values = match value {
+        Bson::String(value) => vec![value.as_str()],
+        Bson::Array(values) if !values.is_empty() => values
+            .iter()
+            .map(|value| match value {
+                Bson::String(value) => Ok(value.as_str()),
+                _ => Err(format!("{path} array values must be strings")),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        Bson::Array(_) => return Err(format!("{path} array must not be empty")),
+        _ => return Err(format!("{path} must be a string or array of strings")),
+    };
+    let mut parsed = Vec::new();
+    for value in values {
+        let Some(kind) = BsonTypeName::parse(value) else {
+            return Err(format!("{path} value {value} is not supported"));
+        };
+        if !parsed.contains(&kind) {
+            parsed.push(kind);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_required(value: &Bson, path: &str) -> std::result::Result<Vec<String>, String> {
+    let Bson::Array(values) = value else {
+        return Err(format!("{path} must be an array"));
+    };
+    let mut required = Vec::new();
+    for value in values {
+        let Bson::String(field) = value else {
+            return Err(format!("{path} values must be strings"));
+        };
+        if field.is_empty() {
+            return Err(format!("{path} values must be non-empty strings"));
+        }
+        if !required.contains(field) {
+            required.push(field.to_string());
+        }
+    }
+    Ok(required)
 }
 
 fn insert_collection_catalog(
@@ -4247,6 +4610,129 @@ mod tests {
             .unwrap();
 
         assert_eq!(migrations_table, "schema_migrations");
+    }
+
+    #[test]
+    fn validator_migration_adds_missing_collection_options_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE collections (
+                namespace TEXT PRIMARY KEY,
+                db TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )
+        .unwrap();
+
+        init_connection(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(collections)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.contains(&"options_bson".to_string()));
+        let migration: String = conn
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE name = 'collection_options_bson'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration, "collection_options_bson");
+    }
+
+    #[test]
+    fn validator_parser_accepts_supported_json_schema_subset() {
+        let validator = JsonSchemaValidator::parse(&doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name", "profile"],
+                "properties": {
+                    "name": { "bsonType": "string" },
+                    "score": { "bsonType": ["int", "long", "double"] },
+                    "total": { "bsonType": "number" },
+                    "profile": {
+                        "bsonType": "object",
+                        "required": ["city"],
+                        "properties": {
+                            "city": { "bsonType": "string" },
+                            "verified": { "bsonType": "bool" }
+                        }
+                    }
+                }
+            }
+        })
+        .unwrap();
+
+        validator
+            .validate(&doc! {
+                "name": "Ada",
+                "score": 1_i64,
+                "total": 2.5,
+                "profile": { "city": "London", "verified": true }
+            })
+            .unwrap();
+        let err = validator
+            .validate(&doc! { "name": "Ada", "profile": {} })
+            .unwrap_err();
+        assert!(err.contains("$root.profile.city is required"));
+        let err = validator
+            .validate(&doc! { "name": "Ada", "profile": { "city": "London" }, "total": "2" })
+            .unwrap_err();
+        assert!(err.contains("$root.total must be number"));
+    }
+
+    #[test]
+    fn validator_parser_rejects_unsupported_shapes() {
+        for validator in [
+            doc! {},
+            doc! { "$jsonSchema": { "bsonType": "array" } },
+            doc! { "$jsonSchema": { "bsonType": "object", "additionalProperties": false } },
+            doc! { "$jsonSchema": { "bsonType": "object", "required": "name" } },
+            doc! { "$jsonSchema": { "bsonType": "object", "required": [""] } },
+            doc! { "$jsonSchema": { "bsonType": "object", "properties": [] } },
+            doc! { "$jsonSchema": { "bsonType": "object", "properties": { "profile.city": { "bsonType": "string" } } } },
+            doc! { "$jsonSchema": { "bsonType": "object", "properties": { "tags": { "bsonType": "array", "items": { "bsonType": "string" } } } } },
+            doc! { "$jsonSchema": { "bsonType": "object", "properties": { "age": { "bsonType": "decimal" } } } },
+        ] {
+            assert!(JsonSchemaValidator::parse(&validator).is_err());
+        }
+    }
+
+    #[test]
+    fn validator_collection_options_roundtrip_from_connection_and_transaction() {
+        let conn = test_conn();
+        let ns = namespace("app", "users");
+        insert_collection_catalog(&conn, "app", "users").unwrap();
+        let options = doc! {
+            "validator": {
+                "$jsonSchema": {
+                    "bsonType": "object",
+                    "required": ["name"],
+                    "properties": { "name": { "bsonType": "string" } }
+                }
+            },
+            "validationLevel": "strict",
+            "validationAction": "error",
+        };
+        parse_collection_options(options.clone()).unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        set_collection_options_tx(&tx, &ns, &options).unwrap();
+        let tx_options = collection_options_tx(&tx, &ns).unwrap();
+        assert_eq!(tx_options.document, options);
+        assert!(tx_options.validator.is_some());
+        tx.commit().unwrap();
+
+        let loaded = collection_options(&conn, &ns).unwrap();
+        assert_eq!(loaded.document, options);
+        assert!(loaded.validator.is_some());
     }
 
     #[test]

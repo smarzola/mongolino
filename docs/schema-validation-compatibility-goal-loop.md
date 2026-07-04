@@ -140,7 +140,7 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Catalog metadata and validator parser
+- [x] Milestone 0: Catalog metadata and validator parser
 - [ ] Milestone 1: Create/listCollections/collMod validation metadata
 - [ ] Milestone 2: Insert/update/findAndModify enforcement and bypass
 - [ ] Milestone 3: PyMongo e2e, spec corpus, docs, and final hardening
@@ -185,6 +185,10 @@ cargo build
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validator`, `cargo test`, and `cargo build`. All passed. Commit hash reported after commit.
 
 ## Milestone 1: Create, listCollections, and collMod Validation Metadata
 
