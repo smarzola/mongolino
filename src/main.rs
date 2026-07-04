@@ -2507,8 +2507,8 @@ fn get_more(client_state: &mut ClientState, command: &Document) -> Result<Docume
         _ => return Ok(command_error(9, "getMore requires a collection name")),
     };
     let batch_size = match optional_i64(command, "batchSize") {
-        Ok(Some(value)) if value < 0 => {
-            return Ok(command_error(9, "batchSize must be non-negative"));
+        Ok(Some(value)) if value <= 0 => {
+            return Ok(command_error(9, "batchSize must be positive"));
         }
         Ok(Some(value)) => value.min(1000) as usize,
         Ok(None) => 101,
@@ -3580,6 +3580,44 @@ mod tests {
     }
 
     #[test]
+    fn get_more_rejects_zero_batch_size_without_consuming_cursor() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 }, "batchSize": 1_i32 },
+        )
+        .unwrap();
+        let id = cursor_id(&response);
+        assert!(id > 0);
+
+        let zero_batch = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "users", "$db": "app", "batchSize": 0_i32 },
+        )
+        .unwrap();
+        assert_command_error(&zero_batch);
+        assert_eq!(zero_batch.get_i32("code").unwrap(), 9);
+        assert!(client_state.cursors.contains_key(&id));
+
+        let final_batch = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "users", "$db": "app", "batchSize": 10_i32 },
+        )
+        .unwrap();
+        let ids = next_batch(&final_batch)
+            .iter()
+            .map(|document| document.get_str("_id").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["u2", "u3"]);
+        assert_eq!(cursor_id(&final_batch), 0);
+        assert!(client_state.cursors.is_empty());
+    }
+
+    #[test]
     fn get_more_rejects_malformed_requests() {
         let mut client_state = ClientState::default();
 
@@ -3588,7 +3626,10 @@ mod tests {
             doc! { "getMore": -1_i64, "collection": "users", "$db": "app" },
             doc! { "getMore": 1_i64, "$db": "app" },
             doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "batchSize": -1_i32 },
+            doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "batchSize": 0_i32 },
+            doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "batchSize": 1.5 },
             doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "comment": "nope" },
+            doc! { "getMore": 999_i64, "collection": "users", "$db": "app" },
         ] {
             let response = get_more(&mut client_state, &command).unwrap();
             assert_command_error(&response);
@@ -3809,13 +3850,30 @@ mod tests {
     }
 
     #[test]
-    fn drop_collection_removes_documents_and_catalog_entry() {
+    fn drop_collection_removes_documents_catalog_and_index_state() {
         let conn = test_conn();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1" }] },
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "name": "Ada" }] },
         )
         .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_1" }],
+            },
+        )
+        .unwrap();
+        let entries_before_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries_before_drop, 1);
 
         let response = drop_collection(&conn, &doc! { "drop": "users", "$db": "app" }).unwrap();
         assert_eq!(response.get_f64("ok").unwrap(), 1.0);
@@ -3830,6 +3888,22 @@ mod tests {
             )
             .is_empty()
         );
+        let indexes_after_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM indexes WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entries_after_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes_after_drop, 0);
+        assert_eq!(entries_after_drop, 0);
     }
 
     #[test]

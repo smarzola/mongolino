@@ -51,7 +51,7 @@ Compatibility flags:
 | `endSessions` | Stub | Returns `{ ok: 1.0 }`. | Sessions are not stored, validated, expired, or attached to operations. |
 | `create` | Partial | Creates a durable empty collection catalog entry. | Collection options such as validators, capped collections, clustered indexes, timeseries, and collation are unsupported. |
 | `listCollections` | Partial | Lists durable catalog entries and legacy document-only namespaces, with `nameOnly` and simple `name` equality filters. | Size/details are minimal; complex filters and collection metadata options are unsupported. |
-| `drop` | Partial | Drops a collection by removing its documents and catalog entry. | Index cleanup will become relevant once user indexes exist. |
+| `drop` | Partial | Drops a collection by removing its documents, catalog entry, user index metadata, and maintained index entries. | No view, change-stream, or storage-stat side effects. |
 | `dropDatabase` | Partial | Drops catalog entries and documents for the selected database only. | No users, roles, profiling collections, or storage statistics. |
 | `count` | Partial | Counts documents matching the supported filter subset, with `skip` and `limit`. PyMongo `estimated_document_count()` uses this path. | No hint, collation, read concern, maxTimeMS, or storage-stat semantics. |
 | `aggregate` | Partial | Supports only the PyMongo `count_documents()` pipeline shape: `$match`, optional `$skip`/`$limit`, and count `$group`. | General aggregation stages return command errors. |

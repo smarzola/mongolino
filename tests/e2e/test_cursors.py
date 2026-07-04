@@ -77,6 +77,26 @@ def test_get_more_after_kill_is_explicit_operation_failure(collection):
     assert "cursor not found" in str(excinfo.value)
 
 
+def test_get_more_zero_batch_size_is_explicit_operation_failure(collection):
+    seed(collection)
+    cursor_id = open_cursor(collection)
+
+    with pytest.raises(OperationFailure) as excinfo:
+        collection.database.command(
+            {"getMore": cursor_id, "collection": collection.name, "batchSize": 0}
+        )
+
+    assert excinfo.value.code == 9
+    assert "batchSize must be positive" in str(excinfo.value)
+
+    next_batch = collection.database.command(
+        {"getMore": cursor_id, "collection": collection.name, "batchSize": 10}
+    )
+    cursor = next_batch["cursor"]
+    assert cursor["id"] == 0
+    assert [doc["_id"] for doc in cursor["nextBatch"]] == ["u2", "u3"]
+
+
 def test_pymongo_cursor_close_is_sane(collection):
     seed(collection)
     cursor = collection.find({}).sort("_id", 1).batch_size(1)
