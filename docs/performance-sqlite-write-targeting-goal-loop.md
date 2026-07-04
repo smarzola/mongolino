@@ -96,7 +96,7 @@ When a milestone is complete:
 - [x] Milestone 0: Transaction candidate planner
 - [x] Milestone 1: Update/delete target narrowing
 - [x] Milestone 2: findAndModify target narrowing
-- [ ] Milestone 3: Unique conflict check pushdown
+- [x] Milestone 3: Unique conflict check pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Transaction Candidate Planner
@@ -211,7 +211,7 @@ update/delete/replace, and fallback findAndModify filters. Verification passed:
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
 tests/e2e/test_find_and_modify.py` (unsandboxed after sandbox localhost bind
 denial), `cargo test`, and extra `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
-uv run --locked pytest tests/e2e/test_spec_corpus.py`. Commit: pending.
+uv run --locked pytest tests/e2e/test_spec_corpus.py`. Commit: `cdadde3`.
 
 Likely files:
 
@@ -245,6 +245,16 @@ Acceptance criteria:
 - Duplicate-key error codes and messages remain compatible with existing tests.
 - Add tests for insert, update, upsert, and findAndModify duplicate conflicts through the pushed-down path.
 - Milestone status is marked done in this file and committed.
+
+Status 2026-07-04: Done. Single-field unique indexes with present non-null
+scalar values use `index_entries` for conflict lookup while excluding the
+current document on updates. Compound indexes, missing/null values, arrays,
+document values, and multikey shapes retain the scan fallback. Verification
+passed: `cargo fmt -- --check`, `cargo test unique`, `cargo test update`,
+`cargo test find_and_modify`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv
+run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py
+tests/e2e/test_update_operators.py` (unsandboxed), and `cargo test`. Commit:
+pending.
 
 Likely files:
 

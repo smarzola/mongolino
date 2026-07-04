@@ -2657,6 +2657,15 @@ fn ensure_unique_constraints_tx(
     }
 
     for index in indexes {
+        if unique_conflict_check_with_index_entries_tx(
+            tx,
+            namespace,
+            &index,
+            document,
+            excluding_id_key,
+        )? {
+            continue;
+        }
         let wanted_key = unique_key_for_document(&index, document)?;
         for stored in
             stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?
@@ -2674,6 +2683,62 @@ fn ensure_unique_constraints_tx(
         }
     }
     Ok(())
+}
+
+fn unique_conflict_check_with_index_entries_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    index: &IndexSpec,
+    document: &Document,
+    excluding_id_key: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let Some(field) = single_field_index_name(index) else {
+        return Ok(false);
+    };
+    let values = values_at_path(document, field);
+    let value = match values.as_slice() {
+        [value] if is_unique_pushdown_scalar(value) => *value,
+        _ => return Ok(false),
+    };
+    let key_value = id_key_from_bson(value);
+    let conflict = tx
+        .query_row(
+            r#"
+            SELECT id_key
+              FROM index_entries
+             WHERE namespace = ?1
+               AND index_name = ?2
+               AND key_value = ?3
+               AND (?4 IS NULL OR id_key != ?4)
+             ORDER BY id_key
+             LIMIT 1
+            "#,
+            params![namespace, index.name, key_value, excluding_id_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    if conflict.is_some() {
+        let wanted_key = unique_key_for_document(index, document)?;
+        return Err(format!(
+            "duplicate key error collection: {namespace} index: {} dup key: {wanted_key}",
+            index.name
+        ));
+    }
+    Ok(true)
+}
+
+fn is_unique_pushdown_scalar(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::Double(_)
+            | Bson::String(_)
+            | Bson::Boolean(_)
+            | Bson::ObjectId(_)
+            | Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::DateTime(_)
+    )
 }
 
 fn unique_key_for_document(
@@ -8803,6 +8868,102 @@ mod tests {
             write_errors(&duplicate_upsert)[0].get_i32("code").unwrap(),
             11000
         );
+    }
+
+    #[test]
+    fn unique_conflict_pushdown_uses_index_entries_for_safe_single_field_scalars() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "ada@example.test", "rank": 1_i32 },
+                    { "_id": "u2", "email": "grace@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
+                    { "key": { "rank": 1_i32 }, "name": "rank_1", "unique": true },
+                    { "key": { "email": 1_i32, "rank": 1_i32 }, "name": "compound_1", "unique": true }
+                ],
+            },
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let email = index_by_name_tx(&tx, "app.users", "email_1")
+            .unwrap()
+            .unwrap();
+        let rank = index_by_name_tx(&tx, "app.users", "rank_1")
+            .unwrap()
+            .unwrap();
+        let compound = index_by_name_tx(&tx, "app.users", "compound_1")
+            .unwrap()
+            .unwrap();
+
+        let conflict = unique_conflict_check_with_index_entries_tx(
+            &tx,
+            "app.users",
+            &email,
+            &doc! { "_id": "u3", "email": "ada@example.test" },
+            None,
+        )
+        .unwrap_err();
+        assert!(conflict.contains("duplicate key error"));
+        assert!(
+            unique_conflict_check_with_index_entries_tx(
+                &tx,
+                "app.users",
+                &email,
+                &doc! { "_id": "u1", "email": "ada@example.test" },
+                Some("str:u1"),
+            )
+            .unwrap()
+        );
+        assert!(
+            unique_conflict_check_with_index_entries_tx(
+                &tx,
+                "app.users",
+                &rank,
+                &doc! { "_id": "u3", "rank": 2_i32 },
+                None,
+            )
+            .unwrap()
+        );
+
+        for (index, document) in [
+            (&email, doc! { "_id": "missing" }),
+            (&email, doc! { "_id": "null", "email": Bson::Null }),
+            (&email, doc! { "_id": "array", "email": ["a@example.test"] }),
+            (
+                &email,
+                doc! { "_id": "document", "email": { "nested": true } },
+            ),
+            (
+                &compound,
+                doc! { "_id": "compound", "email": "ada@example.test", "rank": 1_i32 },
+            ),
+        ] {
+            assert!(
+                !unique_conflict_check_with_index_entries_tx(
+                    &tx,
+                    "app.users",
+                    index,
+                    &document,
+                    None
+                )
+                .unwrap()
+            );
+        }
     }
 
     #[test]

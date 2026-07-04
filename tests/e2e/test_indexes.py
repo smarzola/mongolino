@@ -108,6 +108,23 @@ def test_unique_index_enforces_insert_update_and_upsert(collection):
     assert collection.find_one({"_id": "u4"}) is None
 
 
+def test_unique_index_missing_and_null_fallback_semantics(collection):
+    collection.insert_one({"_id": "u1", "name": "missing"})
+    collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u2", "email": None})
+
+    collection.delete_one({"_id": "u1"})
+    collection.insert_one({"_id": "u3", "email": None})
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u4"}, {"$set": {"name": "missing"}}, upsert=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u4"}, {"$set": {"email": None}}, upsert=True)
+
+
 def test_unique_unordered_bulk_partial_success_and_drop_index(collection):
     collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
 
