@@ -170,7 +170,7 @@ When a milestone is complete:
 - [x] Milestone 1: Equality-prefix candidate narrowing
 - [x] Milestone 2: Safe range scans and count pushdown
 - [x] Milestone 3: Hint command semantics
-- [ ] Milestone 4: Explain diagnostics
+- [x] Milestone 4: Explain diagnostics
 - [ ] Milestone 5: Sort-aware read planning
 - [ ] Milestone 6: Benchmarks, docs, final e2e verification
 
@@ -452,6 +452,17 @@ cargo test explain
 cargo test planner
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py
 ```
+
+Status 2026-07-04: Added partial `explain: true` support for `find` and
+`count`, returning stable `queryPlanner` diagnostics for collection scan, `_id`,
+exact index equality, equality-prefix, range, hinted plans, and fallback
+reasons while keeping aggregate/update/delete/findAndModify explain paths
+explicitly unsupported. Verification passed with `cargo fmt -- --check`,
+`cargo test explain`, `cargo test planner`, `cargo build`, and unsandboxed
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py` because the sandboxed
+e2e path cannot bind localhost. Commit: reported in goal-loop status after
+commit creation.
 
 ## Milestone 5: Sort-Aware Read Planning
 

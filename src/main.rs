@@ -893,7 +893,9 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     };
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
-        &["count", "query", "skip", "limit", "hint", "$db", "lsid"],
+        &[
+            "count", "query", "skip", "limit", "hint", "explain", "$db", "lsid",
+        ],
     ) {
         return Ok(command_error(72, &errmsg));
     }
@@ -914,6 +916,10 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
         Ok(Some(value)) => Some(value as usize),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
+    let explain = match optional_bool(command, "explain") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
 
     let ns = namespace(db, collection);
     let hint = match parse_optional_hint(command) {
@@ -924,6 +930,18 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
         Ok(None) => None,
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
+    if explain {
+        return match planner_v2_plan_for_count(conn, &ns, &filter, hint.as_ref()) {
+            Ok(plan) => Ok(explain_response(
+                "count",
+                &ns,
+                &filter,
+                hint.is_some(),
+                &plan,
+            )),
+            Err(errmsg) => Ok(command_error(2, &errmsg)),
+        };
+    }
     let count = if let Some(hint) = hint.as_ref() {
         let documents = match candidate_documents_with_hint(conn, &ns, &filter, Some(hint)) {
             Ok(documents) => documents,
@@ -2569,6 +2587,313 @@ fn planner_v2_plan_for_filter(indexes: Vec<IndexSpec>, filter: &Document) -> Pla
     }
 
     collection_scan_plan(fallback_reason)
+}
+
+fn planner_v2_plan_for_query(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<PlannerV2Plan, String> {
+    if let Some(hint) = hint {
+        return hinted_planner_v2_plan(conn, namespace, filter, hint);
+    }
+    if filter.is_empty() {
+        return Ok(collection_scan_plan("empty filter"));
+    }
+    if let Some(value) = exact_equality_filter_value(filter, "_id") {
+        return Ok(PlannerV2Plan::IdEquality {
+            id_key: id_key_from_bson(value),
+            diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+        });
+    }
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return Ok(collection_scan_plan(
+            "top-level logical filters are not index-planned",
+        ));
+    }
+
+    let mut fallback_reason = "no compatible index".to_string();
+    for index in
+        planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
+    {
+        if !filter_implies_index_membership(&index, filter) {
+            fallback_reason = format!(
+                "filter does not safely imply index {} membership",
+                index.name
+            );
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)
+            .map_err(|err| err.to_string())?
+        {
+            fallback_reason = format!("index {} has unsupported multikey omissions", index.name);
+            continue;
+        }
+        if let Some(plan) = planner_v2_plan_for_index_shape(&index, filter) {
+            return Ok(plan);
+        }
+        fallback_reason = format!(
+            "index {} does not match supported exact, prefix, or range shapes",
+            index.name
+        );
+    }
+    Ok(collection_scan_plan(fallback_reason))
+}
+
+fn planner_v2_plan_for_count(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<PlannerV2Plan, String> {
+    if hint.is_some() {
+        return planner_v2_plan_for_query(conn, namespace, filter, hint);
+    }
+    if filter.is_empty() {
+        return Ok(collection_scan_plan("empty filter"));
+    }
+    if let Some(value) = exact_equality_filter_value(filter, "_id") {
+        return Ok(PlannerV2Plan::IdEquality {
+            id_key: id_key_from_bson(value),
+            diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+        });
+    }
+    for index in
+        planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
+    {
+        let Some(key_value) = planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter)
+            || !count_filter_covered_by_index(&index, filter)
+        {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+        return Ok(PlannerV2Plan::IndexExactEquality {
+            index_name: index.name.clone(),
+            index_key: index.key.clone(),
+            key_value,
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexExactEquality,
+                Some(&index),
+                true,
+                None,
+            ),
+        });
+    }
+    for index in
+        planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
+    {
+        let Some(range) = range_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter)
+            || !count_filter_covered_by_range_index(&index, filter, &range)
+        {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+        return Ok(PlannerV2Plan::IndexRange {
+            index_name: index.name.clone(),
+            index_key: index.key.clone(),
+            range,
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexRange,
+                Some(&index),
+                true,
+                None,
+            ),
+        });
+    }
+    Ok(collection_scan_plan(
+        "count filter is not fully covered by a supported index",
+    ))
+}
+
+fn hinted_planner_v2_plan(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    hint: &ResolvedHint,
+) -> std::result::Result<PlannerV2Plan, String> {
+    match hint {
+        ResolvedHint::Id => {
+            let Some(value) = exact_equality_filter_value(filter, "_id") else {
+                return Err("hint _id_ is incompatible with this filter".to_string());
+            };
+            Ok(PlannerV2Plan::IdEquality {
+                id_key: id_key_from_bson(value),
+                diagnostic: planner_diagnostic(PlannerScanStrategy::IdExact, None, true, None),
+            })
+        }
+        ResolvedHint::Index(index) => {
+            if !filter_implies_index_membership(index, filter) {
+                return Err(format!(
+                    "hint index {} is unsafe for this filter membership",
+                    index.name
+                ));
+            }
+            if !index_entries_safe_for_planner(conn, namespace, &index.name)
+                .map_err(|err| err.to_string())?
+            {
+                return Err(format!(
+                    "hint index {} has unsupported multikey omissions",
+                    index.name
+                ));
+            }
+            planner_v2_plan_for_index_shape(index, filter).ok_or_else(|| {
+                format!("hint index {} is incompatible with this filter", index.name)
+            })
+        }
+    }
+}
+
+fn planner_v2_plan_for_index_shape(index: &IndexSpec, filter: &Document) -> Option<PlannerV2Plan> {
+    if let Some(key_value) = planner_key_for_filter(index, filter) {
+        return Some(PlannerV2Plan::IndexExactEquality {
+            index_name: index.name.clone(),
+            index_key: index.key.clone(),
+            key_value,
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexExactEquality,
+                Some(index),
+                true,
+                None,
+            ),
+        });
+    }
+    if let Some(range) = range_planner_key_for_filter(index, filter) {
+        return Some(PlannerV2Plan::IndexRange {
+            index_name: index.name.clone(),
+            index_key: index.key.clone(),
+            range,
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexRange,
+                Some(index),
+                true,
+                None,
+            ),
+        });
+    }
+    if let Some((prefix_len, key_value)) = prefix_planner_key_for_filter(index, filter) {
+        return Some(PlannerV2Plan::IndexEqualityPrefix {
+            index_name: index.name.clone(),
+            index_key: index.key.clone(),
+            prefix_len,
+            key_value,
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexEqualityPrefix,
+                Some(index),
+                true,
+                None,
+            ),
+        });
+    }
+    None
+}
+
+fn explain_response(
+    command_name: &str,
+    namespace: &str,
+    filter: &Document,
+    hint_provided: bool,
+    plan: &PlannerV2Plan,
+) -> Document {
+    let diagnostic = plan_diagnostic(plan);
+    doc! {
+        "queryPlanner": {
+            "namespace": namespace,
+            "command": command_name,
+            "parsedFilter": filter.clone(),
+            "hintProvided": hint_provided,
+            "matcherValidationRequired": diagnostic.matcher_validation_required,
+            "winningPlan": winning_plan_document(plan),
+        },
+        "ok": 1.0,
+    }
+}
+
+fn plan_diagnostic(plan: &PlannerV2Plan) -> &PlannerDiagnostic {
+    match plan {
+        PlannerV2Plan::CollectionScan { diagnostic }
+        | PlannerV2Plan::IdEquality { diagnostic, .. }
+        | PlannerV2Plan::IndexExactEquality { diagnostic, .. }
+        | PlannerV2Plan::IndexEqualityPrefix { diagnostic, .. }
+        | PlannerV2Plan::IndexRange { diagnostic, .. }
+        | PlannerV2Plan::IndexSort { diagnostic, .. } => diagnostic,
+    }
+}
+
+fn winning_plan_document(plan: &PlannerV2Plan) -> Document {
+    let diagnostic = plan_diagnostic(plan);
+    let mut document = doc! {
+        "stage": planner_stage(&diagnostic.scan_strategy),
+        "scanStrategy": planner_scan_strategy_name(&diagnostic.scan_strategy),
+    };
+    if let Some(index_name) = &diagnostic.index_name {
+        document.insert("indexName", index_name.clone());
+    }
+    if let Some(index_key) = &diagnostic.index_key {
+        document.insert("keyPattern", Bson::Document(index_key.clone()));
+    }
+    if let Some(fallback_reason) = &diagnostic.fallback_reason {
+        document.insert("fallbackReason", fallback_reason.clone());
+    }
+    match plan {
+        PlannerV2Plan::IdEquality { id_key, .. } => {
+            document.insert("idKey", id_key.clone());
+        }
+        PlannerV2Plan::IndexExactEquality { key_value, .. } => {
+            document.insert("plannerKey", key_value.clone());
+        }
+        PlannerV2Plan::IndexEqualityPrefix {
+            prefix_len,
+            key_value,
+            ..
+        } => {
+            document.insert("plannerKey", key_value.clone());
+            document.insert("prefixLen", *prefix_len as i32);
+        }
+        PlannerV2Plan::IndexRange { range, .. } => {
+            document.insert("rangeField", range.field.clone());
+            document.insert("equalityPrefixLen", range.equality_prefix_len as i32);
+            document.insert("keyPrefix", range.key_prefix.clone());
+        }
+        PlannerV2Plan::CollectionScan { .. } | PlannerV2Plan::IndexSort { .. } => {}
+    }
+    document
+}
+
+fn planner_stage(strategy: &PlannerScanStrategy) -> &'static str {
+    match strategy {
+        PlannerScanStrategy::CollectionScan => "COLLSCAN",
+        PlannerScanStrategy::IdExact => "IDHACK",
+        PlannerScanStrategy::IndexExactEquality
+        | PlannerScanStrategy::IndexEqualityPrefix
+        | PlannerScanStrategy::IndexRange
+        | PlannerScanStrategy::IndexSort => "IXSCAN",
+    }
+}
+
+fn planner_scan_strategy_name(strategy: &PlannerScanStrategy) -> &'static str {
+    match strategy {
+        PlannerScanStrategy::CollectionScan => "collectionScan",
+        PlannerScanStrategy::IdExact => "idExact",
+        PlannerScanStrategy::IndexExactEquality => "indexExactEquality",
+        PlannerScanStrategy::IndexEqualityPrefix => "indexEqualityPrefix",
+        PlannerScanStrategy::IndexRange => "indexRange",
+        PlannerScanStrategy::IndexSort => "indexSort",
+    }
 }
 
 fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<CountPlan> {
@@ -6156,6 +6481,7 @@ fn find_documents_with_state(
             "limit",
             "singleBatch",
             "hint",
+            "explain",
             "$db",
             "lsid",
         ],
@@ -6194,6 +6520,10 @@ fn find_documents_with_state(
         Ok(value) => value,
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
+    let explain = match optional_bool(command, "explain") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
     let ns = namespace(db, collection);
     let hint = match parse_optional_hint(command) {
         Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &ns)?, hint) {
@@ -6203,6 +6533,18 @@ fn find_documents_with_state(
         Ok(None) => None,
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
+    if explain {
+        return match planner_v2_plan_for_query(conn, &ns, &filter, hint.as_ref()) {
+            Ok(plan) => Ok(explain_response(
+                "find",
+                &ns,
+                &filter,
+                hint.is_some(),
+                &plan,
+            )),
+            Err(errmsg) => Ok(command_error(2, &errmsg)),
+        };
+    }
 
     if hint.is_none()
         && sort.is_none()
@@ -12603,6 +12945,192 @@ mod tests {
         assert_command_error(&bad_find_and_modify);
         assert_eq!(
             find_ids(&conn, doc! { "team": "bad-fam-hint" }),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn explain_reports_find_and_count_planner_diagnostics() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" },
+                    { "key": { "name": 1_i32 }, "name": "name_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let id_explain = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "_id": "u1" },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let id_plan = id_explain
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(id_plan.get_str("stage").unwrap(), "IDHACK");
+        assert_eq!(id_plan.get_str("scanStrategy").unwrap(), "idExact");
+
+        let exact_explain = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "Ada" },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let exact_plan = exact_explain
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(exact_plan.get_str("stage").unwrap(), "IXSCAN");
+        assert_eq!(
+            exact_plan.get_str("scanStrategy").unwrap(),
+            "indexExactEquality"
+        );
+        assert_eq!(exact_plan.get_str("indexName").unwrap(), "name_1");
+
+        let hinted_prefix = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "profile.city": "Rome" },
+                "hint": "city_active_1",
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let prefix_planner = hinted_prefix.get_document("queryPlanner").unwrap();
+        assert!(prefix_planner.get_bool("hintProvided").unwrap());
+        let prefix_plan = prefix_planner.get_document("winningPlan").unwrap();
+        assert_eq!(
+            prefix_plan.get_str("scanStrategy").unwrap(),
+            "indexEqualityPrefix"
+        );
+        assert_eq!(prefix_plan.get_i32("prefixLen").unwrap(), 1);
+
+        let range_count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "users",
+                "$db": "app",
+                "query": { "name": { "$gte": "G" } },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let range_plan = range_count
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(range_plan.get_str("scanStrategy").unwrap(), "indexRange");
+        assert_eq!(range_plan.get_str("indexName").unwrap(), "name_1");
+
+        let fallback_explain = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "$or": [{ "name": "Ada" }, { "name": "Grace" }] },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let fallback_plan = fallback_explain
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(fallback_plan.get_str("stage").unwrap(), "COLLSCAN");
+        assert_eq!(
+            fallback_plan.get_str("scanStrategy").unwrap(),
+            "collectionScan"
+        );
+        assert!(
+            fallback_plan
+                .get_str("fallbackReason")
+                .unwrap()
+                .contains("not index-planned")
+        );
+    }
+
+    #[test]
+    fn explain_validates_hints_and_unsupported_command_paths() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" }],
+            },
+        )
+        .unwrap();
+
+        let bad_hint = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "Ada" },
+                "hint": "city_active_1",
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_hint);
+        assert_eq!(bad_hint.get_i32("code").unwrap(), 2);
+
+        let bad_sort = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": {},
+                "sort": { "name": "asc" },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_sort);
+        assert_eq!(bad_sort.get_i32("code").unwrap(), 2);
+
+        let unsupported_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "name": "Ada" },
+                    "u": { "$set": { "team": "explain" } },
+                }],
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_command_error(&unsupported_update);
+        assert_eq!(unsupported_update.get_i32("code").unwrap(), 72);
+        assert_eq!(
+            find_ids(&conn, doc! { "team": "explain" }),
             Vec::<String>::new()
         );
     }

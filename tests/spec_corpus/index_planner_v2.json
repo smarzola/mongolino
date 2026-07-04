@@ -67,6 +67,42 @@
       ]
     },
     {
+      "name": "command",
+      "command": {
+        "find": "$$collection",
+        "filter": {
+          "account": "a"
+        },
+        "hint": "account_created_1",
+        "explain": true
+      },
+      "expect_path_values": [
+        {
+          "path": [
+            "queryPlanner",
+            "winningPlan",
+            "stage"
+          ],
+          "value": "IXSCAN"
+        },
+        {
+          "path": [
+            "queryPlanner",
+            "winningPlan",
+            "scanStrategy"
+          ],
+          "value": "indexEqualityPrefix"
+        },
+        {
+          "path": [
+            "queryPlanner",
+            "hintProvided"
+          ],
+          "value": true
+        }
+      ]
+    },
+    {
       "name": "count_documents",
       "filter": {
         "account": "a",
@@ -76,6 +112,53 @@
       },
       "expect_result": {
         "count": 2
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "count": "$$collection",
+        "query": {
+          "account": "a",
+          "created": {
+            "$gte": "2026-02-01"
+          }
+        },
+        "explain": true
+      },
+      "expect_path_values": [
+        {
+          "path": [
+            "queryPlanner",
+            "winningPlan",
+            "scanStrategy"
+          ],
+          "value": "indexRange"
+        },
+        {
+          "path": [
+            "queryPlanner",
+            "winningPlan",
+            "indexName"
+          ],
+          "value": "account_created_1"
+        }
+      ]
+    },
+    {
+      "name": "command",
+      "command": {
+        "find": "$$collection",
+        "filter": {
+          "state": "queued"
+        },
+        "hint": "account_created_1",
+        "explain": true
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 2,
+        "contains": "incompatible"
       }
     },
     {

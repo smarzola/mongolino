@@ -718,6 +718,66 @@ def test_hint_find_and_count_by_name_and_key_pattern(collection):
         list(collection.find({"name": "Ada"}).hint("city_active_1"))
 
 
+def test_find_and_count_explain_reports_planner_diagnostics(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "profile": {"city": "Rome"}, "active": True, "name": "Ada"},
+            {"_id": "u2", "profile": {"city": "London"}, "active": False, "name": "Grace"},
+            {"_id": "u3", "profile": {"city": "Rome"}, "active": True, "name": "Katherine"},
+        ]
+    )
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+    collection.create_index([("name", ASCENDING)], name="name_1")
+
+    prefix = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {"profile.city": "Rome"},
+            "hint": "city_active_1",
+            "explain": True,
+        }
+    )
+    prefix_plan = prefix["queryPlanner"]["winningPlan"]
+    assert prefix["queryPlanner"]["namespace"] == f"{collection.database.name}.{collection.name}"
+    assert prefix["queryPlanner"]["hintProvided"] is True
+    assert prefix_plan["stage"] == "IXSCAN"
+    assert prefix_plan["scanStrategy"] == "indexEqualityPrefix"
+    assert prefix_plan["indexName"] == "city_active_1"
+    assert prefix_plan["prefixLen"] == 1
+
+    count = collection.database.command(
+        {
+            "count": collection.name,
+            "query": {"name": {"$gte": "G"}},
+            "explain": True,
+        }
+    )
+    count_plan = count["queryPlanner"]["winningPlan"]
+    assert count_plan["scanStrategy"] == "indexRange"
+    assert count_plan["indexName"] == "name_1"
+
+    fallback = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {"$or": [{"name": "Ada"}, {"name": "Grace"}]},
+            "explain": True,
+        }
+    )
+    fallback_plan = fallback["queryPlanner"]["winningPlan"]
+    assert fallback_plan["stage"] == "COLLSCAN"
+    assert "not index-planned" in fallback_plan["fallbackReason"]
+
+    with pytest.raises(OperationFailure):
+        collection.database.command(
+            {
+                "find": collection.name,
+                "filter": {"name": "Ada"},
+                "hint": "city_active_1",
+                "explain": True,
+            }
+        )
+
+
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):
     collection.insert_many(
         [

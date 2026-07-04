@@ -119,6 +119,8 @@ def run_operation(operation, collection):
     result = execute_operation(operation, collection)
     if "expect_result" in operation:
         assert_result(result, operation["expect_result"])
+    if "expect_path_values" in operation:
+        assert_path_values(result, operation["expect_path_values"])
     if "expect_documents" in operation:
         assert result == operation["expect_documents"]
 
@@ -228,6 +230,15 @@ def assert_result(result, expected):
         actual = {"ok": None}
     for key, value in expected.items():
         assert actual[key] == value
+
+
+def assert_path_values(result, expected):
+    assert isinstance(result, dict), "path assertions require a document result"
+    for assertion in expected:
+        current = result
+        for part in assertion["path"]:
+            current = current[part]
+        assert current == assertion["value"]
 
 
 def validate_case(case, source):
