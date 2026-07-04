@@ -103,6 +103,27 @@
       ]
     },
     {
+      "name": "command",
+      "command": {
+        "find": "$$collection",
+        "filter": {},
+        "sort": {
+          "created": 1
+        },
+        "explain": true
+      },
+      "expect_path_values": [
+        {
+          "path": [
+            "queryPlanner",
+            "winningPlan",
+            "scanStrategy"
+          ],
+          "value": "collectionScan"
+        }
+      ]
+    },
+    {
       "name": "count_documents",
       "filter": {
         "account": "a",

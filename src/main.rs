@@ -2429,6 +2429,13 @@ struct RangeBound {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct SortPushdownPlan {
+    index: IndexSpec,
+    key_prefix: String,
+    descending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum ResolvedHint {
     Id,
     Index(IndexSpec),
@@ -2517,6 +2524,7 @@ fn collection_scan_plan(reason: impl Into<String>) -> PlannerV2Plan {
     }
 }
 
+#[cfg(test)]
 fn planner_v2_plan_for_filter(indexes: Vec<IndexSpec>, filter: &Document) -> PlannerV2Plan {
     if filter.is_empty() {
         return collection_scan_plan("empty filter");
@@ -2639,6 +2647,30 @@ fn planner_v2_plan_for_query(
         );
     }
     Ok(collection_scan_plan(fallback_reason))
+}
+
+fn planner_v2_plan_for_find(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    sort: Option<&[(String, i32)]>,
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<PlannerV2Plan, String> {
+    if let Some(sort) = sort
+        && let Some(sort_plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint)?
+    {
+        return Ok(PlannerV2Plan::IndexSort {
+            index_name: sort_plan.index.name.clone(),
+            index_key: sort_plan.index.key.clone(),
+            diagnostic: planner_diagnostic(
+                PlannerScanStrategy::IndexSort,
+                Some(&sort_plan.index),
+                true,
+                None,
+            ),
+        });
+    }
+    planner_v2_plan_for_query(conn, namespace, filter, hint)
 }
 
 fn planner_v2_plan_for_count(
@@ -6534,7 +6566,7 @@ fn find_documents_with_state(
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
     if explain {
-        return match planner_v2_plan_for_query(conn, &ns, &filter, hint.as_ref()) {
+        return match planner_v2_plan_for_find(conn, &ns, &filter, sort.as_deref(), hint.as_ref()) {
             Ok(plan) => Ok(explain_response(
                 "find",
                 &ns,
@@ -7245,6 +7277,195 @@ fn indexed_candidate_documents_by_range(
     Ok(Some(documents))
 }
 
+fn sort_pushdown_plan(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    sort: &[(String, i32)],
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<Option<SortPushdownPlan>, String> {
+    if sort.len() != 1 {
+        return Ok(None);
+    }
+    let (sort_field, sort_direction) = &sort[0];
+    let indexes = match hint {
+        Some(ResolvedHint::Id) => return Ok(None),
+        Some(ResolvedHint::Index(index)) => vec![index.clone()],
+        None => {
+            planner_indexes(indexes_for_namespace(conn, namespace).map_err(|err| err.to_string())?)
+        }
+    };
+    for index in indexes {
+        if index.sparse || index.partial_filter.is_some() {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)
+            .map_err(|err| err.to_string())?
+        {
+            continue;
+        }
+        let Some(plan) = sort_pushdown_plan_for_index(&index, filter, sort_field, *sort_direction)
+        else {
+            continue;
+        };
+        if sort_pushdown_is_covered_and_unique(conn, namespace, filter, &plan)
+            .map_err(|err| err.to_string())?
+        {
+            return Ok(Some(plan));
+        }
+    }
+    Ok(None)
+}
+
+fn sort_pushdown_plan_for_index(
+    index: &IndexSpec,
+    filter: &Document,
+    sort_field: &str,
+    sort_direction: i32,
+) -> Option<SortPushdownPlan> {
+    if sort_direction != 1 && sort_direction != -1 {
+        return None;
+    }
+    if let Some(field) = single_field_index_name(index) {
+        if field != sort_field || !filter.is_empty() {
+            return None;
+        }
+        if !index_field_supports_sort(index, field) {
+            return None;
+        }
+        return Some(SortPushdownPlan {
+            index: index.clone(),
+            key_prefix: encode_range_planner_prefix(&[]),
+            descending: sort_direction == -1,
+        });
+    }
+    compound_sort_pushdown_plan_for_index(index, filter, sort_field, sort_direction)
+}
+
+fn compound_sort_pushdown_plan_for_index(
+    index: &IndexSpec,
+    filter: &Document,
+    sort_field: &str,
+    sort_direction: i32,
+) -> Option<SortPushdownPlan> {
+    if !is_compound_index(index) || filter.keys().any(|key| key.starts_with('$')) {
+        return None;
+    }
+    let mut equality_parts = Vec::new();
+    for field in index.key.keys() {
+        if field == sort_field {
+            if equality_parts.is_empty() || filter.len() != equality_parts.len() {
+                return None;
+            }
+            if !index_field_supports_sort(index, field) {
+                return None;
+            }
+            return Some(SortPushdownPlan {
+                index: index.clone(),
+                key_prefix: encode_range_planner_prefix(&equality_parts),
+                descending: sort_direction == -1,
+            });
+        }
+        let value = exact_equality_filter_part(filter, field)?;
+        if !is_compound_planner_scalar(value) {
+            return None;
+        }
+        equality_parts.push(id_key_from_bson(value));
+    }
+    None
+}
+
+fn index_field_supports_sort(index: &IndexSpec, field: &str) -> bool {
+    matches!(
+        index.key.get(field),
+        Some(Bson::Int32(1) | Bson::Int32(-1) | Bson::Int64(1) | Bson::Int64(-1))
+    )
+}
+
+fn sort_pushdown_is_covered_and_unique(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    plan: &SortPushdownPlan,
+) -> Result<bool> {
+    let expected = if filter.is_empty() {
+        sql_count_documents(conn, namespace)?
+    } else {
+        let Some((_, prefix_key)) = prefix_planner_key_for_filter(&plan.index, filter) else {
+            return Ok(false);
+        };
+        sql_count_index_entries(conn, namespace, &plan.index.name, &prefix_key)?
+    };
+    if expected == 0 {
+        return Ok(false);
+    }
+    let (entry_count, distinct_key_count, unsupported_key_count): (i64, i64, i64) = conn
+        .query_row(
+            r#"
+        SELECT COUNT(DISTINCT id_key),
+               COUNT(DISTINCT key_value),
+               COALESCE(SUM(CASE
+                   WHEN substr(key_value, ?5) LIKE 'bool:%'
+                     OR substr(key_value, ?5) LIKE 'oid:%'
+                     OR substr(key_value, ?5) LIKE 'date:%'
+                   THEN 0
+                   ELSE 1
+               END), 0)
+          FROM index_entries
+         WHERE namespace = ?1
+           AND index_name = ?2
+           AND key_value >= ?3
+           AND key_value < ?4
+        "#,
+            params![
+                namespace,
+                plan.index.name,
+                plan.key_prefix,
+                sort_prefix_upper_bound(&plan.key_prefix),
+                plan.key_prefix.chars().count() as i64 + 1,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    Ok(entry_count == expected && distinct_key_count == expected && unsupported_key_count == 0)
+}
+
+fn sort_prefix_upper_bound(prefix: &str) -> String {
+    format!("{prefix}\u{10ffff}")
+}
+
+fn indexed_candidate_documents_by_sort(
+    conn: &Connection,
+    namespace: &str,
+    plan: &SortPushdownPlan,
+) -> Result<Vec<Document>> {
+    let direction = if plan.descending { "DESC" } else { "ASC" };
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        SELECT d.bson
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+           AND e.key_value >= ?3
+           AND e.key_value < ?4
+         ORDER BY e.key_value {direction}, d.id_key ASC
+        "#
+    ))?;
+    stmt.query_map(
+        params![
+            namespace,
+            plan.index.name,
+            plan.key_prefix,
+            sort_prefix_upper_bound(&plan.key_prefix),
+        ],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?
+    .map(|row| decode_document(row?))
+    .collect::<Result<Vec<_>>>()
+}
+
 fn candidate_documents(
     conn: &Connection,
     namespace: &str,
@@ -7278,6 +7499,14 @@ fn query_documents_with_hint(
     projection: Option<&ProjectionSpec>,
     hint: Option<&ResolvedHint>,
 ) -> std::result::Result<Vec<Document>, MatchError> {
+    if let Some(sort) = sort
+        && let Some(plan) = sort_pushdown_plan(conn, namespace, filter, sort, hint)
+            .map_err(|err| match_error(2, err))?
+    {
+        let source_documents = indexed_candidate_documents_by_sort(conn, namespace, &plan)
+            .map_err(|err| match_error(2, err.to_string()))?;
+        return shape_documents(source_documents, filter, None, skip, limit, projection);
+    }
     let source_documents = candidate_documents_with_hint(conn, namespace, filter, hint)
         .map_err(|err| match_error(2, err))?;
     shape_documents(source_documents, filter, sort, skip, limit, projection)
@@ -13132,6 +13361,190 @@ mod tests {
         assert_eq!(
             find_ids(&conn, doc! { "team": "explain" }),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn sort_pushdown_uses_safe_index_order_and_falls_back_for_unsafe_shapes() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "e1", "account": "a", "created": bson::DateTime::from_millis(1_700_000_000_000_i64) },
+                    { "_id": "e2", "account": "a", "created": bson::DateTime::from_millis(1_600_000_000_000_i64) },
+                    { "_id": "e3", "account": "a", "created": bson::DateTime::from_millis(1_800_000_000_000_i64) },
+                    { "_id": "e4", "account": "b", "created": bson::DateTime::from_millis(1_900_000_000_000_i64) },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "created": 1_i32 }, "name": "created_1" },
+                    { "key": { "account": 1_i32, "created": 1_i32 }, "name": "account_created_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let asc = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": {},
+                "sort": { "created": 1_i32 },
+                "skip": 1_i32,
+                "limit": 2_i32,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&asc)
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["e1", "e3"]
+        );
+
+        let desc = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": {},
+                "sort": { "created": -1_i32 },
+                "limit": 2_i32,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&desc)
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["e4", "e3"]
+        );
+
+        let compound = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "account": "a" },
+                "sort": { "created": -1_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&compound)
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["e3", "e1", "e2"]
+        );
+
+        let explain = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "account": "a" },
+                "sort": { "created": 1_i32 },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explain
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("winningPlan")
+                .unwrap()
+                .get_str("scanStrategy")
+                .unwrap(),
+            "indexSort"
+        );
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [{ "_id": "e5", "account": "c" }],
+            },
+        )
+        .unwrap();
+        let missing_fallback = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": {},
+                "sort": { "created": 1_i32 },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            missing_fallback
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("winningPlan")
+                .unwrap()
+                .get_str("scanStrategy")
+                .unwrap(),
+            "indexSort"
+        );
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "people",
+                "$db": "app",
+                "documents": [
+                    { "_id": "p1", "name": "Ada" },
+                    { "_id": "p2", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "people",
+                "$db": "app",
+                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_1" }],
+            },
+        )
+        .unwrap();
+        let string_sort = find_documents(
+            &conn,
+            &doc! {
+                "find": "people",
+                "$db": "app",
+                "filter": {},
+                "sort": { "name": 1_i32 },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            string_sort
+                .get_document("queryPlanner")
+                .unwrap()
+                .get_document("winningPlan")
+                .unwrap()
+                .get_str("scanStrategy")
+                .unwrap(),
+            "indexSort"
         );
     }
 

@@ -778,6 +778,77 @@ def test_find_and_count_explain_reports_planner_diagnostics(collection):
         )
 
 
+def test_sort_pushdown_for_safe_scalar_index_order_and_fallbacks(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "e1",
+                "account": "a",
+                "created": datetime(2026, 2, 1, tzinfo=timezone.utc),
+                "name": "Ada",
+            },
+            {
+                "_id": "e2",
+                "account": "a",
+                "created": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "name": "Grace",
+            },
+            {
+                "_id": "e3",
+                "account": "a",
+                "created": datetime(2026, 3, 1, tzinfo=timezone.utc),
+                "name": "Katherine",
+            },
+            {
+                "_id": "e4",
+                "account": "b",
+                "created": datetime(2026, 4, 1, tzinfo=timezone.utc),
+                "name": "Mary",
+            },
+        ]
+    )
+    collection.create_index([("created", ASCENDING)], name="created_1")
+    collection.create_index([("account", ASCENDING), ("created", ASCENDING)], name="account_created_1")
+    collection.create_index([("name", ASCENDING)], name="name_1")
+
+    assert ids(collection.find({}).sort("created", ASCENDING).skip(1).limit(2)) == ["e1", "e3"]
+    assert ids(collection.find({}).sort("created", DESCENDING).limit(2)) == ["e4", "e3"]
+    assert ids(collection.find({"account": "a"}).sort("created", DESCENDING)) == ["e3", "e1", "e2"]
+
+    explain = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {"account": "a"},
+            "sort": {"created": ASCENDING},
+            "explain": True,
+        }
+    )
+    assert explain["queryPlanner"]["winningPlan"]["scanStrategy"] == "indexSort"
+    assert explain["queryPlanner"]["winningPlan"]["indexName"] == "account_created_1"
+
+    collection.insert_one({"_id": "e5", "account": "c", "name": "Missing"})
+    missing = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {},
+            "sort": {"created": ASCENDING},
+            "explain": True,
+        }
+    )
+    assert missing["queryPlanner"]["winningPlan"]["scanStrategy"] != "indexSort"
+    assert ids(collection.find({}).sort("created", ASCENDING).limit(1)) == ["e5"]
+
+    string_sort = collection.database.command(
+        {
+            "find": collection.name,
+            "filter": {},
+            "sort": {"name": ASCENDING},
+            "explain": True,
+        }
+    )
+    assert string_sort["queryPlanner"]["winningPlan"]["scanStrategy"] != "indexSort"
+
+
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):
     collection.insert_many(
         [
