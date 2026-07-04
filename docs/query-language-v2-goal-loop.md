@@ -386,7 +386,7 @@ passed; `cargo run --bin mongolino-bench -- --profile ci --check-budget`
 passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` passed;
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` passed;
 unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
-pytest tests/e2e` passed with 167 tests. Commit: pending.
+pytest tests/e2e` passed with 167 tests. Commit: `3391aa8`.
 
 Adversarial repair 2026-07-04: Added `$type` numeric code `7` for ObjectId,
 mixed `$type` array coverage containing `7`, and explicit Mongo-compatible
