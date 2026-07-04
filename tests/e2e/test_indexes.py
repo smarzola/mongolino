@@ -97,6 +97,78 @@ def test_sparse_and_partial_index_metadata_roundtrip(collection):
     assert "email_active_partial" not in index_names(collection)
 
 
+def test_ttl_index_metadata_roundtrip_and_invalid_specs(collection, mongolino_server):
+    collection.insert_one(
+        {
+            "_id": "e1",
+            "createdAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        }
+    )
+
+    generated = collection.create_index(
+        [("createdAt", ASCENDING)],
+        expireAfterSeconds=3600,
+    )
+    explicit = collection.create_index(
+        [("deletedAt", DESCENDING)],
+        name="deleted_ttl",
+        expireAfterSeconds=0,
+    )
+
+    assert generated == "createdAt_1"
+    assert explicit == "deleted_ttl"
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["createdAt_1"]["expireAfterSeconds"] == 3600
+    assert indexes["deleted_ttl"]["expireAfterSeconds"] == 0
+    assert "expireAfterSeconds" not in indexes["_id_"]
+
+    with pytest.raises(OperationFailure) as conflict:
+        collection.create_index(
+            [("createdAt", ASCENDING)],
+            expireAfterSeconds=7200,
+        )
+    assert conflict.value.code == 85
+
+    invalid_specs = [
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_negative", "expireAfterSeconds": -1},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_bool", "expireAfterSeconds": True},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_float", "expireAfterSeconds": 1.5},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_string", "expireAfterSeconds": "60"},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_null", "expireAfterSeconds": None},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_array", "expireAfterSeconds": [60]},
+        {"key": {"expiresAt": ASCENDING}, "name": "ttl_doc", "expireAfterSeconds": {"seconds": 60}},
+        {
+            "key": {"expiresAt": ASCENDING, "tenant": ASCENDING},
+            "name": "ttl_compound",
+            "expireAfterSeconds": 60,
+        },
+        {"key": {"_id": ASCENDING}, "name": "ttl_id", "expireAfterSeconds": 60},
+        {"key": {"expiresAt": "hashed"}, "name": "ttl_hashed", "expireAfterSeconds": 60},
+        {
+            "key": {"expiresAt": ASCENDING},
+            "name": "ttl_sparse",
+            "sparse": True,
+            "expireAfterSeconds": 60,
+        },
+        {
+            "key": {"expiresAt": ASCENDING},
+            "name": "ttl_partial",
+            "partialFilterExpression": {"active": True},
+            "expireAfterSeconds": 60,
+        },
+    ]
+    for spec in invalid_specs:
+        with pytest.raises(OperationFailure) as excinfo:
+            collection.database.command(
+                {"createIndexes": collection.name, "indexes": [spec]}
+            )
+        assert excinfo.value.code == 72
+
+    namespace = f"{collection.database.name}.{collection.name}"
+    for spec in invalid_specs:
+        assert index_entry_count(mongolino_server.db_path, namespace, spec["name"]) == 0
+
+
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
     collection.create_index([("email", ASCENDING)], name="email_1")
     assert collection.create_index([("email", ASCENDING)], name="email_1") == "email_1"

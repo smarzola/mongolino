@@ -3188,6 +3188,9 @@ fn list_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         if let Some(partial_filter) = spec.partial_filter {
             document.insert("partialFilterExpression", partial_filter);
         }
+        if let Some(expire_after_seconds) = spec.expire_after_seconds {
+            document.insert("expireAfterSeconds", expire_after_seconds);
+        }
         batch.push(Bson::Document(document));
     }
 
@@ -3277,6 +3280,7 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
             "v",
             "sparse",
             "partialFilterExpression",
+            "expireAfterSeconds",
         ],
     ) {
         return Err(command_error(72, &errmsg));
@@ -3319,6 +3323,13 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
             ));
         }
     };
+    let expire_after_seconds = match index.get("expireAfterSeconds") {
+        None => None,
+        Some(value) => Some(parse_expire_after_seconds(value)?),
+    };
+    if expire_after_seconds.is_some() {
+        validate_ttl_index_spec(&key, &name, sparse, partial_filter.as_ref())?;
+    }
     match index.get("v") {
         None | Some(Bson::Int32(2) | Bson::Int64(2)) => {}
         Some(_) => return Err(command_error(72, "only index version 2 is supported")),
@@ -3330,8 +3341,64 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
         unique,
         sparse,
         partial_filter,
-        expire_after_seconds: None,
+        expire_after_seconds,
     })
+}
+
+fn parse_expire_after_seconds(value: &Bson) -> std::result::Result<i64, Document> {
+    match value {
+        Bson::Int32(value) if *value >= 0 => Ok(*value as i64),
+        Bson::Int32(_) => Err(command_error(
+            72,
+            "expireAfterSeconds must be a non-negative integer",
+        )),
+        Bson::Int64(value) if *value >= 0 => Ok(*value),
+        Bson::Int64(_) => Err(command_error(
+            72,
+            "expireAfterSeconds must be a non-negative integer",
+        )),
+        _ => Err(command_error(
+            72,
+            "expireAfterSeconds must be a non-negative integer",
+        )),
+    }
+}
+
+fn validate_ttl_index_spec(
+    key: &Document,
+    name: &str,
+    sparse: bool,
+    partial_filter: Option<&Document>,
+) -> std::result::Result<(), Document> {
+    if key.len() != 1 {
+        return Err(command_error(72, "TTL indexes require a single-field key"));
+    }
+    let (field, direction) = key.iter().next().expect("key length checked above");
+    if field == "_id" || name == "_id_" {
+        return Err(command_error(72, "TTL indexes on _id are not supported"));
+    }
+    match direction {
+        Bson::Int32(1) | Bson::Int64(1) | Bson::Int32(-1) | Bson::Int64(-1) => {}
+        _ => {
+            return Err(command_error(
+                72,
+                "TTL indexes require an ascending or descending key",
+            ));
+        }
+    }
+    if sparse {
+        return Err(command_error(
+            72,
+            "TTL indexes with sparse are not supported",
+        ));
+    }
+    if partial_filter.is_some() {
+        return Err(command_error(
+            72,
+            "TTL indexes with partialFilterExpression are not supported",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_index_key(key: &Document) -> std::result::Result<(), Document> {
@@ -11567,6 +11634,137 @@ mod tests {
         .unwrap();
         assert_command_error(&conflict);
         assert_eq!(conflict.get_i32("code").unwrap(), 85);
+    }
+
+    #[test]
+    fn ttl_index_create_list_and_duplicate_spec_validation() {
+        let conn = test_conn();
+
+        let generated = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "createdAt": 1_i32 }, "expireAfterSeconds": 3600_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(generated.get_i32("numIndexesAfter").unwrap(), 2);
+        let explicit = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    {
+                        "key": { "deletedAt": -1_i32 },
+                        "name": "deleted_ttl",
+                        "expireAfterSeconds": 0_i64,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit.get_i32("numIndexesAfter").unwrap(), 3);
+
+        let repeated = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "createdAt": 1_i32 }, "expireAfterSeconds": 3600_i64 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(repeated.get_f64("ok").unwrap(), 1.0);
+
+        let conflict = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "createdAt": 1_i32 }, "expireAfterSeconds": 7200_i32 }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&conflict);
+        assert_eq!(conflict.get_i32("code").unwrap(), 85);
+
+        let listed = list_indexes(
+            &conn,
+            &doc! { "listIndexes": "events", "$db": "app", "cursor": {} },
+        )
+        .unwrap();
+        let batch = first_batch(&listed);
+        let created = batch
+            .iter()
+            .find(|index| index.get_str("name").unwrap() == "createdAt_1")
+            .unwrap();
+        assert_eq!(created.get_i64("expireAfterSeconds").unwrap(), 3600);
+        let deleted = batch
+            .iter()
+            .find(|index| index.get_str("name").unwrap() == "deleted_ttl")
+            .unwrap();
+        assert_eq!(deleted.get_i64("expireAfterSeconds").unwrap(), 0);
+        let id_index = batch
+            .iter()
+            .find(|index| index.get_str("name").unwrap() == "_id_")
+            .unwrap();
+        assert!(!id_index.contains_key("expireAfterSeconds"));
+    }
+
+    #[test]
+    fn ttl_index_rejects_invalid_specs_without_mutation() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [{ "_id": "e1", "createdAt": bson::DateTime::from_millis(1_700_000_000_000_i64) }],
+            },
+        )
+        .unwrap();
+
+        for spec in [
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_negative", "expireAfterSeconds": -1_i32 },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_bool", "expireAfterSeconds": true },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_double", "expireAfterSeconds": 1.5 },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_string", "expireAfterSeconds": "60" },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_null", "expireAfterSeconds": Bson::Null },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_array", "expireAfterSeconds": [60_i32] },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_document", "expireAfterSeconds": { "seconds": 60_i32 } },
+            doc! { "key": { "createdAt": 1_i32, "tenant": 1_i32 }, "name": "ttl_compound", "expireAfterSeconds": 60_i32 },
+            doc! { "key": { "_id": 1_i32 }, "name": "_id_ttl", "expireAfterSeconds": 60_i32 },
+            doc! { "key": { "createdAt": "hashed" }, "name": "ttl_hashed", "expireAfterSeconds": 60_i32 },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_sparse", "sparse": true, "expireAfterSeconds": 60_i32 },
+            doc! { "key": { "createdAt": 1_i32 }, "name": "ttl_partial", "partialFilterExpression": { "active": true }, "expireAfterSeconds": 60_i32 },
+        ] {
+            let response = create_indexes(
+                &conn,
+                &doc! { "createIndexes": "events", "$db": "app", "indexes": [spec] },
+            )
+            .unwrap();
+            assert_command_error(&response);
+            assert_eq!(response.get_i32("code").unwrap(), 72);
+        }
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM indexes WHERE namespace = 'app.events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 0);
+        assert_eq!(entry_count, 0);
     }
 
     #[test]

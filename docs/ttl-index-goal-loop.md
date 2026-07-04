@@ -177,7 +177,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: TTL metadata model and migration-safe persistence
-- [ ] Milestone 1: `createIndexes` TTL validation and listing
+- [x] Milestone 1: `createIndexes` TTL validation and listing
 - [ ] Milestone 2: Deterministic TTL sweeper core
 - [ ] Milestone 3: Wire-visible read/write sweep integration
 - [ ] Milestone 4: `collMod` TTL update subset
@@ -210,7 +210,7 @@ Status:
 
 - 2026-07-04: Completed TTL metadata model and migration-safe persistence.
   Verification passed: `cargo fmt -- --check`; `cargo test index`;
-  `cargo test create_indexes`. Commit: pending.
+  `cargo test create_indexes`. Commit: `f331358`.
 
 Likely files:
 
@@ -255,6 +255,16 @@ Acceptance criteria:
   compound keys, `_id`, and unsupported key directions.
 - No invalid TTL creation leaves persisted index metadata or index entries.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed TTL `createIndexes` parsing, validation, durable
+  listing, duplicate-spec checks, and PyMongo metadata/error coverage.
+  Verification passed: `cargo fmt -- --check`; `cargo test ttl`;
+  `cargo test list_indexes`; `cargo test create_indexes`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_indexes.py` (30 passed, outside sandbox due localhost bind).
+  Commit: pending.
 
 Likely files:
 
