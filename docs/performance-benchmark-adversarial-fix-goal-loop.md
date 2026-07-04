@@ -67,7 +67,7 @@ The fix is complete only when:
 
 - [x] Milestone 0: Add cleanup helper and regression coverage
 - [x] Milestone 1: Wire cleanup into benchmark harness
-- [ ] Milestone 2: Final verification and commit
+- [x] Milestone 2: Final verification and commit
 
 ## Milestone 0: Add Cleanup Helper And Regression Coverage
 
@@ -170,3 +170,23 @@ Use unsandboxed execution for the PyMongo e2e suite if the sandbox blocks localh
 Commit requirement:
 
 - Commit with a focused message such as `Clean up benchmark temp databases`.
+
+Status:
+
+- 2026-07-04: Final verification completed. Exact commands run:
+  `cargo fmt -- --check`;
+  `cargo test --bin mongolino-bench`;
+  `TMPDIR=/private/tmp/mongolino-bench-cleanup.diNDc0 cargo run --bin mongolino-bench -- --profile smoke --json /private/tmp/mongolino-bench-cleanup.diNDc0/mongolino-bench-smoke.json`;
+  `find /private/tmp/mongolino-bench-cleanup.diNDc0 -maxdepth 1 -name 'mongolino-bench-*.sqlite3*' -print`;
+  `cargo test`;
+  `cargo build`;
+  `cargo run --bin mongolino-bench -- --profile ci --check-budget`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`;
+  `find /private/tmp -maxdepth 1 -name 'mongolino-bench-*.sqlite3*' -print`.
+  The sandboxed e2e run failed at localhost port allocation with
+  `PermissionError: [Errno 1] Operation not permitted` from
+  `sock.bind(("127.0.0.1", 0))`; the same e2e command passed outside the
+  sandbox with 119 passed and 1 skipped. Final focused fix commit hash:
+  `23f793e`.
