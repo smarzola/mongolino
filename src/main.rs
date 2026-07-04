@@ -3813,6 +3813,7 @@ enum TransactionCandidatePlan {
     IndexedEquality {
         index_name: String,
         key_value: String,
+        unique: bool,
     },
     Fallback,
 }
@@ -3834,6 +3835,7 @@ fn plan_transaction_candidates(
         return Ok(TransactionCandidatePlan::IndexedEquality {
             index_name: index.name,
             key_value,
+            unique: index.unique,
         });
     }
     let Some((field, value)) = exact_single_equality_filter(filter) else {
@@ -3851,6 +3853,7 @@ fn plan_transaction_candidates(
     Ok(TransactionCandidatePlan::IndexedEquality {
         index_name: index.name,
         key_value: id_key_from_bson(value),
+        unique: index.unique,
     })
 }
 
@@ -3868,8 +3871,43 @@ fn transaction_candidate_documents(
         TransactionCandidatePlan::IndexedEquality {
             index_name,
             key_value,
-        } => indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value),
+            unique,
+        } => {
+            if unique {
+                indexed_unique_candidate_document_tx(tx, namespace, &index_name, &key_value)
+            } else {
+                indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value)
+            }
+        }
         TransactionCandidatePlan::Fallback => stored_documents_for_namespace_tx(tx, namespace),
+    }
+}
+
+fn indexed_unique_candidate_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    index_name: &str,
+    key_value: &str,
+) -> Result<Vec<StoredDocument>> {
+    let id_key = tx
+        .query_row(
+            r#"
+            SELECT id_key
+              FROM index_entries
+             WHERE namespace = ?1
+               AND index_name = ?2
+               AND key_value = ?3
+             LIMIT 1
+            "#,
+            params![namespace, index_name, key_value],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match id_key {
+        Some(id_key) => Ok(stored_document_by_id_key_tx(tx, namespace, &id_key)?
+            .into_iter()
+            .collect()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -7663,6 +7701,7 @@ mod tests {
             TransactionCandidatePlan::IndexedEquality {
                 index_name: "active_1".to_string(),
                 key_value: "bool:true".to_string(),
+                unique: false,
             }
         );
         assert_eq!(
@@ -7675,6 +7714,7 @@ mod tests {
             TransactionCandidatePlan::IndexedEquality {
                 index_name: "city_1".to_string(),
                 key_value: "str:Rome".to_string(),
+                unique: false,
             }
         );
         assert_eq!(
@@ -7687,6 +7727,7 @@ mod tests {
             TransactionCandidatePlan::IndexedEquality {
                 index_name: "city_active_1".to_string(),
                 key_value: "compound:2:8:str:Rome:9:bool:true".to_string(),
+                unique: false,
             }
         );
 

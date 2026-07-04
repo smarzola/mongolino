@@ -163,7 +163,7 @@ When a milestone is complete:
 - [x] Milestone 1: Compound index entry maintenance
 - [x] Milestone 2: Compound read and count pushdown
 - [x] Milestone 3: Compound write target and unique pushdown
-- [ ] Milestone 4: Benchmarks, docs, and final verification
+- [x] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Compound Key Encoding And Planner Classification
 
@@ -430,6 +430,27 @@ binding.
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-04: Added `find_compound_equality`,
+  `count_compound_equality`, and `update_compound_target` benchmarks, CI budget
+  thresholds, local before/after evidence, and scorecard documentation. Final
+  local results: `find_compound_equality` `2.122 ms/op` versus
+  `find_collection_scan` `30.807 ms/op` (`14.5x` faster);
+  `count_compound_equality` `0.030 ms/op`; `update_compound_target`
+  `1.336 ms/op`. Verified with `cargo fmt -- --check`; `cargo test`;
+  `cargo build`; `cargo run --bin mongolino-bench -- --profile smoke --json
+  /tmp/mongolino-bench-index-compound-smoke.json`; `cargo run --bin
+  mongolino-bench -- --profile local --json
+  /tmp/mongolino-bench-index-compound-local.json`; `cargo run --bin
+  mongolino-bench -- --profile ci --check-budget`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`;
+  sandboxed full e2e failed at localhost bind with `PermissionError: [Errno 1]
+  Operation not permitted`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv run --locked pytest tests/e2e` passed with 136 passed and 1 skipped.
+  Commit hash: pending.
 
 ## Final Response Requirements
 

@@ -14,6 +14,7 @@ use rusqlite::Connection;
 
 const DB: &str = "bench";
 const COLL: &str = "users";
+const COMPOUND_COLL: &str = "compound_users";
 
 #[derive(Clone, Copy, Debug)]
 struct Profile {
@@ -129,6 +130,19 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "find_compound_equality",
+        args.profile.iterations,
+        doc! {
+            "find": COLL,
+            "filter": {
+                "team": compound_target_team(args.profile.documents),
+                "email": compound_target_email(args.profile.documents),
+            },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "count_empty_filter",
         args.profile.iterations,
         doc! {
@@ -146,7 +160,20 @@ fn run() -> Result<()> {
             "$db": DB,
         },
     )?);
+    results.push(harness.bench_command(
+        "count_compound_equality",
+        args.profile.iterations,
+        doc! {
+            "count": COLL,
+            "query": {
+                "team": compound_target_team(args.profile.documents),
+                "email": compound_target_email(args.profile.documents),
+            },
+            "$db": DB,
+        },
+    )?);
     results.push(harness.bench_update_index_refresh()?);
+    results.push(harness.bench_update_compound_target()?);
     results.push(harness.bench_command(
         "aggregation_match_count",
         args.profile.iterations,
@@ -257,6 +284,7 @@ impl Harness {
                 { "key": { "email": 1_i32 }, "name": "email_1" },
                 { "key": { "team": 1_i32 }, "name": "team_1" },
                 { "key": { "active": 1_i32 }, "name": "active_1" },
+                { "key": { "team": 1_i32, "email": 1_i32 }, "name": "team_email_1" },
             ],
             "$db": DB,
         })?;
@@ -269,6 +297,33 @@ impl Harness {
                 .collect::<Vec<_>>();
             self.command(doc! {
                 "insert": COLL,
+                "documents": documents,
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        self.seed_compound_target_collection()?;
+        Ok(())
+    }
+
+    fn seed_compound_target_collection(&mut self) -> Result<()> {
+        self.command(doc! {
+            "createIndexes": COMPOUND_COLL,
+            "indexes": [
+                { "key": { "team": 1_i32, "email": 1_i32 }, "name": "team_email_1" },
+            ],
+            "$db": DB,
+        })?;
+
+        let document_count = compound_target_documents(self.profile);
+        for chunk_start in (0..document_count).step_by(self.profile.insert_batch) {
+            let chunk_end = (chunk_start + self.profile.insert_batch).min(document_count);
+            let documents = (chunk_start..chunk_end)
+                .map(seed_document)
+                .map(Bson::Document)
+                .collect::<Vec<_>>();
+            self.command(doc! {
+                "insert": COMPOUND_COLL,
                 "documents": documents,
                 "ordered": true,
                 "$db": DB,
@@ -330,6 +385,36 @@ impl Harness {
         Ok(BenchResult {
             name: "update_index_refresh",
             dataset_size: self.profile.documents,
+            iterations: self.profile.iterations,
+            elapsed: start.elapsed(),
+            operations: self.profile.iterations,
+        })
+    }
+
+    fn bench_update_compound_target(&mut self) -> Result<BenchResult> {
+        let start = Instant::now();
+        let document_count = compound_target_documents(self.profile);
+        for _ in 0..self.profile.iterations {
+            self.command(doc! {
+                "update": COMPOUND_COLL,
+                "updates": [
+                    {
+                        "q": {
+                            "team": compound_target_team(document_count),
+                            "email": compound_target_email(document_count),
+                        },
+                        "u": { "$set": { "compoundTouched": true } },
+                        "multi": false,
+                        "upsert": false,
+                    }
+                ],
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(BenchResult {
+            name: "update_compound_target",
+            dataset_size: document_count,
             iterations: self.profile.iterations,
             elapsed: start.elapsed(),
             operations: self.profile.iterations,
@@ -445,6 +530,27 @@ fn seed_document(i: usize) -> Document {
             "level": (i % 7) as i32,
         },
         "tags": tags,
+    }
+}
+
+fn compound_target_index(documents: usize) -> usize {
+    documents / 2
+}
+
+fn compound_target_documents(profile: Profile) -> usize {
+    profile.documents.min(2_000)
+}
+
+fn compound_target_email(documents: usize) -> String {
+    format!("user{}@example.test", compound_target_index(documents))
+}
+
+fn compound_target_team(documents: usize) -> &'static str {
+    match compound_target_index(documents) % 4 {
+        0 => "platform",
+        1 => "growth",
+        2 => "infra",
+        _ => "data",
     }
 }
 
@@ -590,9 +696,12 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "find_indexed_scalar_equality" => (80.0, 12.0),
         "count_empty_filter" => (250.0, 4.0),
         "count_simple_equality" => (250.0, 4.0),
+        "count_compound_equality" => (25.0, 40.0),
         "update_index_refresh" => (150.0, 6.0),
+        "update_compound_target" => (80.0, 12.0),
         "aggregation_match_count" => (350.0, 3.0),
         "aggregation_unwind_group" => (600.0, 1.5),
+        "find_compound_equality" => (80.0, 12.0),
         _ => (1_000.0, 1.0),
     };
     BudgetThreshold {

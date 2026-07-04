@@ -7,22 +7,23 @@ loop, verification, and push.
 
 ## Baseline
 
-Current index support after the performance pushdown work:
+Current index support after the compound planner uplift:
 
 - `createIndexes`, `listIndexes`, and `dropIndexes` are implemented.
 - `_id_` is always listed and cannot be dropped.
 - User index key specs accept ascending and descending numeric directions.
 - `unique: true` is enforced for supported unique key shapes.
-- Maintained `index_entries` support safe single-field scalar planner paths.
-- Single-field scalar indexes can accelerate `find`, `count`, aggregation
-  `$match` + `$count`, update/delete target selection, findAndModify target
-  selection, and safe non-numeric unique checks.
+- Maintained `index_entries` support safe single-field scalar planner paths and
+  safe full-key compound scalar planner paths.
+- Single-field scalar and full-key compound scalar indexes can accelerate
+  `find`, `count`, aggregation `$match` + `$count`, update/delete target
+  selection, findAndModify target selection, and safe non-numeric unique checks.
 - Unsupported index types and options return explicit command errors.
 
 Major gaps:
 
-- Compound indexes are stored as metadata, but maintained planner entries are
-  single-field only.
+- Compound prefix scans, range scans, sort-only compound planning, and
+  collation-aware compound behavior are absent.
 - Sparse and partial index options are rejected.
 - Multikey indexes do not have MongoDB-compatible array indexing semantics.
 - Query hints, index choice diagnostics, and broader sort/range pushdown are
@@ -35,15 +36,15 @@ Major gaps:
 The percentages below are a repo-local scorecard for common application index
 behavior, not a claim of full MongoDB parity.
 
-| Area | Weight | Baseline | Target After 3 Uplifts |
-| --- | ---: | ---: | ---: |
-| Index command surface and catalog behavior | 15% | 10% | 12% |
-| Basic btree key specs and metadata | 15% | 8% | 13% |
-| Unique enforcement semantics | 20% | 12% | 16% |
-| Planner use for reads and writes | 25% | 8% | 20% |
-| Sparse/partial/multikey practical semantics | 20% | 1% | 12% |
-| Explicit unsupported behavior and tests | 5% | 4% | 5% |
-| Total | 100% | 43% | 78% |
+| Area | Weight | Baseline | After Uplift 1 | Target After 3 Uplifts |
+| --- | ---: | ---: | ---: | ---: |
+| Index command surface and catalog behavior | 15% | 10% | 11% | 12% |
+| Basic btree key specs and metadata | 15% | 8% | 11% | 13% |
+| Unique enforcement semantics | 20% | 12% | 14% | 16% |
+| Planner use for reads and writes | 25% | 8% | 15% | 20% |
+| Sparse/partial/multikey practical semantics | 20% | 1% | 1% | 12% |
+| Explicit unsupported behavior and tests | 5% | 4% | 4% | 5% |
+| Total | 100% | 43% | 56% | 78% |
 
 Completion target for this goal: reach at least **75%** on this scorecard while
 preserving explicit errors for unsupported MongoDB index families.
@@ -59,6 +60,15 @@ Baseline local numbers from `docs/performance-baseline.md`:
 - `find_indexed_scalar_equality`: about `2.151 ms/op`.
 - `count_simple_equality`: about `0.066 ms/op`.
 - `update_index_refresh`: about `1.147 ms/op`.
+
+After compound planner uplift local numbers:
+
+- `find_collection_scan`: about `30.807 ms/op`.
+- `find_compound_equality`: about `2.122 ms/op`, `14.5x` faster than
+  collection scan.
+- `count_compound_equality`: about `0.030 ms/op`.
+- `update_compound_target`: about `1.336 ms/op` on the dedicated 2000-document
+  compound target-selection dataset.
 
 Goal-level targets after all three index uplifts:
 
@@ -77,6 +87,8 @@ Goal-level targets after all three index uplifts:
 ## Uplift 1: Compound Index Planner And Benchmarks
 
 Target compatibility movement: **43% -> 55%**.
+
+Delivered compatibility movement: **43% -> 56%**.
 
 Target behavior:
 

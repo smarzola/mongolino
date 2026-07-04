@@ -133,6 +133,57 @@ Full local profile after write targeting and unique pushdown:
 | aggregation_match_count | 100 | 7.40 | 13522.58 | 0.074 |
 | aggregation_unwind_group | 100 | 5775.63 | 17.31 | 57.756 |
 
+## Compound Index Planner Results
+
+Recorded on 2026-07-04 from the working tree based on commit `87a8b08` after
+compound index entry maintenance, read/count pushdown, write target selection,
+and benchmark wiring.
+
+Smoke profile: seeded query dataset 400 documents. The dedicated
+`update_compound_target` collection uses the same smoke document count.
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 25 | 36.25 | 34484.19 | 1.450 |
+| find_id_equality | 25 | 0.82 | 30304.57 | 0.033 |
+| find_collection_scan | 25 | 118.30 | 211.32 | 4.732 |
+| find_indexed_scalar_equality | 25 | 8.63 | 2898.07 | 0.345 |
+| find_compound_equality | 25 | 10.88 | 2298.27 | 0.435 |
+| count_empty_filter | 25 | 1.30 | 19238.17 | 0.052 |
+| count_simple_equality | 25 | 2.09 | 11945.52 | 0.084 |
+| count_compound_equality | 25 | 1.36 | 18446.78 | 0.054 |
+| update_index_refresh | 25 | 18.82 | 1328.34 | 0.753 |
+| update_compound_target | 25 | 18.46 | 1354.00 | 0.739 |
+| aggregation_match_count | 25 | 3.99 | 6262.79 | 0.160 |
+| aggregation_unwind_group | 25 | 219.53 | 113.88 | 8.781 |
+
+Local profile: seeded query dataset 3000 documents. The dedicated
+`update_compound_target` collection uses 2000 documents to isolate selective
+compound target selection from unrelated index refresh overhead.
+
+| Benchmark | Before ms/op | After ms/op | Change |
+| --- | ---: | ---: | ---: |
+| find_compound_equality vs find_collection_scan | 30.807 | 2.122 | 14.5x faster |
+| count_compound_equality | n/a | 0.030 | below 0.25 ms/op target |
+| update_compound_target | n/a | 1.336 | below 2 ms/op target |
+
+Full local profile after compound index planner uplift:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 100 | 267.27 | 37416.00 | 2.673 |
+| find_id_equality | 100 | 2.29 | 43699.13 | 0.023 |
+| find_collection_scan | 100 | 3080.73 | 32.46 | 30.807 |
+| find_indexed_scalar_equality | 100 | 220.11 | 454.33 | 2.201 |
+| find_compound_equality | 100 | 212.16 | 471.34 | 2.122 |
+| count_empty_filter | 100 | 11.59 | 8631.11 | 0.116 |
+| count_simple_equality | 100 | 8.39 | 11911.85 | 0.084 |
+| count_compound_equality | 100 | 3.02 | 33150.09 | 0.030 |
+| update_index_refresh | 100 | 148.91 | 671.56 | 1.489 |
+| update_compound_target | 100 | 133.60 | 748.49 | 1.336 |
+| aggregation_match_count | 100 | 9.07 | 11028.80 | 0.091 |
+| aggregation_unwind_group | 100 | 5719.08 | 17.49 | 57.191 |
+
 ## Interpretation
 
 Current behavior has these SQLite-backed fast paths:
@@ -141,34 +192,39 @@ Current behavior has these SQLite-backed fast paths:
   avoids decoding the namespace.
 - Simple scalar equality `find` can use maintained `index_entries`, then still
   decodes matching BSON documents for final matcher compatibility.
+- Full-key safe compound equality `find` can use maintained compound
+  `index_entries`, then still decodes candidate BSON documents for final Rust
+  matcher validation.
 - `count` uses SQLite for empty filters, exact `_id` equality, and exact
-  non-numeric indexed scalar equality with maintained single-field index
-  entries.
+  non-numeric indexed scalar equality with maintained single-field or full-key
+  compound index entries.
 - Aggregation pipelines exactly shaped as `$match` followed by `$count` reuse
   the same safe count planner and avoid BSON namespace decode when the filter
   is pushdown-safe.
 - update, delete, and findAndModify target selection use transaction-local
-  candidates for exact `_id` equality and safe indexed scalar equality, then
-  still validate every candidate with the Rust matcher before mutating.
+  candidates for exact `_id` equality, safe indexed scalar equality, and safe
+  full-key compound equality, then still validate every candidate with the Rust
+  matcher before mutating.
 - single-field unique indexes with present non-null non-numeric scalar values
-  use maintained `index_entries` for duplicate checks; numeric values fall back
-  to the Rust scan so `Int32`, `Int64`, and `Double` equality semantics remain
-  consistent.
+  use maintained `index_entries` for duplicate checks. Compound unique indexes
+  use the same pushdown only when every key part is present, non-null,
+  non-numeric, and scalar. Numeric values fall back to the Rust scan so
+  `Int32`, `Int64`, and `Double` equality semantics remain consistent.
 
 The remaining slow local results cluster around full namespace decode:
 
 - collection-scan `find` decodes every document before filtering;
 - unsupported count filters fall back to Rust matcher semantics, including
   arrays, logical operators, unsupported operators, multi-predicate filters,
-  unindexed fields, null equality, document equality, and numeric indexed
-  equality where matcher semantics compare `Int32`, `Int64`, and `Double`
-  cross-type;
+  unindexed fields, null equality, document equality, partial compound
+  coverage, extra-field compound filters, and numeric indexed equality where
+  matcher semantics compare `Int32`, `Int64`, and `Double` cross-type;
 - general aggregation still starts by loading the full namespace into memory,
   then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
 - write filters outside the conservative planner, including logical operators,
   multi-predicate filters, unindexed fields, arrays, null/missing semantics,
-  numeric unique values, and compound/multikey unique shapes, still use the
-  Rust matcher and scan fallback.
+  numeric unique values, partial compound filters, and multikey unique shapes,
+  still use the Rust matcher and scan fallback.
 
 Expect variance between local machines and GitHub-hosted runners. The CI budget
 therefore uses intentionally coarse latency and throughput thresholds. Use JSON
