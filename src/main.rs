@@ -826,6 +826,7 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
     Ok(doc! { "values": values, "ok": 1.0 })
 }
 
+#[cfg(test)]
 fn aggregate_command(conn: &Connection, command: &Document) -> Result<Document> {
     let mut client_state = ClientState::default();
     aggregate_command_with_state(conn, &mut client_state, command)

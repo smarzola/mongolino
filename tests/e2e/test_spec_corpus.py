@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, OperationFailure, WriteError
 
 
@@ -144,10 +145,39 @@ def execute_operation(operation, collection):
         )
     if name == "update_many":
         return collection.update_many(operation.get("filter", {}), operation["update"])
+    if name == "find_one_and_update":
+        return collection.find_one_and_update(
+            operation.get("filter", {}),
+            operation["update"],
+            projection=operation.get("projection"),
+            sort=_sort(operation),
+            upsert=operation.get("upsert", False),
+            return_document=_return_document(operation),
+        )
+    if name == "find_one_and_replace":
+        return collection.find_one_and_replace(
+            operation.get("filter", {}),
+            operation["replacement"],
+            projection=operation.get("projection"),
+            sort=_sort(operation),
+            upsert=operation.get("upsert", False),
+            return_document=_return_document(operation),
+        )
+    if name == "find_one_and_delete":
+        return collection.find_one_and_delete(
+            operation.get("filter", {}),
+            projection=operation.get("projection"),
+            sort=_sort(operation),
+        )
     if name == "delete_one":
         return collection.delete_one(operation.get("filter", {}))
     if name == "delete_many":
         return collection.delete_many(operation.get("filter", {}))
+    if name == "aggregate":
+        kwargs = {}
+        if "batch_size" in operation:
+            kwargs["batchSize"] = operation["batch_size"]
+        return list(collection.aggregate(operation["pipeline"], **kwargs))
     if name == "count_documents":
         kwargs = {}
         if "skip" in operation:
@@ -169,7 +199,7 @@ def execute_operation(operation, collection):
         return collection.drop_index(operation["index_name"])
     if name == "command":
         database = collection.database.client[operation.get("database", collection.database.name)]
-        return database.command(operation["command"])
+        return database.command(_expand_collection_placeholder(operation["command"], collection.name))
     raise AssertionError(f"unsupported corpus operation: {name}")
 
 
@@ -229,6 +259,34 @@ def _final_projection(case):
     for document in case["expect_final_documents"]:
         fields.update({key: 1 for key in document if key != "_id"})
     return fields
+
+
+def _sort(operation):
+    sort = operation.get("sort")
+    if sort is None:
+        return None
+    return [tuple(item) for item in sort]
+
+
+def _return_document(operation):
+    value = operation.get("return_document", "before")
+    if value == "after":
+        return ReturnDocument.AFTER
+    assert value == "before", "return_document must be before or after"
+    return ReturnDocument.BEFORE
+
+
+def _expand_collection_placeholder(value, collection_name):
+    if value == "$$collection":
+        return collection_name
+    if isinstance(value, dict):
+        return {
+            key: _expand_collection_placeholder(item, collection_name)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_expand_collection_placeholder(item, collection_name) for item in value]
+    return value
 
 
 @pytest.mark.parametrize("case", load_local_cases())

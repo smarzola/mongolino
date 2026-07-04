@@ -1,0 +1,170 @@
+{
+  "name": "findAndModify update replace delete and upsert",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "email": "ada@example.test",
+      "name": "Ada",
+      "score": 1,
+      "state": "queued"
+    },
+    {
+      "_id": "u2",
+      "email": "grace@example.test",
+      "name": "Grace",
+      "score": 3,
+      "state": "queued"
+    }
+  ],
+  "operations": [
+    {
+      "name": "create_index",
+      "keys": {
+        "email": 1
+      },
+      "index_name": "email_1",
+      "unique": true,
+      "expect_result": {
+        "name": "email_1"
+      }
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "state": "queued"
+      },
+      "sort": [
+        [
+          "score",
+          -1
+        ]
+      ],
+      "update": {
+        "$inc": {
+          "score": 1
+        },
+        "$set": {
+          "state": "running"
+        }
+      },
+      "projection": {
+        "_id": 1,
+        "state": 1,
+        "score": 1
+      },
+      "expect_result": {
+        "_id": "u2",
+        "state": "queued",
+        "score": 3
+      }
+    },
+    {
+      "name": "find_one_and_replace",
+      "filter": {
+        "_id": "u1"
+      },
+      "replacement": {
+        "email": "ada2@example.test",
+        "name": "Ada Lovelace",
+        "score": 5,
+        "state": "queued"
+      },
+      "return_document": "after",
+      "expect_result": {
+        "_id": "u1",
+        "email": "ada2@example.test",
+        "name": "Ada Lovelace",
+        "score": 5,
+        "state": "queued"
+      }
+    },
+    {
+      "name": "find_one_and_delete",
+      "filter": {
+        "state": "running"
+      },
+      "projection": {
+        "_id": 1,
+        "state": 1
+      },
+      "expect_result": {
+        "_id": "u2",
+        "state": "running"
+      }
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "_id": "u3",
+        "email": "new@example.test"
+      },
+      "update": {
+        "$set": {
+          "name": "New"
+        },
+        "$inc": {
+          "score": 1
+        }
+      },
+      "upsert": true,
+      "return_document": "after",
+      "expect_result": {
+        "_id": "u3",
+        "email": "new@example.test",
+        "name": "New",
+        "score": 1
+      }
+    },
+    {
+      "name": "find_one_and_replace",
+      "filter": {
+        "_id": "u3"
+      },
+      "replacement": {
+        "email": "ada2@example.test",
+        "name": "Duplicate",
+        "score": 1
+      },
+      "expect_error": {
+        "type": "DuplicateKeyError",
+        "code": 11000,
+        "contains": "duplicate key"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "findAndModify": "$$collection",
+        "query": {},
+        "update": {
+          "$set": {
+            "state": "bad"
+          }
+        },
+        "arrayFilters": []
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "arrayFilters"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "email": "ada2@example.test",
+      "name": "Ada Lovelace",
+      "score": 5,
+      "state": "queued"
+    },
+    {
+      "_id": "u3",
+      "email": "new@example.test",
+      "name": "New",
+      "score": 1
+    }
+  ]
+}

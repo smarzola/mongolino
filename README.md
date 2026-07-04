@@ -24,6 +24,8 @@ db.users.insertOne({ _id: "u1", name: "Ada" })
 db.users.insertOne({ _id: "u2", name: "Grace", age: 39, profile: { city: "London" } })
 db.users.find({ age: { $gte: 38 } }, { name: 1, _id: 0 }).sort({ age: -1 }).toArray()
 db.users.updateOne({ _id: "u1" }, { $set: { name: "Ada Lovelace" }, $inc: { score: 1 } })
+db.users.findOneAndUpdate({ _id: "u1" }, { $inc: { score: 1 } }, { returnDocument: "after" })
+db.users.aggregate([{ $match: { age: { $gte: 38 } } }, { $sort: { age: -1 } }, { $project: { name: 1 } }]).toArray()
 db.users.deleteOne({ _id: "u2" })
 ```
 
@@ -54,15 +56,16 @@ Compatibility flags:
 | `drop` | Partial | Drops a collection by removing its documents, catalog entry, user index metadata, and maintained index entries. | No view, change-stream, or storage-stat side effects. |
 | `dropDatabase` | Partial | Drops catalog entries and documents for the selected database only. | No users, roles, profiling collections, or storage statistics. |
 | `count` | Partial | Counts documents matching the supported filter subset, with `skip` and `limit`. PyMongo `estimated_document_count()` uses this path. | No hint, collation, read concern, maxTimeMS, or storage-stat semantics. |
-| `aggregate` | Partial | Supports only the PyMongo `count_documents()` pipeline shape: `$match`, optional `$skip`/`$limit`, and count `$group`. | General aggregation stages return command errors. |
+| `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`; preserves the PyMongo `count_documents()` `$group` shape; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`. | No expression language, `$lookup`, `$unwind`, `$facet`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$out`, `$merge`, `$geoNear`, general `$group`, allowDiskUse, collation, hint, read concern, write concern, explain, or maxTimeMS. |
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order. | No collation, hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key `writeErrors`, and supports ordered/unordered batches. | No write concern, bypass document validation, schema validation, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, and conservative scalar equality lookup through supported indexes. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, or tailable cursors. Unsupported operators return command errors. |
+| `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, `fields`/`projection`, pre-image or post-image return, update/replacement upsert, `_id` immutability, unique-index enforcement, and maintained index entries. | No array filters, pipeline updates, positional updates, collation, hint, write concern, maxTimeMS, bypass document validation, `let`, retryable writes, or transaction semantics. Unsupported shapes return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
 | `killCursors` | Partial | Removes live per-client cursors and reports `cursorsKilled` or `cursorsNotFound`. | No cross-connection cursor lookup. Malformed cursor ids return command errors. |
 | `update` | Partial | Supports replacement updates, `$set`, `$unset`, `$inc`, upsert, single-update, multi-update, ordered/unordered batches, `_id` immutability, and duplicate-key write errors. | No array filters, positional operators, pipeline updates, `$rename`, `$push`, `$pull`, hints, collation, write concern, retryable writes, or transactions. |
 | `delete` | Partial | Supports batch deletes with `q` and `limit`; `limit: 1` deletes one deterministic match and `limit: 0` deletes all matches. | No hints, collation, write concern, retryable writes, or explain behavior. |
-| Cursors | Partial | `find` stores remaining results under a positive cursor id, PyMongo can iterate across multiple batches, exhausted cursors close with `id: 0`, and `killCursors` explicitly closes live cursors. | No cursor timeout. Cursor state is not durable and is scoped to one client connection. Invalid or exhausted cursor ids return explicit command errors for `getMore`. |
+| Cursors | Partial | `find` and `aggregate` store remaining results under a positive cursor id, PyMongo can iterate across multiple batches, exhausted cursors close with `id: 0`, and `killCursors` explicitly closes live cursors. | No cursor timeout. Cursor state is not durable and is scoped to one client connection. Invalid or exhausted cursor ids return explicit command errors for `getMore`. |
 | BSON storage | Partial | Stores BSON blobs in SQLite, derives a stable primary key from `_id`, and maintains scalar equality index entries for supported simple indexes. Inserts with operator-shaped field names store those names as data. | No schema validation, document size enforcement beyond message size, compound index planning, or range planning. |
 | Authentication | Unsupported | No auth challenge or credential validation. | No SCRAM, x.509, keyfile, localhost exception, users, roles, or permissions. |
 | Transactions | Unsupported | No multi-operation transaction protocol. | No sessions, transaction numbers, retryable writes, snapshot reads, or rollback semantics. |
@@ -99,6 +102,17 @@ Update paths support dotted document fields. Dotted updates through scalar
 parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, attempts to change
 `_id`, and unsupported update operators are rejected with write errors.
 
+`findAndModify` uses the same matcher, sort, projection, update application,
+duplicate-key checks, and maintained index entries as `find`, `update`, and
+`delete`. It is SQLite-transaction backed for one selected document, but it does
+not implement MongoDB sessions, retryable writes, write concern durability
+semantics, or multi-document transactions.
+
+Aggregation is a document-stream subset. Each supported stage runs in order over
+the current stream, so `$limit` before `$skip` is intentionally different from
+`$skip` before `$limit`. Unsupported stages and projection expressions return
+command errors instead of being ignored.
+
 ## Development
 
 ```sh
@@ -118,6 +132,8 @@ Useful targeted subsets while developing:
 
 ```sh
 uv run --locked pytest tests/e2e/test_cursors.py
+uv run --locked pytest tests/e2e/test_find_and_modify.py
+uv run --locked pytest tests/e2e/test_aggregation.py
 uv run --locked pytest tests/e2e/test_lifecycle.py
 uv run --locked pytest tests/e2e/test_indexes.py
 uv run --locked pytest tests/e2e/test_metadata.py
@@ -138,6 +154,6 @@ and the PyMongo e2e suite on pushes and pull requests.
 ## Scope
 
 This is not a full MongoDB replacement. The next major pieces are
-collection/database lifecycle commands, indexes, broader query/update operators,
+broader query/update operators, more aggregation stages, richer index planning,
 authentication behavior, transactions, retryable writes, and deeper driver
 compatibility testing.

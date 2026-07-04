@@ -115,11 +115,11 @@ When a milestone is complete:
 - [x] Milestone 1: `findAndModify` command compatibility
 - [x] Milestone 2: Aggregation read pipeline subset
 - [x] Milestone 3: Aggregation cursor batching and adversarial command coverage
-- [ ] Milestone 4: Spec corpus, README, and final verification hardening
+- [x] Milestone 4: Spec corpus, README, and final verification hardening
 
 ## Milestone 0: Baseline and Shared Query-Shaping Preparation
 
-Status 2026-07-04: Complete. Introduced shared candidate loading, document shaping, and cursor response helpers while preserving existing `find` behavior. Verification: `cargo fmt -- --check` passed after applying `cargo fmt`; `cargo test find` passed; `cargo test aggregate` passed; `cargo test planner` passed; `cargo test` passed; `cargo build` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`.
+Status 2026-07-04: Complete. Commit: `65ebc54`. Introduced shared candidate loading, document shaping, and cursor response helpers while preserving existing `find` behavior. Verification: `cargo fmt -- --check` passed after applying `cargo fmt`; `cargo test find` passed; `cargo test aggregate` passed; `cargo test planner` passed; `cargo test` passed; `cargo build` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`.
 
 Problem:
 
@@ -171,7 +171,7 @@ Commit requirement:
 
 ## Milestone 1: `findAndModify` Command Compatibility
 
-Status 2026-07-04: Complete. Added `findAndModify` / `findandmodify` dispatch, transaction-backed update/replace/delete/upsert behavior, pre-image/post-image responses, projection aliases, unique-index enforcement, index-entry refresh/delete, and explicit errors for malformed or unsupported command shapes. Verification: `cargo fmt -- --check` passed; `cargo test find_and_modify` passed; `cargo test unique` passed; `cargo test planner` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_find_and_modify.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `cargo test` passed.
+Status 2026-07-04: Complete. Commit: `827ce53`. Added `findAndModify` / `findandmodify` dispatch, transaction-backed update/replace/delete/upsert behavior, pre-image/post-image responses, projection aliases, unique-index enforcement, index-entry refresh/delete, and explicit errors for malformed or unsupported command shapes. Verification: `cargo fmt -- --check` passed; `cargo test find_and_modify` passed; `cargo test unique` passed; `cargo test planner` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_find_and_modify.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `cargo test` passed.
 
 Problem:
 
@@ -260,7 +260,7 @@ Commit requirement:
 
 ## Milestone 2: Aggregation Read Pipeline Subset
 
-Status 2026-07-04: Complete. Implemented sequential aggregate stages for `$match`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`, while preserving the existing PyMongo `count_documents()` `$group` shape. Verification: `cargo fmt -- --check` passed; `cargo test aggregate` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py` failed with the same bind error; `cargo test` passed.
+Status 2026-07-04: Complete. Commit: `cf2b721`. Implemented sequential aggregate stages for `$match`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`, while preserving the existing PyMongo `count_documents()` `$group` shape. Verification: `cargo fmt -- --check` passed; `cargo test aggregate` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py` failed with the same bind error; `cargo test` passed.
 
 Problem:
 
@@ -324,7 +324,7 @@ Commit requirement:
 
 ## Milestone 3: Aggregation Cursor Batching and Adversarial Command Coverage
 
-Status 2026-07-04: Complete. Threaded aggregate through per-client cursor state, implemented `cursor.batchSize` parsing with explicit malformed-shape errors, stored aggregate remainders for `getMore`, and added unsupported aggregate option coverage. Verification: `cargo fmt -- --check` passed; `cargo test aggregate` passed; `cargo test get_more` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_cursors.py` failed with the same bind error; `cargo test` passed.
+Status 2026-07-04: Complete. Commit: `380047e`. Threaded aggregate through per-client cursor state, implemented `cursor.batchSize` parsing with explicit malformed-shape errors, stored aggregate remainders for `getMore`, and added unsupported aggregate option coverage. Verification: `cargo fmt -- --check` passed; `cargo test aggregate` passed; `cargo test get_more` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_cursors.py` failed with the same bind error; `cargo test` passed.
 
 Problem:
 
@@ -374,6 +374,8 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: Spec Corpus, README, and Final Verification Hardening
+
+Status 2026-07-04: Complete. Updated README compatibility tables/notes, extended the local spec corpus runner for `find_one_and_*` and aggregate operations, added corpus coverage for `findAndModify`, aggregation pipelines, aggregate cursor batching, and explicit unsupported errors, and recorded milestone commit hashes for completed milestones. Verification: `cargo fmt -- --check` passed; `cargo test` passed; `cargo build` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked python -m py_compile tests/e2e/test_spec_corpus.py tests/e2e/test_aggregation.py tests/e2e/test_find_and_modify.py` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1` (6 non-server tests passed, 1 skipped, fixture-bound e2e cases blocked).
 
 Problem:
 

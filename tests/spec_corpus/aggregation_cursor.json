@@ -1,0 +1,63 @@
+{
+  "name": "aggregation cursor batching",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "s1",
+      "score": 1
+    },
+    {
+      "_id": "s2",
+      "score": 2
+    },
+    {
+      "_id": "s3",
+      "score": 3
+    }
+  ],
+  "operations": [
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$sort": {
+            "_id": 1
+          }
+        },
+        {
+          "$project": {
+            "_id": 1
+          }
+        }
+      ],
+      "batch_size": 1,
+      "expect_documents": [
+        {
+          "_id": "s1"
+        },
+        {
+          "_id": "s2"
+        },
+        {
+          "_id": "s3"
+        }
+      ]
+    },
+    {
+      "name": "command",
+      "command": {
+        "aggregate": "$$collection",
+        "pipeline": [],
+        "cursor": {
+          "batchSize": 0
+        }
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 9,
+        "contains": "batchSize"
+      }
+    }
+  ]
+}

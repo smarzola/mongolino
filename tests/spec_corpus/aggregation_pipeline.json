@@ -1,0 +1,103 @@
+{
+  "name": "aggregation pipeline subset",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "s1",
+      "active": true,
+      "score": 7,
+      "team": "red"
+    },
+    {
+      "_id": "s2",
+      "active": false,
+      "score": 5,
+      "team": "blue"
+    },
+    {
+      "_id": "s3",
+      "active": true,
+      "score": 11,
+      "team": "red"
+    }
+  ],
+  "operations": [
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "team": "red"
+          }
+        },
+        {
+          "$sort": {
+            "score": -1
+          }
+        },
+        {
+          "$project": {
+            "_id": 1,
+            "score": 1
+          }
+        },
+        {
+          "$limit": 1
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "s3",
+          "score": 11
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "active": true
+          }
+        },
+        {
+          "$count": "total"
+        }
+      ],
+      "expect_documents": [
+        {
+          "total": 2
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$lookup": {
+            "from": "other"
+          }
+        }
+      ],
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "$lookup"
+      }
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$count": ""
+        }
+      ],
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 9,
+        "contains": "$count"
+      }
+    }
+  ]
+}
