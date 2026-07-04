@@ -2,9 +2,10 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from bson import BSON
 from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING
-from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, WriteError
 
 
 pytestmark = pytest.mark.e2e
@@ -44,6 +45,15 @@ def index_key_entry_count(db_path, namespace, index_name, key_value):
             """,
             (namespace, index_name, key_value),
         ).fetchone()[0]
+
+
+def stored_ids(db_path, namespace):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT bson FROM documents WHERE namespace = ? ORDER BY created_at",
+            (namespace,),
+        ).fetchall()
+    return [BSON(row[0]).decode()["_id"] for row in rows]
 
 
 def test_create_list_and_drop_indexes(collection):
@@ -264,6 +274,63 @@ def test_ttl_expiration_is_visible_through_reads_and_writes(collection):
 
     assert collection.find_one({"_id": "delete-now"}) is None
     assert collection.find_one({"_id": "delete-future"}) is not None
+
+
+def test_invalid_ttl_read_and_update_commands_do_not_sweep(collection, mongolino_server):
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(days=1)
+    future = now + timedelta(days=1)
+
+    def make_collection(suffix):
+        coll = collection.database[f"{collection.name}_{suffix}"]
+        coll.create_index(
+            [("expiresAt", ASCENDING)],
+            name="expires_ttl",
+            expireAfterSeconds=60,
+        )
+        coll.insert_many(
+            [
+                {"_id": "expired", "expiresAt": past, "category": "old"},
+                {"_id": "future", "expiresAt": future, "category": "new"},
+            ]
+        )
+        return coll
+
+    invalid_find = make_collection("invalid_find")
+    with pytest.raises(OperationFailure) as find_error:
+        list(invalid_find.find({"expiresAt": {"$near": past}}))
+    assert find_error.value.code == 2
+    assert stored_ids(
+        mongolino_server.db_path, f"{invalid_find.database.name}.{invalid_find.name}"
+    ) == ["expired", "future"]
+    assert ids(invalid_find.find({}).sort("_id", ASCENDING)) == ["future"]
+
+    invalid_aggregate = make_collection("invalid_aggregate")
+    with pytest.raises(OperationFailure) as aggregate_error:
+        list(invalid_aggregate.aggregate([{"$match": {"expiresAt": {"$near": past}}}]))
+    assert aggregate_error.value.code == 2
+    assert stored_ids(
+        mongolino_server.db_path,
+        f"{invalid_aggregate.database.name}.{invalid_aggregate.name}",
+    ) == ["expired", "future"]
+    assert ids(invalid_aggregate.find({}).sort("_id", ASCENDING)) == ["future"]
+
+    invalid_update = make_collection("invalid_update")
+    with pytest.raises(WriteError) as update_error:
+        invalid_update.update_one(
+            {"expiresAt": {"$near": past}},
+            {"$set": {"seen": True}},
+        )
+    assert update_error.value.code == 2
+    assert stored_ids(
+        mongolino_server.db_path,
+        f"{invalid_update.database.name}.{invalid_update.name}",
+    ) == ["expired", "future"]
+    invalid_update.update_one({"_id": "future"}, {"$set": {"seen": True}})
+    assert stored_ids(
+        mongolino_server.db_path,
+        f"{invalid_update.database.name}.{invalid_update.name}",
+    ) == ["future"]
 
 
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):

@@ -8233,14 +8233,17 @@ fn validate_elem_match_shape(operand: &Bson) -> MatchResult<()> {
     if predicate.is_empty() {
         return Err(match_error(2, "$elemMatch requires a non-empty document"));
     }
-    if predicate
-        .keys()
-        .all(|key| is_scalar_elem_match_operator(key))
-    {
+    if predicate.keys().all(|key| {
+        is_scalar_elem_match_operator(key) || (key.starts_with('$') && !is_logical_operator(key))
+    }) {
         validate_operator_document_shape(predicate)
     } else {
         validate_filter_shape(predicate)
     }
+}
+
+fn is_logical_operator(operator: &str) -> bool {
+    matches!(operator, "$and" | "$or" | "$nor")
 }
 
 fn validate_regex_predicate_shape(operand: &Bson, extra_options: Option<&Bson>) -> MatchResult<()> {
@@ -8636,6 +8639,7 @@ fn is_scalar_elem_match_operator(operator: &str) -> bool {
             | "$exists"
             | "$not"
             | "$regex"
+            | "$options"
             | "$type"
             | "$size"
             | "$all"

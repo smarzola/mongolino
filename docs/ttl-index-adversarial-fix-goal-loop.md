@@ -117,7 +117,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Read-path preflight validation before TTL sweeps
 - [x] Milestone 1: Write-path preflight validation before TTL sweeps
-- [ ] Milestone 2: PyMongo adversarial coverage and full verification
+- [x] Milestone 2: PyMongo adversarial coverage and full verification
 
 ## Milestone 0: Read-Path Preflight Validation Before TTL Sweeps
 
@@ -265,6 +265,18 @@ Likely files:
 - `tests/e2e/test_indexes.py`
 - `tests/e2e/test_validation.py`
 - `docs/ttl-index-adversarial-fix-goal-loop.md`
+
+Status note:
+
+- 2026-07-04: Added PyMongo adversarial TTL coverage for invalid `find`,
+  invalid `aggregate`, invalid update, and invalid insert validation with
+  expired TTL documents present. Full verification run: `cargo fmt --
+  --check`, `cargo test`, `cargo build`, `cargo run --bin mongolino-bench --
+  --profile ci --check-budget`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv lock --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
+  --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+  --locked pytest tests/e2e`. PyMongo e2e result: 188 passed. Implementation
+  commit: pending checkpoint.
 
 ## Final Response Requirements
 

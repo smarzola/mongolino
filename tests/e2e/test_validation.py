@@ -1,4 +1,8 @@
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from bson import BSON
 from pymongo import ReturnDocument
 from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, WriteError
 
@@ -27,6 +31,15 @@ def listed_options(db, name):
     return db.command({"listCollections": 1, "filter": {"name": name}})["cursor"][
         "firstBatch"
     ][0]["options"]
+
+
+def stored_ids(db_path, namespace):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT bson FROM documents WHERE namespace = ? ORDER BY created_at",
+            (namespace,),
+        ).fetchall()
+    return [BSON(row[0]).decode()["_id"] for row in rows]
 
 
 def test_create_collection_with_validator_is_listed(mongo_client):
@@ -227,6 +240,30 @@ def test_insert_enforces_validator_ordered_unordered_and_bypass(mongo_client):
             }
         )
     assert malformed.value.code == 9
+
+
+def test_invalid_ttl_insert_validation_does_not_sweep(mongo_client, mongolino_server):
+    db = mongo_client["validation_ttl_insert_no_sweep"]
+    collection = db.create_collection("users", validator=user_validator())
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    collection.create_index("expiresAt", name="expires_ttl", expireAfterSeconds=60)
+    collection.insert_many(
+        [
+            {"_id": "expired", "name": "Ada", "expiresAt": past},
+            {"_id": "future", "name": "Grace", "expiresAt": future},
+        ]
+    )
+
+    with pytest.raises(WriteError) as insert_error:
+        collection.insert_one({"_id": "bad", "expiresAt": future})
+    assert insert_error.value.code == 121
+    assert stored_ids(mongolino_server.db_path, f"{db.name}.{collection.name}") == [
+        "expired",
+        "future",
+    ]
+
+    assert [doc["_id"] for doc in collection.find({}).sort("_id", 1)] == ["future"]
 
 
 def test_update_enforces_validator_for_replacement_modifier_upsert_and_bypass(mongo_client):
