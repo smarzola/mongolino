@@ -377,6 +377,16 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 ```
 
+Adversarial repair 2026-07-04: Added `$type` numeric code `7` for ObjectId,
+mixed `$type` array coverage containing `7`, and explicit Mongo-compatible
+`$all: []` behavior that returns no matches. Added Rust matcher, PyMongo e2e,
+and spec-corpus coverage. Verification: `cargo fmt -- --check`, `cargo test
+type`, `cargo test all`, `cargo test elem`, `cargo test`, and `cargo build`
+passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+pytest tests/e2e/test_query_language.py tests/e2e/test_spec_corpus.py` was
+blocked by localhost binding permissions; the same command passed unsandboxed
+with 29 tests. Commit: pending.
+
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
 

@@ -6378,6 +6378,7 @@ fn query_type_name_for_code(code: i32, path: &str) -> MatchResult<BsonTypeName> 
         2 => Ok(BsonTypeName::String),
         3 => Ok(BsonTypeName::Object),
         4 => Ok(BsonTypeName::Array),
+        7 => Ok(BsonTypeName::ObjectId),
         8 => Ok(BsonTypeName::Bool),
         9 => Ok(BsonTypeName::Date),
         10 => Ok(BsonTypeName::Null),
@@ -6422,6 +6423,9 @@ fn matches_all_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> 
     let Bson::Array(required) = operand else {
         return Err(match_error(2, "$all requires an array"));
     };
+    if required.is_empty() {
+        return Ok(false);
+    }
     for required_value in required {
         if let Bson::Document(document) = required_value {
             if document.len() == 1 && document.contains_key("$elemMatch") {
@@ -11982,6 +11986,14 @@ mod tests {
             vec!["u1"]
         );
         assert_eq!(
+            find_ids(&conn, doc! { "oid": { "$type": 7_i32 } }),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "oid": { "$type": [7_i32, "string"] } }),
+            vec!["u1"]
+        );
+        assert_eq!(
             find_ids(&conn, doc! { "created": { "$type": 9_i32 } }),
             vec!["u1"]
         );
@@ -12020,6 +12032,7 @@ mod tests {
             find_ids(&conn, doc! { "scores": { "$all": [2_i32, 2_i32] } }),
             vec!["u1"]
         );
+        assert!(find_ids(&conn, doc! { "tags": { "$all": [] } }).is_empty());
         assert!(find_ids(&conn, doc! { "tags": { "$all": ["math", "missing"] } }).is_empty());
 
         for filter in [

@@ -72,6 +72,8 @@ def test_type_size_and_all_predicates_find_and_count(collection):
     ]
     assert ids(collection.find({"active": {"$type": "bool"}})) == ["u1"]
     assert ids(collection.find({"oid": {"$type": "objectId"}})) == ["u1"]
+    assert ids(collection.find({"oid": {"$type": 7}})) == ["u1"]
+    assert ids(collection.find({"oid": {"$type": [7, "string"]}})) == ["u1"]
     assert ids(collection.find({"nothing": {"$type": 10}})) == ["u1"]
     assert ids(collection.find({"age": {"$type": ["int", "long"]}}).sort("_id", ASCENDING)) == [
         "u1",
@@ -86,6 +88,7 @@ def test_type_size_and_all_predicates_find_and_count(collection):
 
     assert ids(collection.find({"tags": {"$all": ["logic", "math"]}})) == ["u1"]
     assert ids(collection.find({"scores": {"$all": [2, 2]}})) == ["u1"]
+    assert collection.count_documents({"tags": {"$all": []}}) == 0
     assert collection.count_documents({"tags": {"$all": ["math", "missing"]}}) == 0
 
     assert ids(collection.find({"scores": {"$elemMatch": {"$gt": 4, "$lt": 7}}})) == ["u1"]

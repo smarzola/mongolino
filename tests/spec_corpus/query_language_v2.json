@@ -94,6 +94,12 @@
         1,
         2
       ]
+    },
+    {
+      "name": "Generated ObjectId",
+      "tags": [
+        "generated"
+      ]
     }
   ],
   "operations": [
@@ -171,6 +177,23 @@
     {
       "name": "find",
       "filter": {
+        "_id": {
+          "$type": 7
+        }
+      },
+      "projection": {
+        "_id": 0,
+        "name": 1
+      },
+      "expect_documents": [
+        {
+          "name": "Generated ObjectId"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
         "profile": {
           "$type": "object"
         }
@@ -218,6 +241,18 @@
           "_id": "u1"
         }
       ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "tags": {
+          "$all": []
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": []
     },
     {
       "name": "find",
