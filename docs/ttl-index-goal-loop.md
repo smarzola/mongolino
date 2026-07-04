@@ -567,6 +567,26 @@ Status:
   --locked pytest tests/e2e` (186 passed, outside sandbox due localhost bind).
   Commit: `3fdeafd`.
 
+Parent adversarial review:
+
+- 2026-07-04: Parent review found a blocking no-mutation-on-error gap: some
+  read/write paths could run TTL sweeps before all command-specific validation
+  completed. A dedicated fix prompt was created at
+  `docs/ttl-index-adversarial-fix-goal-loop.md` and completed by subagent with
+  commits `ac22037`, `e1d14bb`, `287158d`, `7110352`, `3b4aaaf`, and
+  `d1658c4`.
+- 2026-07-04: Parent re-review accepted the fix after inspecting the preflight
+  validation code and adversarial Rust/PyMongo tests. Verification passed:
+  `cargo fmt -- --check`; `cargo test ttl`; `cargo test find_rejects`;
+  `cargo test aggregate`; `cargo test update`; `cargo test delete`;
+  `cargo test validation`; full `cargo test` (161 main tests and 163 bench
+  target tests); `cargo build`; `cargo run --bin mongolino-bench --
+  --profile ci --check-budget`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv lock --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
+  --locked --dev`; and unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv run --locked pytest tests/e2e` (188 passed). No remaining blocking TTL
+  issues found.
+
 Likely files:
 
 - `README.md`
