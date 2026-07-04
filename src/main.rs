@@ -1000,6 +1000,9 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
         Some(Bson::Document(filter)) => filter.clone(),
         Some(_) => return Ok(command_error(9, "count query must be a document")),
     };
+    if let Err(err) = validate_filter_shape(&filter) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
     let skip = match optional_i64(command, "skip") {
         Ok(Some(value)) if value < 0 => return Ok(command_error(9, "skip must be non-negative")),
         Ok(Some(value)) => value as usize,
@@ -1088,6 +1091,9 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
         Some(Bson::Document(filter)) => filter.clone(),
         Some(_) => return Ok(command_error(9, "distinct query must be a document")),
     };
+    if let Err(err) = validate_filter_shape(&filter) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
 
     let mut values = Vec::<Bson>::new();
     let ns = namespace(db, collection);
@@ -1147,6 +1153,9 @@ fn aggregate_command_with_state(
         Ok(pipeline) => pipeline,
         Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
     };
+    if let Err(response) = validate_aggregate_pipeline_shape(pipeline) {
+        return Ok(response);
+    }
     let ns = namespace(db, collection);
     sweep_ttl_namespace(conn, &ns)?;
     if let Some(documents) = aggregate_match_count_pushdown(conn, &ns, pipeline)? {
@@ -1378,6 +1387,87 @@ fn aggregate_pipeline_documents(
     }
 
     Ok(Ok(documents))
+}
+
+fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(), Document> {
+    for stage in pipeline {
+        let Bson::Document(stage) = stage else {
+            return Err(command_error(
+                9,
+                "aggregate pipeline stages must be documents",
+            ));
+        };
+        if stage.len() != 1 {
+            return Err(command_error(
+                72,
+                "aggregate stages must contain one operator",
+            ));
+        }
+        let (operator, operand) = stage.iter().next().expect("stage len checked above");
+        match operator.as_str() {
+            "$match" => {
+                let Bson::Document(filter) = operand else {
+                    return Err(command_error(9, "$match requires a document"));
+                };
+                if let Err(err) = validate_filter_shape(filter) {
+                    return Err(command_error(err.code, &err.errmsg));
+                }
+            }
+            "$sort" => {
+                let Bson::Document(sort) = operand else {
+                    return Err(command_error(9, "$sort requires a document"));
+                };
+                if let Err(errmsg) = parse_sort_document(sort) {
+                    return Err(command_error(2, &errmsg));
+                }
+            }
+            "$skip" => {
+                non_negative_stage_usize(operand, "$skip")?;
+            }
+            "$limit" => {
+                non_negative_stage_usize(operand, "$limit")?;
+            }
+            "$project" => {
+                let Bson::Document(projection) = operand else {
+                    return Err(command_error(9, "$project requires a document"));
+                };
+                if let Err(errmsg) = parse_projection_document(projection) {
+                    return Err(command_error(2, &errmsg));
+                }
+            }
+            "$count" => {
+                let Bson::String(field) = operand else {
+                    return Err(command_error(
+                        9,
+                        "$count requires a non-empty string field name",
+                    ));
+                };
+                if field.is_empty() {
+                    return Err(command_error(
+                        9,
+                        "$count requires a non-empty string field name",
+                    ));
+                }
+            }
+            "$unwind" => {
+                parse_unwind_stage(operand)?;
+            }
+            "$group" => {
+                let Bson::Document(group) = operand else {
+                    return Err(command_error(9, "$group requires a document"));
+                };
+                parse_group_stage(group)?;
+            }
+            _ => {
+                return Err(command_error(
+                    72,
+                    &format!("aggregate stage {operator} is not supported"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6773,6 +6863,9 @@ fn find_documents_with_state(
         Some(Bson::Document(filter)) => filter.clone(),
         Some(_) => return Ok(command_error(9, "find filter must be a document")),
     };
+    if let Err(err) = validate_filter_shape(&filter) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
         &[
@@ -7845,6 +7938,170 @@ fn matches_filter(document: &Document, filter: &Document) -> MatchResult<bool> {
         }
     }
     Ok(true)
+}
+
+fn validate_filter_shape(filter: &Document) -> MatchResult<()> {
+    for (key, condition) in filter {
+        if key.starts_with('$') {
+            validate_logical_operator_shape(key, condition)?;
+        } else {
+            validate_field_condition_shape(condition)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_logical_operator_shape(operator: &str, operand: &Bson) -> MatchResult<()> {
+    if !matches!(operator, "$and" | "$or" | "$nor") {
+        return Err(match_error(
+            2,
+            format!("unsupported top-level query operator {operator}"),
+        ));
+    }
+
+    let clauses = match operand {
+        Bson::Array(clauses) if !clauses.is_empty() => clauses,
+        Bson::Array(_) => {
+            return Err(match_error(
+                2,
+                format!("{operator} requires a non-empty array"),
+            ));
+        }
+        _ => return Err(match_error(2, format!("{operator} requires an array"))),
+    };
+
+    for clause in clauses {
+        let Bson::Document(clause) = clause else {
+            return Err(match_error(
+                2,
+                format!("{operator} entries must be documents"),
+            ));
+        };
+        validate_filter_shape(clause)?;
+    }
+    Ok(())
+}
+
+fn validate_field_condition_shape(condition: &Bson) -> MatchResult<()> {
+    if is_operator_document(condition) {
+        let Bson::Document(operators) = condition else {
+            unreachable!("operator document checked above");
+        };
+        validate_operator_document_shape(operators)?;
+    } else if matches!(condition, Bson::RegularExpression(_)) {
+        validate_regex_predicate_shape(condition, None)?;
+    }
+    Ok(())
+}
+
+fn validate_operator_document_shape(operators: &Document) -> MatchResult<()> {
+    if operators.keys().any(|key| !key.starts_with('$')) {
+        return Err(match_error(
+            2,
+            "field predicate cannot mix operators and literal document fields",
+        ));
+    }
+    if operators.contains_key("$options") && !operators.contains_key("$regex") {
+        return Err(match_error(2, "$options requires $regex"));
+    }
+
+    for (operator, operand) in operators {
+        match operator.as_str() {
+            "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {}
+            "$in" => {
+                if !matches!(operand, Bson::Array(_)) {
+                    return Err(match_error(2, "$in requires an array"));
+                }
+            }
+            "$nin" => {
+                if !matches!(operand, Bson::Array(_)) {
+                    return Err(match_error(2, "$nin requires an array"));
+                }
+            }
+            "$exists" => {
+                if !matches!(operand, Bson::Boolean(_)) {
+                    return Err(match_error(2, "$exists requires a boolean"));
+                }
+            }
+            "$not" => {
+                let Bson::Document(nested) = operand else {
+                    return Err(match_error(2, "$not requires a document"));
+                };
+                validate_operator_document_shape(nested)?;
+            }
+            "$regex" => {
+                validate_regex_predicate_shape(operand, operators.get("$options"))?;
+            }
+            "$options" => {}
+            "$type" => {
+                parse_query_type_set(operand, "$type")?;
+            }
+            "$size" => {
+                parse_non_negative_i32(operand, "$size")?;
+            }
+            "$all" => validate_all_predicate_shape(operand)?,
+            "$elemMatch" => validate_elem_match_shape(operand)?,
+            _ => {
+                return Err(match_error(
+                    2,
+                    format!("unsupported query operator {operator}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_all_predicate_shape(operand: &Bson) -> MatchResult<()> {
+    let Bson::Array(required) = operand else {
+        return Err(match_error(2, "$all requires an array"));
+    };
+    for required_value in required {
+        if let Bson::Document(document) = required_value {
+            if document.len() == 1
+                && let Some(elem_match) = document.get("$elemMatch")
+            {
+                validate_elem_match_shape(elem_match)?;
+                continue;
+            }
+        }
+        if is_operator_document(required_value) {
+            return Err(match_error(2, "$all entries cannot be operator documents"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_elem_match_shape(operand: &Bson) -> MatchResult<()> {
+    let Bson::Document(predicate) = operand else {
+        return Err(match_error(2, "$elemMatch requires a document"));
+    };
+    if predicate.is_empty() {
+        return Err(match_error(2, "$elemMatch requires a non-empty document"));
+    }
+    if predicate
+        .keys()
+        .all(|key| is_scalar_elem_match_operator(key))
+    {
+        validate_operator_document_shape(predicate)
+    } else {
+        validate_filter_shape(predicate)
+    }
+}
+
+fn validate_regex_predicate_shape(operand: &Bson, extra_options: Option<&Bson>) -> MatchResult<()> {
+    let (pattern, regex_options) = match operand {
+        Bson::String(pattern) => (pattern.as_str(), ""),
+        Bson::RegularExpression(regex) => (regex.pattern.as_str(), regex.options.as_str()),
+        _ => return Err(match_error(2, "$regex requires a string or BSON regex")),
+    };
+    let extra_options = match extra_options {
+        None => "",
+        Some(Bson::String(options)) => options.as_str(),
+        Some(_) => return Err(match_error(2, "$options requires a string")),
+    };
+    build_query_regex(pattern, &[regex_options, extra_options])?;
+    Ok(())
 }
 
 fn matches_logical_operator(
@@ -12320,6 +12577,151 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn raw_ids_in_namespace(conn: &Connection, namespace: &str) -> Vec<String> {
+        documents_for_namespace(conn, namespace)
+            .unwrap()
+            .into_iter()
+            .map(|document| document.get_str("_id").unwrap().to_string())
+            .collect()
+    }
+
+    fn assert_invalid_ttl_read_preserves_expired(
+        conn: &Connection,
+        collection: &str,
+        response: Document,
+    ) {
+        assert_command_error(&response);
+        assert_eq!(
+            raw_ids_in_namespace(conn, &format!("app.{collection}")),
+            vec!["expired", "future"]
+        );
+    }
+
+    #[test]
+    fn ttl_invalid_read_commands_do_not_sweep_expired_documents() {
+        let conn = test_conn();
+
+        seed_ttl_command_fixture(&conn, "bad_find_field");
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "bad_find_field",
+                "$db": "app",
+                "filter": { "category": { "$near": "old" } },
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_find_field", response);
+
+        seed_ttl_command_fixture(&conn, "bad_find_top");
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "bad_find_top",
+                "$db": "app",
+                "filter": { "$where": "this.category == 'old'" },
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_find_top", response);
+
+        seed_ttl_command_fixture(&conn, "bad_count");
+        let response = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "bad_count",
+                "$db": "app",
+                "query": { "category": { "$near": "old" } },
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_count", response);
+
+        seed_ttl_command_fixture(&conn, "bad_distinct");
+        let response = distinct_command(
+            &conn,
+            &doc! {
+                "distinct": "bad_distinct",
+                "$db": "app",
+                "key": "category",
+                "query": { "category": { "$near": "old" } },
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_distinct", response);
+
+        seed_ttl_command_fixture(&conn, "bad_aggregate_stage");
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_aggregate_stage",
+                "$db": "app",
+                "pipeline": [{ "$lookup": { "from": "other" } }],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_aggregate_stage", response);
+
+        seed_ttl_command_fixture(&conn, "bad_aggregate_match");
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_aggregate_match",
+                "$db": "app",
+                "pipeline": [{ "$match": { "category": { "$near": "old" } } }],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_aggregate_match", response);
+    }
+
+    #[test]
+    fn ttl_invalid_filter_errors_are_not_masked_when_all_documents_expired() {
+        let conn = test_conn();
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "all_expired",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "all_expired",
+                "$db": "app",
+                "documents": [{ "_id": "expired", "expiresAt": past }],
+            },
+        )
+        .unwrap();
+
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "all_expired",
+                "$db": "app",
+                "filter": { "category": { "$near": "old" } },
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert_eq!(
+            response.get_str("errmsg").unwrap(),
+            "unsupported query operator $near"
+        );
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.all_expired"),
+            vec!["expired"]
+        );
     }
 
     #[test]
