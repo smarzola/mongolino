@@ -18,6 +18,7 @@ const COMPOUND_COLL: &str = "compound_users";
 const PARTIAL_COLL: &str = "partial_users";
 const PARTIAL_UNIQUE_COLL: &str = "partial_unique_users";
 const MULTIKEY_COLL: &str = "multikey_users";
+const COLLATION_COLL: &str = "collation_users";
 
 #[derive(Clone, Copy, Debug)]
 struct Profile {
@@ -248,6 +249,40 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "find_collation_scan_equality",
+        args.profile.iterations,
+        doc! {
+            "find": COLLATION_COLL,
+            "filter": { "team": "PLATFORM" },
+            "collation": { "locale": "en", "strength": 2_i32 },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_collation_index_equality",
+        args.profile.iterations,
+        doc! {
+            "find": COLLATION_COLL,
+            "filter": { "name": collation_target_name(args.profile.documents) },
+            "collation": { "locale": "en", "strength": 2_i32 },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "find_collation_sort_fallback",
+        args.profile.iterations,
+        doc! {
+            "find": COLLATION_COLL,
+            "filter": { "team": "platform" },
+            "sort": { "name": 1_i32 },
+            "collation": { "locale": "en", "strength": 2_i32 },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "count_empty_filter",
         args.profile.iterations,
         doc! {
@@ -445,6 +480,7 @@ impl Harness {
         self.seed_partial_collection()?;
         self.seed_partial_unique_collection()?;
         self.seed_multikey_collection()?;
+        self.seed_collation_collection()?;
         Ok(())
     }
 
@@ -552,6 +588,35 @@ impl Harness {
                 .collect::<Vec<_>>();
             self.command(doc! {
                 "insert": MULTIKEY_COLL,
+                "documents": documents,
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn seed_collation_collection(&mut self) -> Result<()> {
+        self.command(doc! {
+            "createIndexes": COLLATION_COLL,
+            "indexes": [
+                {
+                    "key": { "name": 1_i32 },
+                    "name": "name_ci",
+                    "collation": { "locale": "en", "strength": 2_i32 },
+                },
+            ],
+            "$db": DB,
+        })?;
+
+        for chunk_start in (0..self.profile.documents).step_by(self.profile.insert_batch) {
+            let chunk_end = (chunk_start + self.profile.insert_batch).min(self.profile.documents);
+            let documents = (chunk_start..chunk_end)
+                .map(collation_seed_document)
+                .map(Bson::Document)
+                .collect::<Vec<_>>();
+            self.command(doc! {
+                "insert": COLLATION_COLL,
                 "documents": documents,
                 "ordered": true,
                 "$db": DB,
@@ -886,6 +951,29 @@ fn multikey_seed_document(i: usize) -> Document {
     }
 }
 
+fn collation_target_name(documents: usize) -> String {
+    format!("USER{}", documents / 2)
+}
+
+fn collation_seed_document(i: usize) -> Document {
+    let name = if i % 2 == 0 {
+        format!("User{i}")
+    } else {
+        format!("user{i}")
+    };
+    let team = match i % 4 {
+        0 => "Platform",
+        1 => "platform",
+        2 => "Infra",
+        _ => "infra",
+    };
+    doc! {
+        "_id": format!("collation-user-{i}"),
+        "name": name,
+        "team": team,
+    }
+}
+
 fn assert_ok(response: &Document, context: &str) -> Result<()> {
     match response.get_f64("ok") {
         Ok(value) if (value - 1.0).abs() < f64::EPSILON => Ok(()),
@@ -1034,6 +1122,9 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "find_hint_range" => (120.0, 8.0),
         "find_sort_index_skip_limit" => (80.0, 12.0),
         "find_partial_index_equality" => (80.0, 12.0),
+        "find_collation_scan_equality" => (250.0, 4.0),
+        "find_collation_index_equality" => (80.0, 12.0),
+        "find_collation_sort_fallback" => (300.0, 3.0),
         "count_empty_filter" => (250.0, 4.0),
         "count_simple_equality" => (250.0, 4.0),
         "count_compound_equality" => (25.0, 40.0),

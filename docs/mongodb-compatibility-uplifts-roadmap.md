@@ -13,14 +13,20 @@ subset, but several major MongoDB application surfaces remain unsupported or
 intentionally conservative:
 
 - Query predicates now support a practical `$regex`, `$elemMatch`, `$type`,
-  `$size`, and `$all` subset; JavaScript, geospatial/text, expression, and
-  collation-aware predicates remain unsupported.
+  `$size`, `$all`, and supported collation equality subset; JavaScript,
+  geospatial/text, expression, and non-simple collation range predicates remain
+  unsupported.
 - Index planning now supports conservative compound prefix scans, safe scalar
   range scans, narrow sort pushdown, `hint`, and partial `explain`
   diagnostics. Broader index classes and unsafe shapes remain unsupported.
-- TTL index metadata, deterministic expiration, and narrow TTL `collMod`
-  updates are supported for the documented single-field date subset.
-- Collation is rejected on find/count/distinct/aggregate/write paths.
+- TTL index metadata, deterministic expiration, narrow TTL `collMod` updates,
+  and supported collation-aware index metadata are available for documented safe
+  shapes.
+- Collation support is limited to `{ locale: "simple" }` and English
+  case-insensitive strength-2 equality/sort behavior on supported command paths.
+  ICU collation, numeric ordering, diacritic folding, locale-specific ordering,
+  non-simple range predicates, and unsafe collation/index combinations remain
+  unsupported.
 - Aggregation has no general expression language, `$addFields`, `$lookup`, or
   broader stage coverage.
 - Update pipelines, positional operators, and `arrayFilters` are unsupported.
@@ -34,14 +40,14 @@ claim of full MongoDB parity.
 
 | Area | Weight | Current | Target After 7 Uplifts |
 | --- | ---: | ---: | ---: |
-| Query predicate compatibility | 20% | 17% | 17% |
+| Query predicate compatibility | 20% | 18% | 18% |
 | Index planning and diagnostics | 15% | 15% | 15% |
-| Index lifecycle/TTL/collation behavior | 15% | 11% | 11% |
-| Aggregation compatibility | 20% | 9% | 15% |
+| Index lifecycle/TTL/collation behavior | 15% | 13% | 13% |
+| Aggregation compatibility | 20% | 10% | 15% |
 | Update language compatibility | 15% | 8% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 68% | 83% |
+| Total | 100% | 72% | 86% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -70,9 +76,15 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt to write after Index Planner v2: `docs/ttl-index-goal-loop.md`.
 
 4. Collation Support
-   - Add a supported simple collation subset for equality/sort and
-     collation-aware indexes where safe.
-   - Prompt to write after TTL: `docs/collation-compatibility-goal-loop.md`.
+   - Complete in uplift 4. Added `{ locale: "simple" }` and English
+     case-insensitive strength-2 collation for supported equality, sort,
+     distinct, read/write target selection, aggregate `$match`/`$sort`/`$count`,
+     and safe matching collation-aware indexes.
+   - Unsupported ICU options, unsupported locales/strengths, non-simple string
+     ranges, collation with TTL/partial indexes, and unsafe hints return
+     explicit errors or fall back without using binary indexes for non-simple
+     semantics.
+   - Prompt: `docs/collation-compatibility-goal-loop.md`.
 
 5. Aggregation v2
    - Add expression evaluation, `$addFields`/`$set`, broader `$project`, and a

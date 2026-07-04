@@ -517,3 +517,36 @@ Headline movement:
 - `find_sort_index_skip_limit` is budgeted as a gross-regression guard; the
   conservative proof avoids unsafe sorts, but this debug smoke run is not yet a
   headline latency win.
+
+## Collation Compatibility Uplift Results
+
+Recorded on 2026-07-04 from the working tree based on commit `8c1c09f` after
+adding the supported collation subset and benchmark wiring. Benchmarks used the
+debug `cargo run --bin mongolino-bench -- --profile ci --check-budget` command.
+
+Delivered implementation:
+
+- Adds a dedicated collation benchmark collection with mixed-case names and a
+  matching `{ locale: "en", strength: 2 }` index on `name`.
+- Exercises non-simple collation scan equality, matching collation-aware index
+  equality, and non-simple collation sort fallback.
+- Keeps CI thresholds coarse because these debug benchmarks are regression
+  guards, not MongoDB parity claims.
+
+CI profile budget check passed with:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| find_collation_scan_equality | 30 | 70.13 | 427.79 | 2.338 |
+| find_collation_index_equality | 30 | 13.82 | 2170.13 | 0.461 |
+| find_collation_sort_fallback | 30 | 83.17 | 360.72 | 2.772 |
+
+Interpretation:
+
+- Matching collation-aware equality indexes use maintained folded string keys
+  and stay in the same latency band as existing scalar equality index checks on
+  the CI profile.
+- Non-simple collation sort remains a Rust-side fallback by design. The budget
+  guards against gross regressions without claiming broad sort pushdown.
+- Unsafe non-simple collation range planning is intentionally absent; those
+  shapes return command/write errors and are covered by Rust and PyMongo tests.

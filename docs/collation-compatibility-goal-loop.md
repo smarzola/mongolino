@@ -195,7 +195,7 @@ When a milestone is complete:
 - [x] Milestone 2: Collation-aware write target selection and no-mutation errors
 - [x] Milestone 3: Index metadata, unique enforcement, and safe planning
 - [x] Milestone 4: PyMongo/spec-corpus adversarial coverage
-- [ ] Milestone 5: Benchmarks, docs, scorecard, final verification
+- [x] Milestone 5: Benchmarks, docs, scorecard, final verification
 
 ## Milestone 0: Collation Parser And Comparison Model
 
@@ -468,7 +468,7 @@ assertion does not itself trigger a sweep. Verified with `cargo fmt -- --check`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_crud.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_find_and_modify.py tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py`
 after the same pytest command was blocked in-sandbox by
 `socket.bind(("127.0.0.1", 0))` returning `PermissionError: [Errno 1]
-Operation not permitted`. PyMongo result: 142 passed. Commit: pending.
+Operation not permitted`. PyMongo result: 142 passed. Commit: 8c1c09f.
 
 ## Milestone 5: Benchmarks, Docs, Scorecard, Final Verification
 
@@ -520,6 +520,25 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 ```
+
+Status 2026-07-04: Complete. Added collation benchmark coverage for
+case-insensitive scan equality, matching collation-aware index equality, and
+non-simple collation sort fallback; unique enforcement remains covered by Rust
+unit tests and PyMongo e2e because the benchmark harness is a steady-state
+budget guard rather than an error-path duplicate-write benchmark. Updated the
+README command/storage/index rows, documented the narrow collation subset and
+unsupported ICU/range/planner gaps, updated the roadmap scorecard from 68% to
+72%, and recorded CI-profile benchmark results in
+`docs/performance-baseline.md`. Final verification passed with
+`cargo fmt -- --check`, `cargo test` (172 main tests and 174 bench-target
+tests), `cargo build`, `cargo run --bin mongolino-bench -- --profile ci
+--check-budget`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock
+--check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
+--dev`, and unsandboxed
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+(196 passed). The same pytest command was blocked in-sandbox by
+`socket.bind(("127.0.0.1", 0))` returning `PermissionError: [Errno 1]
+Operation not permitted`. Commit: final checkpoint commit; see handoff.
 
 ## Final Response Requirements
 
