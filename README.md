@@ -158,6 +158,12 @@ cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-s
 cargo run --bin mongolino-bench -- --profile local --json /tmp/mongolino-bench-local.json
 ```
 
+Run the CI-friendly smoke budget locally:
+
+```sh
+cargo run --bin mongolino-bench -- --profile ci --check-budget
+```
+
 Profiles:
 
 - `smoke`: fast local check with small seeded collections.
@@ -166,7 +172,9 @@ Profiles:
 
 The benchmark harness creates temporary SQLite databases, seeds data through
 `mongolino` command handlers, and exercises real insert, find, count, update,
-index-entry refresh, and aggregation paths.
+index-entry refresh, and aggregation paths. Budget thresholds are intentionally
+coarse: they are meant to catch severe regressions in CI, not to decide small
+performance wins.
 
 Run the PyMongo end-to-end suite with `uv`:
 

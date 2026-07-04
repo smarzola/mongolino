@@ -100,7 +100,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Benchmark harness design and workload seeding
 - [x] Milestone 1: Benchmark command and machine-readable output
-- [ ] Milestone 2: CI-friendly performance budget smoke
+- [x] Milestone 2: CI-friendly performance budget smoke
 - [ ] Milestone 3: Baseline results and SQLite pushdown roadmap
 - [ ] Milestone 4: Final correctness verification and docs
 
@@ -166,7 +166,7 @@ Status note:
   ops/sec, and latency fields. Verification run: `cargo fmt -- --check`;
   `cargo test`; `cargo run --bin mongolino-bench -- --profile smoke`;
   `cargo run --bin mongolino-bench -- --profile smoke --json
-  /tmp/mongolino-bench-smoke.json`. Commit hash: pending.
+  /tmp/mongolino-bench-smoke.json`. Commit hash: `2758dca`.
 
 Problem:
 
@@ -212,6 +212,14 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 2: CI-Friendly Performance Budget Smoke
+
+Status note:
+
+- 2026-07-04: Added the `ci` profile smoke budget to GitHub Actions after
+  `cargo build`, and documented that thresholds are intentionally coarse enough
+  for CI variance while still catching severe regressions. Verification run:
+  `cargo fmt -- --check`; `cargo run --bin mongolino-bench -- --profile ci
+  --check-budget`; `cargo test`. Commit hash: pending.
 
 Problem:
 

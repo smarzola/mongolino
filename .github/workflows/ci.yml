@@ -38,6 +38,9 @@ jobs:
       - name: Build Rust binary
         run: cargo build
 
+      - name: Run performance budget smoke
+        run: cargo run --bin mongolino-bench -- --profile ci --check-budget
+
       - name: Sync Python e2e environment
         run: uv sync --locked --dev
 
