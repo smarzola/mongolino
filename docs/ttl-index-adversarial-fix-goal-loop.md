@@ -152,7 +152,7 @@ Status note:
 - 2026-07-04: Added query filter and aggregate pipeline preflight validation
   before read-path TTL sweeps. Verification run: `cargo fmt -- --check`,
   `cargo test ttl`, `cargo test find_rejects`, `cargo test aggregate`,
-  `cargo test count`. Commit: `4a7cf87`.
+  `cargo test count`. Implementation commit: `ac22037`.
 
 Likely files:
 
