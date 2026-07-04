@@ -52,9 +52,10 @@ Compatibility flags:
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key `writeErrors`, and supports ordered/unordered batches. | No write concern, bypass document validation, schema validation, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, and capped batch size. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, tailable cursors, or secondary indexes. Unsupported operators return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
+| `killCursors` | Partial | Removes live per-client cursors and reports `cursorsKilled` or `cursorsNotFound`. | No cross-connection cursor lookup. Malformed cursor ids return command errors. |
 | `update` | Partial | Supports replacement updates, `$set`, `$unset`, `$inc`, upsert, single-update, multi-update, ordered/unordered batches, `_id` immutability, and duplicate-key write errors. | No array filters, positional operators, pipeline updates, `$rename`, `$push`, `$pull`, hints, collation, write concern, retryable writes, or transactions. |
 | `delete` | Partial | Supports batch deletes with `q` and `limit`; `limit: 1` deletes one deterministic match and `limit: 0` deletes all matches. | No hints, collation, write concern, retryable writes, or explain behavior. |
-| Cursors | Partial | `find` stores remaining results under a positive cursor id, PyMongo can iterate across multiple batches, and exhausted cursors close with `id: 0`. | No cursor timeout or kill cursor support yet. Cursor state is not durable and is scoped to one client connection. |
+| Cursors | Partial | `find` stores remaining results under a positive cursor id, PyMongo can iterate across multiple batches, exhausted cursors close with `id: 0`, and `killCursors` explicitly closes live cursors. | No cursor timeout. Cursor state is not durable and is scoped to one client connection. Invalid or exhausted cursor ids return explicit command errors for `getMore`. |
 | BSON storage | Partial | Stores BSON blobs in SQLite and derives a stable primary key from `_id`. Inserts with operator-shaped field names store those names as data. | No typed secondary indexes, schema validation, document size enforcement beyond message size, or query planning. |
 | Authentication | Unsupported | No auth challenge or credential validation. | No SCRAM, x.509, keyfile, localhost exception, users, roles, or permissions. |
 | Transactions | Unsupported | No multi-operation transaction protocol. | No sessions, transaction numbers, retryable writes, snapshot reads, or rollback semantics. |
@@ -116,7 +117,7 @@ and the PyMongo e2e suite on pushes and pull requests.
 
 ## Scope
 
-This is not a full MongoDB replacement. The next major pieces are cursor kill
-support, collection/database lifecycle commands, indexes, broader query/update
-operators, authentication behavior, transactions, retryable writes, and deeper
-driver compatibility testing.
+This is not a full MongoDB replacement. The next major pieces are
+collection/database lifecycle commands, indexes, broader query/update operators,
+authentication behavior, transactions, retryable writes, and deeper driver
+compatibility testing.

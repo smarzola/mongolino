@@ -464,6 +464,7 @@ fn handle_command_with_state(
         "insert" => insert_documents(conn, command),
         "find" => find_documents_with_state(conn, client_state, command),
         "getMore" => get_more(client_state, command),
+        "killCursors" => kill_cursors(client_state, command),
         "update" => update_documents(conn, command),
         "delete" => delete_documents(conn, command),
         other => Ok(command_error(
@@ -1464,6 +1465,57 @@ fn get_more(client_state: &mut ClientState, command: &Document) -> Result<Docume
     ))
 }
 
+fn kill_cursors(client_state: &mut ClientState, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("killCursors") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "killCursors requires a collection name")),
+    };
+    let cursor_ids = match command.get_array("cursors") {
+        Ok(cursors) => cursors,
+        Err(_) => return Ok(command_error(9, "killCursors requires a cursors array")),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["killCursors", "cursors", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let ns = namespace(db, collection);
+    let mut cursors_killed = Vec::new();
+    let mut cursors_not_found = Vec::new();
+
+    for value in cursor_ids {
+        let cursor_id = match value {
+            Bson::Int64(value) if *value > 0 => *value,
+            Bson::Int32(value) if *value > 0 => *value as i64,
+            Bson::Int64(_) | Bson::Int32(_) => {
+                return Ok(command_error(9, "killCursors cursor ids must be positive"));
+            }
+            _ => return Ok(command_error(9, "killCursors cursor ids must be integers")),
+        };
+
+        if client_state
+            .cursors
+            .get(&cursor_id)
+            .is_some_and(|cursor| cursor.namespace == ns)
+        {
+            client_state.cursors.remove(&cursor_id);
+            cursors_killed.push(Bson::Int64(cursor_id));
+        } else {
+            cursors_not_found.push(Bson::Int64(cursor_id));
+        }
+    }
+
+    Ok(doc! {
+        "cursorsKilled": cursors_killed,
+        "cursorsNotFound": cursors_not_found,
+        "cursorsAlive": Bson::Array(vec![]),
+        "cursorsUnknown": Bson::Array(vec![]),
+        "ok": 1.0,
+    })
+}
+
 fn split_batch(documents: Vec<Document>, batch_size: usize) -> (Vec<Document>, Vec<Document>) {
     let mut first_batch = Vec::new();
     let mut remaining = Vec::new();
@@ -2371,6 +2423,130 @@ mod tests {
             doc! { "getMore": 1_i64, "collection": "users", "$db": "app", "comment": "nope" },
         ] {
             let response = get_more(&mut client_state, &command).unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn kill_cursors_removes_live_cursor_and_reports_repeated_kill_not_found() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 }, "batchSize": 1_i32 },
+        )
+        .unwrap();
+        let id = cursor_id(&response);
+
+        let killed = kill_cursors(
+            &mut client_state,
+            &doc! { "killCursors": "users", "$db": "app", "cursors": [id] },
+        )
+        .unwrap();
+        assert_eq!(
+            killed.get_array("cursorsKilled").unwrap(),
+            &vec![Bson::Int64(id)]
+        );
+        assert!(client_state.cursors.is_empty());
+
+        let repeated = kill_cursors(
+            &mut client_state,
+            &doc! { "killCursors": "users", "$db": "app", "cursors": [id] },
+        )
+        .unwrap();
+        assert_eq!(
+            repeated.get_array("cursorsNotFound").unwrap(),
+            &vec![Bson::Int64(id)]
+        );
+    }
+
+    #[test]
+    fn kill_cursors_namespace_mismatch_does_not_remove_live_cursor() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 }, "batchSize": 1_i32 },
+        )
+        .unwrap();
+        let id = cursor_id(&response);
+
+        let mismatch = kill_cursors(
+            &mut client_state,
+            &doc! { "killCursors": "other", "$db": "app", "cursors": [id] },
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch.get_array("cursorsNotFound").unwrap(),
+            &vec![Bson::Int64(id)]
+        );
+        assert!(client_state.cursors.contains_key(&id));
+    }
+
+    #[test]
+    fn get_more_after_kill_or_exhaustion_is_explicit_error() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        let mut client_state = ClientState::default();
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 }, "batchSize": 1_i32 },
+        )
+        .unwrap();
+        let killed_id = cursor_id(&response);
+        kill_cursors(
+            &mut client_state,
+            &doc! { "killCursors": "users", "$db": "app", "cursors": [killed_id] },
+        )
+        .unwrap();
+        let after_kill = get_more(
+            &mut client_state,
+            &doc! { "getMore": killed_id, "collection": "users", "$db": "app" },
+        )
+        .unwrap();
+        assert_command_error(&after_kill);
+        assert_eq!(after_kill.get_i32("code").unwrap(), 43);
+
+        let response = find_documents_with_state(
+            &conn,
+            &mut client_state,
+            &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 }, "batchSize": 2_i32 },
+        )
+        .unwrap();
+        let exhausted_id = cursor_id(&response);
+        assert!(exhausted_id > 0);
+        let final_batch = get_more(
+            &mut client_state,
+            &doc! { "getMore": exhausted_id, "collection": "users", "$db": "app", "batchSize": 10_i32 },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&final_batch), 0);
+        let after_exhaustion = get_more(
+            &mut client_state,
+            &doc! { "getMore": exhausted_id, "collection": "users", "$db": "app" },
+        )
+        .unwrap();
+        assert_command_error(&after_exhaustion);
+        assert_eq!(after_exhaustion.get_i32("code").unwrap(), 43);
+    }
+
+    #[test]
+    fn kill_cursors_rejects_malformed_requests() {
+        let mut client_state = ClientState::default();
+
+        for command in [
+            doc! { "killCursors": "", "$db": "app", "cursors": [1_i64] },
+            doc! { "killCursors": "users", "$db": "app" },
+            doc! { "killCursors": "users", "$db": "app", "cursors": ["bad"] },
+            doc! { "killCursors": "users", "$db": "app", "cursors": [-1_i64] },
+            doc! { "killCursors": "users", "$db": "app", "cursors": [1_i64], "comment": "nope" },
+        ] {
+            let response = kill_cursors(&mut client_state, &command).unwrap();
             assert_command_error(&response);
         }
     }

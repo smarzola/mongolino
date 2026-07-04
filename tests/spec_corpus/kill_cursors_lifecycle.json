@@ -1,0 +1,42 @@
+{
+  "name": "kill cursors lifecycle responses",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "killCursors": "users",
+        "cursors": [
+          12345
+        ]
+      },
+      "expect_result": {
+        "cursorsKilled": [],
+        "cursorsNotFound": [
+          12345
+        ],
+        "cursorsAlive": [],
+        "cursorsUnknown": [],
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "killCursors": "users",
+        "cursors": [
+          "bad"
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 9,
+        "contains": "killCursors cursor ids must be integers"
+      }
+    }
+  ]
+}
