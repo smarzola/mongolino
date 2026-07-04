@@ -70,6 +70,57 @@ def test_aggregate_count(collection):
     assert list(collection.aggregate([{"$match": {"team": "none"}}, {"$count": "total"}])) == []
 
 
+def seed_tagged_items(collection):
+    collection.insert_many(
+        [
+            {"_id": "a", "tags": ["red", "blue"]},
+            {"_id": "b", "tags": []},
+            {"_id": "c"},
+            {"_id": "d", "tags": None},
+            {"_id": "e", "tags": "green"},
+        ]
+    )
+
+
+def test_aggregate_unwind_default_and_preserve_behavior(collection):
+    seed_tagged_items(collection)
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$unwind": "$tags"},
+                {"$project": {"_id": 1, "tags": 1}},
+            ]
+        )
+    ) == [
+        {"_id": "a", "tags": "red"},
+        {"_id": "a", "tags": "blue"},
+        {"_id": "e", "tags": "green"},
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$unwind": {
+                        "path": "$tags",
+                        "preserveNullAndEmptyArrays": True,
+                        "includeArrayIndex": "idx",
+                    }
+                },
+                {"$project": {"_id": 1, "tags": 1, "idx": 1}},
+            ]
+        )
+    ) == [
+        {"_id": "a", "tags": "red", "idx": 0},
+        {"_id": "a", "tags": "blue", "idx": 1},
+        {"_id": "b", "idx": None},
+        {"_id": "c", "idx": None},
+        {"_id": "d", "tags": None, "idx": None},
+        {"_id": "e", "tags": "green", "idx": None},
+    ]
+
+
 def test_aggregate_unsupported_stage_is_explicit_error(collection):
     seed_scores(collection)
 
@@ -90,6 +141,25 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
                 {"aggregate": collection.name, "pipeline": [{"$group": group}], "cursor": {}}
             )
         assert "count_documents group shape" in str(excinfo.value)
+
+
+def test_aggregate_unwind_rejects_malformed_options(collection):
+    seed_tagged_items(collection)
+
+    for pipeline, contains in [
+        ([{"$unwind": "$"}], "field path"),
+        ([{"$unwind": {"path": "tags"}}], "field path"),
+        (
+            [{"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": "yes"}}],
+            "preserveNullAndEmptyArrays",
+        ),
+        ([{"$unwind": {"path": "$tags", "includeArrayIndex": "$idx"}}], "includeArrayIndex"),
+        ([{"$unwind": {"path": "$tags", "includeArrayIndex": "tags.idx"}}], "conflicting"),
+        ([{"$unwind": {"path": "$tags", "unknown": True}}], "unknown"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
 
 
 def test_aggregate_batch_size_iterates_with_get_more(collection):

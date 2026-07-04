@@ -1096,6 +1096,13 @@ fn aggregate_pipeline_documents(
                     vec![doc! { field: documents.len() as i64 }]
                 };
             }
+            "$unwind" => {
+                let unwind = match parse_unwind_stage(operand) {
+                    Ok(unwind) => unwind,
+                    Err(response) => return Ok(Err(response)),
+                };
+                documents = apply_unwind_stage(documents, &unwind);
+            }
             "$group" => {
                 let Bson::Document(group) = operand else {
                     return Ok(Err(command_error(9, "$group requires a document")));
@@ -1118,6 +1125,132 @@ fn aggregate_pipeline_documents(
     }
 
     Ok(Ok(documents))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct UnwindSpec {
+    path: String,
+    preserve_null_and_empty_arrays: bool,
+    include_array_index: Option<String>,
+}
+
+fn parse_unwind_stage(value: &Bson) -> std::result::Result<UnwindSpec, Document> {
+    match value {
+        Bson::String(path) => Ok(UnwindSpec {
+            path: parse_aggregation_field_path(path, "$unwind path")?,
+            preserve_null_and_empty_arrays: false,
+            include_array_index: None,
+        }),
+        Bson::Document(spec) => parse_unwind_document(spec),
+        _ => Err(command_error(
+            9,
+            "$unwind requires a field path string or document",
+        )),
+    }
+}
+
+fn parse_unwind_document(spec: &Document) -> std::result::Result<UnwindSpec, Document> {
+    for key in spec.keys() {
+        if !matches!(
+            key.as_str(),
+            "path" | "preserveNullAndEmptyArrays" | "includeArrayIndex"
+        ) {
+            return Err(command_error(
+                72,
+                &format!("$unwind option {key} is not supported"),
+            ));
+        }
+    }
+
+    let path = match spec.get_str("path") {
+        Ok(path) => parse_aggregation_field_path(path, "$unwind path")?,
+        Err(_) => {
+            return Err(command_error(
+                9,
+                "$unwind document requires a field path string",
+            ));
+        }
+    };
+    let preserve_null_and_empty_arrays = match spec.get("preserveNullAndEmptyArrays") {
+        None => false,
+        Some(Bson::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(command_error(
+                9,
+                "$unwind preserveNullAndEmptyArrays must be a boolean",
+            ));
+        }
+    };
+    let include_array_index = match spec.get("includeArrayIndex") {
+        None => None,
+        Some(Bson::String(index_path)) => {
+            validate_aggregation_path(index_path, "$unwind includeArrayIndex", true)?;
+            if index_path.starts_with('$') {
+                return Err(command_error(
+                    9,
+                    "$unwind includeArrayIndex cannot start with $",
+                ));
+            }
+            reject_path_collisions(&[path.clone(), index_path.to_string()], "$unwind")
+                .map_err(|errmsg| command_error(9, &errmsg))?;
+            Some(index_path.to_string())
+        }
+        Some(_) => {
+            return Err(command_error(
+                9,
+                "$unwind includeArrayIndex must be a string",
+            ));
+        }
+    };
+
+    Ok(UnwindSpec {
+        path,
+        preserve_null_and_empty_arrays,
+        include_array_index,
+    })
+}
+
+fn apply_unwind_stage(documents: Vec<Document>, spec: &UnwindSpec) -> Vec<Document> {
+    let mut out = Vec::new();
+    for document in documents {
+        match get_document_path(&document, &spec.path) {
+            Some(Bson::Array(values)) if values.is_empty() => {
+                if spec.preserve_null_and_empty_arrays {
+                    let mut preserved = document;
+                    unset_document_path(&mut preserved, &spec.path);
+                    set_unwind_index(&mut preserved, spec, Bson::Null);
+                    out.push(preserved);
+                }
+            }
+            Some(Bson::Array(values)) => {
+                for (index, value) in values.clone().into_iter().enumerate() {
+                    let mut unwound = document.clone();
+                    set_document_path(&mut unwound, &spec.path, value);
+                    set_unwind_index(&mut unwound, spec, Bson::Int32(index as i32));
+                    out.push(unwound);
+                }
+            }
+            Some(Bson::Null) | None => {
+                if spec.preserve_null_and_empty_arrays {
+                    let mut preserved = document;
+                    set_unwind_index(&mut preserved, spec, Bson::Null);
+                    out.push(preserved);
+                }
+            }
+            Some(_) => {
+                let mut scalar = document;
+                set_unwind_index(&mut scalar, spec, Bson::Null);
+                out.push(scalar);
+            }
+        }
+    }
+    out
+}
+
+fn set_unwind_index(document: &mut Document, spec: &UnwindSpec, index: Bson) {
+    if let Some(path) = &spec.include_array_index {
+        set_document_path(document, path, index);
+    }
 }
 
 fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> Result<Document> {
@@ -6696,6 +6829,79 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_unwind_expands_arrays_and_preserves_when_requested() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "a", "tags": ["red", "blue"] },
+                    { "_id": "b", "tags": [] },
+                    { "_id": "c" },
+                    { "_id": "d", "tags": Bson::Null },
+                    { "_id": "e", "tags": "green" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let default = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$project": { "_id": 1_i32, "tags": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&default),
+            vec![
+                doc! { "_id": "a", "tags": "red" },
+                doc! { "_id": "a", "tags": "blue" },
+                doc! { "_id": "e", "tags": "green" },
+            ]
+        );
+
+        let preserved = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$unwind": {
+                            "path": "$tags",
+                            "preserveNullAndEmptyArrays": true,
+                            "includeArrayIndex": "idx",
+                        }
+                    },
+                    { "$project": { "_id": 1_i32, "tags": 1_i32, "idx": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&preserved),
+            vec![
+                doc! { "_id": "a", "tags": "red", "idx": 0_i32 },
+                doc! { "_id": "a", "tags": "blue", "idx": 1_i32 },
+                doc! { "_id": "b", "idx": Bson::Null },
+                doc! { "_id": "c", "idx": Bson::Null },
+                doc! { "_id": "d", "tags": Bson::Null, "idx": Bson::Null },
+                doc! { "_id": "e", "tags": "green", "idx": Bson::Null },
+            ]
+        );
+    }
+
+    #[test]
     fn aggregate_cursor_batch_size_uses_get_more_and_cleans_up() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -6812,6 +7018,20 @@ mod tests {
             vec![Bson::Document(doc! { "$count": "" })],
             vec![Bson::Document(doc! { "$count": 1_i32 })],
             vec![Bson::Document(doc! { "$lookup": { "from": "other" } })],
+            vec![Bson::Document(doc! { "$unwind": "$" })],
+            vec![Bson::Document(doc! { "$unwind": { "path": "tags" } })],
+            vec![Bson::Document(
+                doc! { "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": "yes" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$unwind": { "path": "$tags", "includeArrayIndex": "$idx" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$unwind": { "path": "$tags", "includeArrayIndex": "tags.idx" } },
+            )],
+            vec![Bson::Document(
+                doc! { "$unwind": { "path": "$tags", "unknown": true } },
+            )],
             vec![Bson::Document(
                 doc! { "$group": { "_id": "$state", "n": { "$sum": 1_i32 } } },
             )],

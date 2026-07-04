@@ -103,7 +103,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Aggregation expression and grouping design
-- [ ] Milestone 1: `$unwind` stage
+- [x] Milestone 1: `$unwind` stage
 - [ ] Milestone 2: `$group` keys and scalar accumulators
 - [ ] Milestone 3: Array-style accumulators and pipeline composition
 - [ ] Milestone 4: Adversarial coverage, README, spec corpus, and final verification
@@ -114,7 +114,7 @@ Status 2026-07-04:
 
 - Added the internal aggregation expression subset for field paths, scalar literals, and simple document key specs, with Rust coverage for supported evaluation and malformed shapes.
 - Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`.
-- Commit: pending at status-update time; final hash reported in handoff.
+- Commit: `971ac7e`.
 
 Problem:
 
@@ -155,6 +155,13 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: `$unwind` Stage
+
+Status 2026-07-04:
+
+- Added `$unwind` string and document forms with default drop behavior, preservation, scalar handling, array index output, and explicit option/path errors.
+- Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`; `cargo build`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` outside the sandbox.
+- Sandboxed e2e attempt failed at localhost port allocation with `PermissionError: [Errno 1] Operation not permitted` from `tests/e2e/conftest.py:103`.
+- Commit: pending at status-update time; final hash reported in handoff.
 
 Problem:
 

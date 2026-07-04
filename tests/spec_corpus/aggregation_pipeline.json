@@ -90,6 +90,34 @@
       "name": "aggregate",
       "pipeline": [
         {
+          "$unwind": "$team"
+        },
+        {
+          "$project": {
+            "_id": 1,
+            "team": 1
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "s1",
+          "team": "red"
+        },
+        {
+          "_id": "s2",
+          "team": "blue"
+        },
+        {
+          "_id": "s3",
+          "team": "red"
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
           "$count": ""
         }
       ],
@@ -97,6 +125,22 @@
         "type": "OperationFailure",
         "code": 9,
         "contains": "$count"
+      }
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$unwind": {
+            "path": "$team",
+            "unknown": true
+          }
+        }
+      ],
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "unknown"
       }
     }
   ]
