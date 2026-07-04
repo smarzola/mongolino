@@ -21,7 +21,11 @@ def test_type_size_and_all_predicates_find_and_count(collection):
                 "name": "Ada",
                 "profile": {"city": "Rome"},
                 "tags": ["math", "logic"],
-                "scores": [1, 2, Int64(2)],
+                "scores": [1, 2, 5],
+                "items": [
+                    {"kind": "a", "score": 1, "meta": {"flag": False}},
+                    {"kind": "b", "score": 5, "meta": {"flag": True}},
+                ],
                 "nothing": None,
                 "active": True,
                 "oid": oid,
@@ -29,8 +33,25 @@ def test_type_size_and_all_predicates_find_and_count(collection):
                 "long": Int64(37),
                 "ratio": 1.5,
             },
-            {"_id": "u2", "name": "Grace", "tags": ["navy"], "scores": [3], "age": Int64(39)},
-            {"_id": "u3", "name": "Katherine", "tags": [], "scores": "none", "age": 41.0},
+            {
+                "_id": "u2",
+                "name": "Grace",
+                "tags": ["navy"],
+                "scores": [3],
+                "items": [
+                    {"kind": "a", "score": 6, "meta": {"flag": False}},
+                    {"kind": "b", "score": 2, "meta": {"flag": True}},
+                ],
+                "age": Int64(39),
+            },
+            {
+                "_id": "u3",
+                "name": "Katherine",
+                "tags": [],
+                "scores": "none",
+                "items": [{"kind": "a", "score": 1, "meta": {"flag": True}}],
+                "age": 41.0,
+            },
         ]
     )
 
@@ -67,6 +88,26 @@ def test_type_size_and_all_predicates_find_and_count(collection):
     assert ids(collection.find({"scores": {"$all": [2, 2]}})) == ["u1"]
     assert collection.count_documents({"tags": {"$all": ["math", "missing"]}}) == 0
 
+    assert ids(collection.find({"scores": {"$elemMatch": {"$gt": 4, "$lt": 7}}})) == ["u1"]
+    assert ids(collection.find({"items": {"$elemMatch": {"kind": "a", "score": {"$gte": 5}}}})) == [
+        "u2"
+    ]
+    assert ids(collection.find({"items": {"$elemMatch": {"kind": "a", "meta.flag": True}}})) == [
+        "u3"
+    ]
+    assert ids(
+        collection.find(
+            {
+                "items": {
+                    "$all": [
+                        {"$elemMatch": {"kind": "a", "score": {"$gte": 5}}},
+                        {"$elemMatch": {"kind": "b", "score": {"$lte": 2}}},
+                    ]
+                }
+            }
+        )
+    ) == ["u2"]
+
 
 def test_type_size_and_all_malformed_predicates_are_errors(collection):
     collection.insert_one({"_id": "u1", "tags": ["math"], "name": "Ada"})
@@ -78,10 +119,9 @@ def test_type_size_and_all_malformed_predicates_are_errors(collection):
         ({"tags": {"$size": -1}}, "$size requires a non-negative integer"),
         ({"tags": {"$size": 1.5}}, "$size requires a non-negative integer"),
         ({"tags": {"$all": "math"}}, "$all requires an array"),
-        (
-            {"tags": {"$all": [{"$elemMatch": {"$eq": "math"}}]}},
-            "$all $elemMatch clauses are not supported yet",
-        ),
+        ({"tags": {"$elemMatch": 1}}, "$elemMatch requires a document"),
+        ({"tags": {"$elemMatch": {}}}, "$elemMatch requires a non-empty document"),
+        ({"tags": {"$elemMatch": {"$where": "bad"}}}, "unsupported query operator $where"),
     ]
 
     for filter_doc, message in bad_filters:

@@ -14,7 +14,23 @@
       "scores": [
         1,
         2,
-        2
+        5
+      ],
+      "items": [
+        {
+          "kind": "a",
+          "score": 1,
+          "meta": {
+            "flag": false
+          }
+        },
+        {
+          "kind": "b",
+          "score": 5,
+          "meta": {
+            "flag": true
+          }
+        }
       ],
       "profile": {
         "city": "Rome"
@@ -34,6 +50,22 @@
       "scores": [
         3
       ],
+      "items": [
+        {
+          "kind": "a",
+          "score": 6,
+          "meta": {
+            "flag": false
+          }
+        },
+        {
+          "kind": "b",
+          "score": 2,
+          "meta": {
+            "flag": true
+          }
+        }
+      ],
       "age": 39
     },
     {
@@ -44,6 +76,15 @@
         "space"
       ],
       "scores": "none",
+      "items": [
+        {
+          "kind": "a",
+          "score": 1,
+          "meta": {
+            "flag": true
+          }
+        }
+      ],
       "age": 41.0
     },
     {
@@ -76,7 +117,23 @@
           "scores": [
             1,
             2,
-            2
+            5
+          ],
+          "items": [
+            {
+              "kind": "a",
+              "score": 1,
+              "meta": {
+                "flag": false
+              }
+            },
+            {
+              "kind": "b",
+              "score": 5,
+              "meta": {
+                "flag": true
+              }
+            }
           ],
           "profile": {
             "city": "Rome"
@@ -165,20 +222,87 @@
     {
       "name": "find",
       "filter": {
-        "tags": {
+        "scores": {
+          "$elemMatch": {
+            "$gt": 4,
+            "$lt": 7
+          }
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u1"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "items": {
+          "$elemMatch": {
+            "kind": "a",
+            "score": {
+              "$gte": 5
+            }
+          }
+        }
+      },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u2"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "items": {
           "$all": [
             {
               "$elemMatch": {
-                "$eq": "Math"
+                "kind": "a",
+                "score": {
+                  "$gte": 5
+                }
+              }
+            },
+            {
+              "$elemMatch": {
+                "kind": "b",
+                "score": {
+                  "$lte": 2
+                }
               }
             }
           ]
         }
       },
+      "projection": {
+        "_id": 1
+      },
+      "expect_documents": [
+        {
+          "_id": "u2"
+        }
+      ]
+    },
+    {
+      "name": "find",
+      "filter": {
+        "items": {
+          "$elemMatch": {}
+        }
+      },
       "expect_error": {
         "type": "OperationFailure",
         "code": 2,
-        "contains": "$all $elemMatch clauses are not supported yet"
+        "contains": "$elemMatch requires a non-empty document"
       }
     },
     {

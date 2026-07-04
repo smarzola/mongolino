@@ -134,7 +134,7 @@ When a milestone is complete:
 - [x] Milestone 0: Matcher architecture and error model
 - [x] Milestone 1: Regex predicate support
 - [x] Milestone 2: `$type`, `$size`, and `$all`
-- [ ] Milestone 3: `$elemMatch` scalar and document semantics
+- [x] Milestone 3: `$elemMatch` scalar and document semantics
 - [ ] Milestone 4: Cross-command/e2e/spec coverage and docs
 
 ## Milestone 0: Matcher Architecture And Error Model
@@ -277,7 +277,7 @@ membership. `$all` `$elemMatch` clauses remain explicit errors until Milestone
 `cargo test size` passed; `cargo test all` passed; after `cargo build`,
 unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
 pytest tests/e2e/test_query_language.py` passed with 2 tests; `cargo fmt --
---check && cargo test` passed. Commit: pending.
+--check && cargo test` passed. Commit: `8b820bf`.
 
 ## Milestone 3: `$elemMatch` Scalar And Document Semantics
 
@@ -321,6 +321,16 @@ cargo test find_matcher
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_query_language.py tests/e2e/test_crud.py tests/e2e/test_find_and_modify.py
 cargo test
 ```
+
+Status 2026-07-04: Complete. Added `$elemMatch` for scalar arrays and document
+arrays, including nested dotted fields, logical predicates, no cross-element
+predicate mixing, regex/type/size/all nested scalar predicates where supported,
+and `$all` `$elemMatch` clauses. Verification: `cargo test elem` passed; `cargo
+test find_matcher` passed; after `cargo build`, unsandboxed
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_query_language.py tests/e2e/test_crud.py
+tests/e2e/test_find_and_modify.py` passed with 41 tests; `cargo test` passed.
+Commit: pending.
 
 ## Milestone 4: Cross-Command/E2E/Spec Coverage And Docs
 

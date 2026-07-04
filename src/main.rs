@@ -6300,6 +6300,7 @@ fn matches_operator_predicate(
         "$type" => matches_type_predicate(values, operand),
         "$size" => matches_size_predicate(values, operand),
         "$all" => matches_all_predicate(values, operand),
+        "$elemMatch" => matches_elem_match_predicate(values, operand),
         _ => Err(match_error(
             2,
             format!("unsupported query operator {operator}"),
@@ -6422,29 +6423,113 @@ fn matches_all_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> 
         return Err(match_error(2, "$all requires an array"));
     };
     for required_value in required {
-        if is_operator_document(required_value) {
-            let Bson::Document(document) = required_value else {
-                unreachable!("operator document checked above");
-            };
-            if document.contains_key("$elemMatch") {
-                return Err(match_error(
-                    2,
-                    "$all $elemMatch clauses are not supported yet",
-                ));
+        if let Bson::Document(document) = required_value {
+            if document.len() == 1 && document.contains_key("$elemMatch") {
+                continue;
             }
+        }
+        if is_operator_document(required_value) {
             return Err(match_error(2, "$all entries cannot be operator documents"));
         }
     }
-    Ok(values.iter().any(|candidate| {
+    for candidate in values {
         let Bson::Array(candidate_values) = candidate else {
-            return false;
+            continue;
         };
-        required.iter().all(|required_value| {
-            candidate_values
-                .iter()
-                .any(|candidate_value| bson_values_equal(candidate_value, required_value))
-        })
-    }))
+        let mut all_matched = true;
+        for required_value in required {
+            let matched = match elem_match_operand(required_value) {
+                Some(elem_match) => {
+                    let mut matched = false;
+                    for candidate_value in candidate_values {
+                        if matches_elem_match_value(candidate_value, elem_match)? {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                }
+                None => candidate_values
+                    .iter()
+                    .any(|candidate_value| bson_values_equal(candidate_value, required_value)),
+            };
+            if !matched {
+                all_matched = false;
+                break;
+            }
+        }
+        if all_matched {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn elem_match_operand(value: &Bson) -> Option<&Bson> {
+    match value {
+        Bson::Document(document) if document.len() == 1 => document.get("$elemMatch"),
+        _ => None,
+    }
+}
+
+fn matches_elem_match_predicate(values: &[&Bson], operand: &Bson) -> MatchResult<bool> {
+    let Bson::Document(predicate) = operand else {
+        return Err(match_error(2, "$elemMatch requires a document"));
+    };
+    if predicate.is_empty() {
+        return Err(match_error(2, "$elemMatch requires a non-empty document"));
+    }
+    for candidate in values {
+        let Bson::Array(candidate_values) = candidate else {
+            continue;
+        };
+        for candidate_value in candidate_values {
+            if matches_elem_match_value(candidate_value, operand)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn matches_elem_match_value(value: &Bson, operand: &Bson) -> MatchResult<bool> {
+    let Bson::Document(predicate) = operand else {
+        return Err(match_error(2, "$elemMatch requires a document"));
+    };
+    if predicate.is_empty() {
+        return Err(match_error(2, "$elemMatch requires a non-empty document"));
+    }
+    match value {
+        Bson::Document(document)
+            if !predicate
+                .keys()
+                .all(|key| is_scalar_elem_match_operator(key)) =>
+        {
+            matches_filter(document, predicate)
+        }
+        _ => matches_operator_document(&[value], predicate),
+    }
+}
+
+fn is_scalar_elem_match_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "$eq"
+            | "$ne"
+            | "$gt"
+            | "$gte"
+            | "$lt"
+            | "$lte"
+            | "$in"
+            | "$nin"
+            | "$exists"
+            | "$not"
+            | "$regex"
+            | "$type"
+            | "$size"
+            | "$all"
+            | "$elemMatch"
+    )
 }
 
 fn matches_regex_predicate(
@@ -11944,7 +12029,121 @@ mod tests {
             doc! { "tags": { "$size": -1_i32 } },
             doc! { "tags": { "$size": 1.5 } },
             doc! { "tags": { "$all": "math" } },
-            doc! { "tags": { "$all": [{ "$elemMatch": { "$eq": "math" } }] } },
+        ] {
+            let response = find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": filter },
+            )
+            .unwrap();
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn find_matcher_supports_elem_match_predicates() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "scores": [1_i32, 5_i32, 8_i32],
+                        "tags": ["math", "logic"],
+                        "items": [
+                            { "kind": "a", "score": 1_i32, "meta": { "flag": false } },
+                            { "kind": "b", "score": 5_i32, "meta": { "flag": true } },
+                        ],
+                    },
+                    {
+                        "_id": "u2",
+                        "scores": [2_i32, 9_i32],
+                        "tags": ["navy"],
+                        "items": [
+                            { "kind": "a", "score": 6_i32, "meta": { "flag": false } },
+                            { "kind": "b", "score": 2_i32, "meta": { "flag": true } },
+                        ],
+                    },
+                    {
+                        "_id": "u3",
+                        "scores": [3_i32],
+                        "tags": ["space"],
+                        "items": [
+                            { "kind": "a", "score": 1_i32, "meta": { "flag": true } },
+                        ],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "scores": { "$elemMatch": { "$gt": 4_i32, "$lt": 7_i32 } } }
+            ),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "tags": { "$elemMatch": { "$regex": "^LOG", "$options": "i" } } }
+            ),
+            vec!["u1"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "items": { "$elemMatch": { "kind": "a", "score": { "$gte": 5_i32 } } } }
+            ),
+            vec!["u2"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "items": { "$elemMatch": { "kind": "a", "meta.flag": true } } }
+            ),
+            vec!["u3"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "items": { "$elemMatch": { "$or": [{ "score": { "$gte": 6_i32 } }, { "meta.flag": false }] } } }
+            ),
+            vec!["u1", "u2"]
+        );
+        assert!(
+            find_ids(
+                &conn,
+                doc! { "items.kind": "a", "items.score": { "$gte": 5_i32 } }
+            )
+            .contains(&"u1".to_string())
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "items": { "$elemMatch": { "kind": "a", "score": { "$gte": 5_i32 } } } }
+            ),
+            vec!["u2"]
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "items": { "$all": [
+                    { "$elemMatch": { "kind": "a", "score": { "$gte": 5_i32 } } },
+                    { "$elemMatch": { "kind": "b", "score": { "$lte": 2_i32 } } },
+                ] } }
+            ),
+            vec!["u2"]
+        );
+
+        for filter in [
+            doc! { "scores": { "$elemMatch": 5_i32 } },
+            doc! { "scores": { "$elemMatch": {} } },
+            doc! { "scores": { "$elemMatch": { "$where": "bad" } } },
+            doc! { "items": { "$elemMatch": { "$and": [] } } },
         ] {
             let response = find_documents(
                 &conn,
@@ -11987,7 +12186,6 @@ mod tests {
 
         for filter in [
             doc! { "$where": "this.age > 1" },
-            doc! { "tags": { "$elemMatch": { "$eq": "math" } } },
             doc! { "age": { "$in": "Ada" } },
             doc! { "age": { "$nin": "Ada" } },
             doc! { "age": { "$exists": 1_i32 } },

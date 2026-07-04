@@ -143,6 +143,45 @@ def test_regex_predicates_find_count_update_and_delete_targets(collection):
     assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u1", "u2", "u4"]
 
 
+def test_elem_match_update_and_delete_targets(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "u1",
+                "items": [
+                    {"kind": "a", "score": 1},
+                    {"kind": "b", "score": 5},
+                ],
+                "scores": [1, 5, 8],
+            },
+            {
+                "_id": "u2",
+                "items": [
+                    {"kind": "a", "score": 6},
+                    {"kind": "b", "score": 2},
+                ],
+                "scores": [2, 9],
+            },
+            {
+                "_id": "u3",
+                "items": [{"kind": "a", "score": 1}],
+                "scores": [3],
+            },
+        ]
+    )
+
+    updated = collection.update_one(
+        {"items": {"$elemMatch": {"kind": "a", "score": {"$gte": 5}}}},
+        {"$set": {"matched": "elem"}},
+    )
+    assert updated.matched_count == 1
+    assert collection.find_one({"_id": "u2"})["matched"] == "elem"
+
+    deleted = collection.delete_many({"scores": {"$elemMatch": {"$gt": 4, "$lt": 7}}})
+    assert deleted.deleted_count == 1
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u2", "u3"]
+
+
 def test_find_projection_edges(collection):
     seed_users(collection)
 

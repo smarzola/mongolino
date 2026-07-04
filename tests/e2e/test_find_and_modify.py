@@ -258,6 +258,41 @@ def test_find_and_modify_targets_array_backed_matches_when_index_entries_are_inc
     assert collection.find_one({"_id": "j2"}) is None
 
 
+def test_find_and_modify_targets_elem_match_filters(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "j1",
+                "items": [
+                    {"kind": "a", "score": 1},
+                    {"kind": "b", "score": 5},
+                ],
+                "scores": [1, 5, 8],
+            },
+            {
+                "_id": "j2",
+                "items": [
+                    {"kind": "a", "score": 6},
+                    {"kind": "b", "score": 2},
+                ],
+                "scores": [2, 9],
+            },
+        ]
+    )
+
+    updated = collection.find_one_and_update(
+        {"items": {"$elemMatch": {"kind": "a", "score": {"$gte": 5}}}},
+        {"$set": {"state": "matched"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j2"
+    assert updated["state"] == "matched"
+
+    removed = collection.find_one_and_delete({"scores": {"$elemMatch": {"$gt": 4, "$lt": 7}}})
+    assert removed["_id"] == "j1"
+    assert collection.find_one({"_id": "j1"}) is None
+
+
 def test_find_and_modify_keeps_scalar_multikey_entries_fresh(collection):
     collection.insert_many(
         [
