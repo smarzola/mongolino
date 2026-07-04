@@ -90,6 +90,41 @@ def test_compound_indexed_count_uses_safe_full_key_and_falls_back(collection):
     assert collection.count_documents({"profile.city": "Rome", "active": 1}) == 1
 
 
+def test_sparse_and_partial_indexed_count_uses_safe_membership_filters(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test", "active": True, "handle": "ada"},
+            {"_id": "u2", "email": "same@example.test", "active": False},
+            {"_id": "u3", "name": "missing"},
+            {"_id": "u4", "email": "other@example.test", "active": True, "handle": "grace"},
+        ]
+    )
+    collection.create_index("email", name="email_sparse", sparse=True)
+    collection.create_index(
+        "email",
+        name="email_active_partial",
+        partialFilterExpression={"active": True},
+    )
+    collection.create_index(
+        "email",
+        name="email_active_handle_partial",
+        partialFilterExpression={
+            "$and": [{"active": {"$eq": True}}, {"handle": {"$exists": True}}]
+        },
+    )
+
+    assert collection.count_documents({"email": "same@example.test"}) == 2
+    assert collection.count_documents({"email": "same@example.test", "active": True}) == 1
+    assert (
+        collection.count_documents(
+            {"email": "same@example.test", "active": True, "handle": "ada"}
+        )
+        == 1
+    )
+    assert collection.count_documents({"email": "same@example.test", "active": False}) == 1
+    assert collection.count_documents({"active": True}) == 2
+
+
 def test_indexed_count_falls_back_when_index_has_array_omissions(collection):
     collection.insert_many(
         [

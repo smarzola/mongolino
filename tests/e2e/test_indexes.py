@@ -13,6 +13,10 @@ def index_names(collection):
     return [index["name"] for index in collection.list_indexes()]
 
 
+def ids(cursor):
+    return [doc["_id"] for doc in cursor]
+
+
 def multikey_omission_count(db_path, namespace):
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         return conn.execute(
@@ -449,6 +453,38 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
         "u1"
     ]
     assert collection.count_documents({"profile.city": "Milan"}) == 1
+
+
+def test_sparse_and_partial_indexed_find_preserves_membership_safety(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test", "active": True, "handle": "ada"},
+            {"_id": "u2", "email": "same@example.test", "active": False},
+            {"_id": "u3", "name": "missing"},
+            {"_id": "u4", "email": "other@example.test", "active": True, "handle": "grace"},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_sparse", sparse=True)
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_partial",
+        partialFilterExpression={"active": True},
+    )
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_handle_partial",
+        partialFilterExpression={
+            "$and": [{"active": {"$eq": True}}, {"handle": {"$exists": True}}]
+        },
+    )
+
+    assert ids(collection.find({"email": "same@example.test"})) == ["u1", "u2"]
+    assert ids(collection.find({"email": "same@example.test", "active": True})) == ["u1"]
+    assert ids(
+        collection.find({"email": "same@example.test", "active": True, "handle": "ada"})
+    ) == ["u1"]
+    assert ids(collection.find({"email": "same@example.test", "active": False})) == ["u2"]
+    assert ids(collection.find({"active": True})) == ["u1", "u4"]
 
 
 def test_compound_indexed_query_results_stay_correct_after_mutations(collection):

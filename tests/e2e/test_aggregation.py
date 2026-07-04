@@ -112,6 +112,37 @@ def test_aggregate_match_count_uses_compound_index_for_safe_full_key(collection)
     assert list(collection.aggregate([{"$match": {"team": "missing", "active": True}}, {"$count": "total"}])) == []
 
 
+def test_aggregate_match_count_uses_sparse_and_partial_membership_filters(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test", "active": True, "handle": "ada"},
+            {"_id": "u2", "email": "same@example.test", "active": False},
+            {"_id": "u3", "name": "missing"},
+            {"_id": "u4", "email": "other@example.test", "active": True, "handle": "grace"},
+        ]
+    )
+    collection.create_index("email", name="email_sparse", sparse=True)
+    collection.create_index(
+        "email",
+        name="email_active_partial",
+        partialFilterExpression={"active": True},
+    )
+
+    assert list(
+        collection.aggregate(
+            [{"$match": {"email": "same@example.test", "active": True}}, {"$count": "total"}]
+        )
+    ) == [{"total": 1}]
+    assert list(
+        collection.aggregate(
+            [{"$match": {"email": "same@example.test", "active": False}}, {"$count": "total"}]
+        )
+    ) == [{"total": 1}]
+    assert list(collection.aggregate([{"$match": {"active": True}}, {"$count": "total"}])) == [
+        {"total": 2}
+    ]
+
+
 def test_aggregate_match_count_falls_back_when_index_has_array_omissions(collection):
     collection.insert_many(
         [

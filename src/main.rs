@@ -10698,6 +10698,118 @@ mod tests {
     }
 
     #[test]
+    fn planner_uses_sparse_and_partial_indexes_only_when_filter_implies_membership() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "same@example.test", "active": true, "handle": "ada" },
+                    { "_id": "u2", "email": "same@example.test", "active": false },
+                    { "_id": "u3", "name": "missing" },
+                    { "_id": "u4", "email": "other@example.test", "active": true, "handle": "grace" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_sparse", "sparse": true },
+                    {
+                        "key": { "email": 1_i32 },
+                        "name": "email_active_partial",
+                        "partialFilterExpression": { "active": true },
+                    },
+                    {
+                        "key": { "email": 1_i32 },
+                        "name": "email_active_handle_partial",
+                        "partialFilterExpression": {
+                            "$and": [
+                                { "active": { "$eq": true } },
+                                { "handle": { "$exists": true } },
+                            ],
+                        },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "email": "same@example.test" },
+                0,
+                None,
+            )
+            .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.users",
+                &doc! { "email": "same@example.test", "active": true }
+            )
+            .unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "email_active_partial".to_string(),
+                key_value: "str:same@example.test".to_string(),
+            }
+        );
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "email": "same@example.test", "active": true },
+                0,
+                None,
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.users",
+                &doc! { "email": "same@example.test", "active": true, "handle": "ada" }
+            )
+            .unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "email_active_handle_partial".to_string(),
+                key_value: "str:same@example.test".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "active": true }).unwrap(),
+            CountPlan::Fallback
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.users",
+                &doc! { "email": "same@example.test", "active": false }
+            )
+            .unwrap(),
+            CountPlan::Fallback
+        );
+        assert_eq!(
+            find_ids(
+                &conn,
+                doc! { "email": "same@example.test", "active": false }
+            ),
+            vec!["u2"]
+        );
+    }
+
+    #[test]
     fn planner_falls_back_when_compound_index_omits_array_values() {
         let conn = test_conn();
         insert_documents(
