@@ -102,7 +102,7 @@ When a milestone is complete:
 - [x] Milestone 1: Benchmark command and machine-readable output
 - [x] Milestone 2: CI-friendly performance budget smoke
 - [x] Milestone 3: Baseline results and SQLite pushdown roadmap
-- [ ] Milestone 4: Final correctness verification and docs
+- [x] Milestone 4: Final correctness verification and docs
 
 ## Milestone 0: Benchmark Harness Design And Workload Seeding
 
@@ -269,7 +269,7 @@ Status note:
   run: `cargo run --bin mongolino-bench -- --profile smoke --json
   /tmp/mongolino-bench-smoke.json`; `cargo run --bin mongolino-bench --
   --profile local --json /tmp/mongolino-bench-local.json`; `cargo fmt --
-  --check`. Commit hash: pending.
+  --check`. Commit hash: `ac1baef`.
 
 Problem:
 
@@ -313,6 +313,20 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: Final Correctness Verification And Docs
+
+Status note:
+
+- 2026-07-04: Final README, CI, benchmark, baseline, and checklist updates
+  are in place. Verification run: `cargo fmt -- --check`; `cargo test`;
+  `cargo build`; `cargo run --bin mongolino-bench -- --profile ci
+  --check-budget`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock
+  --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked
+  --dev`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+  pytest tests/e2e`. The sandboxed e2e run failed at localhost port
+  allocation with `PermissionError: [Errno 1] Operation not permitted` from
+  `sock.bind(("127.0.0.1", 0))` in `tests/e2e/conftest.py:103`; the same
+  command passed unsandboxed with `119 passed, 1 skipped`. Commit hash:
+  pending.
 
 Problem:
 
