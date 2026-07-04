@@ -116,7 +116,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before continuing.
 
 - [x] Milestone 0: Read-path preflight validation before TTL sweeps
-- [ ] Milestone 1: Write-path preflight validation before TTL sweeps
+- [x] Milestone 1: Write-path preflight validation before TTL sweeps
 - [ ] Milestone 2: PyMongo adversarial coverage and full verification
 
 ## Milestone 0: Read-Path Preflight Validation Before TTL Sweeps
@@ -200,6 +200,15 @@ Acceptance criteria:
   expired documents before unique enforcement.
 - Existing write TTL happy paths still pass.
 - Milestone status is marked done in this file and committed.
+
+Status note:
+
+- 2026-07-04: Added pre-sweep write validation for insert validator
+  failures, update/delete entry shape and query filters, and findAndModify
+  invalid hint/update/validator paths. Verification run: `cargo fmt --
+  --check`, `cargo test ttl`, `cargo test update`, `cargo test delete`,
+  `cargo test find_and_modify`, `cargo test validation`. Implementation
+  commit: pending checkpoint.
 
 Likely files:
 

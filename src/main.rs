@@ -1970,6 +1970,9 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         Ok(value) => value.unwrap_or(false),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
+    if let Err(err) = validate_filter_shape(&query) {
+        return Ok(command_error(err.code, &err.errmsg));
+    }
 
     if remove && command.contains_key("update") {
         return Ok(command_error(
@@ -2022,6 +2025,20 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     } else {
         collection_options_tx(&tx, &namespace)?
     };
+    if !remove
+        && let Some(response) = find_and_modify_update_preflight_error(
+            &tx,
+            &namespace,
+            &query,
+            sort.as_deref(),
+            hint.as_ref(),
+            update.as_ref().expect("update parsed above"),
+            upsert,
+            &options,
+        )?
+    {
+        return Ok(response);
+    }
     sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
     let outcome = if remove {
         apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref(), hint.as_ref())?
@@ -2206,6 +2223,51 @@ fn apply_find_and_modify_update(
         updated_existing: Some(true),
         upserted: None,
     }))
+}
+
+fn find_and_modify_update_preflight_error(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    query: &Document,
+    sort: Option<&[(String, i32)]>,
+    hint: Option<&ResolvedHint>,
+    update: &UpdateSpec,
+    upsert: bool,
+    options: &CollectionOptions,
+) -> Result<Option<Document>> {
+    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
+        Ok(target) => target,
+        Err(response) => return Ok(Some(response)),
+    }) else {
+        if !upsert {
+            return Ok(None);
+        }
+        let mut new_document = match build_upsert_document(query, update) {
+            Ok(document) => document,
+            Err(errmsg) => return Ok(Some(command_error(update_error_code(&errmsg), &errmsg))),
+        };
+        ensure_document_id(&mut new_document);
+        if let Err(errmsg) = validate_document_with_options(options, &new_document) {
+            return Ok(Some(command_error(update_error_code(&errmsg), &errmsg)));
+        }
+        return Ok(None);
+    };
+
+    let new_document = match apply_update_to_document(&target.document, update) {
+        Ok(document) => document,
+        Err(errmsg) => return Ok(Some(command_error(update_error_code(&errmsg), &errmsg))),
+    };
+    let new_id_key = id_key(&new_document)?;
+    if new_id_key != target.id_key {
+        let errmsg = "update cannot change _id";
+        return Ok(Some(command_error(update_error_code(errmsg), errmsg)));
+    }
+    if new_document != target.document
+        && let Err(errmsg) = validate_document_with_options(options, &new_document)
+    {
+        return Ok(Some(command_error(update_error_code(&errmsg), &errmsg)));
+    }
+    Ok(None)
 }
 
 fn find_and_modify_target_tx(
@@ -5239,16 +5301,15 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
         prepared.push((id_key, encoded, document));
     }
 
-    let tx = conn.unchecked_transaction()?;
-    let mut inserted = 0_i32;
-    let mut write_errors = Vec::new();
-    ensure_collection_catalog_tx(&tx, &namespace)?;
     let options = if bypass_validation {
         CollectionOptions::empty()
     } else {
-        collection_options_tx(&tx, &namespace)?
+        collection_options(conn, &namespace)?
     };
-    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
+    let tx = conn.unchecked_transaction()?;
+    let mut inserted = 0_i32;
+    let mut write_errors = Vec::new();
+    let mut swept = false;
 
     {
         let mut stmt = tx.prepare(
@@ -5267,6 +5328,11 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
                     break;
                 }
                 continue;
+            }
+            if !swept {
+                ensure_collection_catalog_tx(&tx, &namespace)?;
+                sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
+                swept = true;
             }
             if let Err(errmsg) = ensure_unique_constraints_tx(&tx, &namespace, document, None) {
                 write_errors.push(write_error(
@@ -5405,16 +5471,37 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let mut upserted_count = 0_i32;
     let mut upserted = Vec::new();
     let mut write_errors = Vec::new();
-    ensure_collection_catalog_tx(&tx, &namespace)?;
-    let options = if bypass_validation {
-        CollectionOptions::empty()
-    } else {
-        collection_options_tx(&tx, &namespace)?
-    };
-    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
+    let mut options = None;
+    let mut swept = false;
 
     for (index, entry) in updates.iter().enumerate() {
-        let result = apply_update_entry(&tx, &namespace, entry, &options);
+        if let Err(errmsg) = validate_update_entry_shape_tx(&tx, &namespace, entry) {
+            write_errors.push(write_error(
+                index as i32,
+                update_error_code(&errmsg),
+                &errmsg,
+            ));
+            if ordered {
+                break;
+            }
+            continue;
+        }
+        if !swept {
+            ensure_collection_catalog_tx(&tx, &namespace)?;
+            options = Some(if bypass_validation {
+                CollectionOptions::empty()
+            } else {
+                collection_options_tx(&tx, &namespace)?
+            });
+            sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
+            swept = true;
+        }
+        let result = apply_update_entry(
+            &tx,
+            &namespace,
+            entry,
+            options.as_ref().expect("options initialized before update"),
+        );
         match result {
             Ok(outcome) => {
                 matched_count += outcome.matched;
@@ -5462,6 +5549,34 @@ struct UpdateOutcome {
     matched: i32,
     modified: i32,
     upserted_id: Option<Bson>,
+}
+
+fn validate_update_entry_shape_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    entry: &Bson,
+) -> std::result::Result<(), String> {
+    let Bson::Document(entry) = entry else {
+        return Err("update entries must be documents".to_string());
+    };
+    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint"])?;
+    let query = entry
+        .get_document("q")
+        .map_err(|_| "update entry requires q document".to_string())?;
+    validate_filter_shape(query).map_err(|err| err.errmsg)?;
+    let update = entry
+        .get_document("u")
+        .map_err(|_| "update entry requires u document".to_string())?;
+    optional_bool_doc(entry, "upsert")?;
+    optional_bool_doc(entry, "multi")?;
+    if let Some(hint) = parse_optional_hint(entry)? {
+        resolve_hint(
+            indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
+            hint,
+        )?;
+    }
+    classify_update(update)?;
+    Ok(())
 }
 
 fn apply_update_entry(
@@ -6763,11 +6878,22 @@ fn delete_documents(conn: &Connection, command: &Document) -> Result<Document> {
 
     let namespace = namespace(db, collection);
     let tx = conn.unchecked_transaction()?;
-    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
     let mut removed = 0_i32;
     let mut write_errors = Vec::new();
+    let mut swept = false;
 
     for (index, entry) in deletes.iter().enumerate() {
+        if let Err(errmsg) = validate_delete_entry_shape_tx(&tx, &namespace, entry) {
+            write_errors.push(write_error(index as i32, 2, &errmsg));
+            if ordered {
+                break;
+            }
+            continue;
+        }
+        if !swept {
+            sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
+            swept = true;
+        }
         match apply_delete_entry(&tx, &namespace, entry) {
             Ok(count) => removed += count,
             Err(errmsg) => {
@@ -6788,6 +6914,34 @@ fn delete_documents(conn: &Connection, command: &Document) -> Result<Document> {
         response.insert("writeErrors", write_errors);
     }
     Ok(response)
+}
+
+fn validate_delete_entry_shape_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    entry: &Bson,
+) -> std::result::Result<(), String> {
+    let Bson::Document(entry) = entry else {
+        return Err("delete entries must be documents".to_string());
+    };
+    reject_unsupported_entry_keys(entry, &["q", "limit", "hint"])?;
+    let query = entry
+        .get_document("q")
+        .map_err(|_| "delete entry requires q document".to_string())?;
+    validate_filter_shape(query).map_err(|err| err.errmsg)?;
+    match entry.get("limit") {
+        Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => {}
+        Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {}
+        Some(_) => return Err("delete limit must be 0 or 1".to_string()),
+        None => return Err("delete entry requires limit".to_string()),
+    }
+    if let Some(hint) = parse_optional_hint(entry)? {
+        resolve_hint(
+            indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
+            hint,
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_delete_entry(
@@ -12599,6 +12753,44 @@ mod tests {
         );
     }
 
+    fn ttl_name_validator() -> Document {
+        doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name"],
+                "properties": { "name": { "bsonType": "string" } }
+            }
+        }
+    }
+
+    fn seed_validated_ttl_name_fixture(conn: &Connection, collection: &str) {
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        let future =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() + 86_400_000);
+        create_indexes(
+            conn,
+            &doc! {
+                "createIndexes": collection,
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            conn,
+            &doc! {
+                "insert": collection,
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "name": "Ada", "expiresAt": past },
+                    { "_id": "future", "name": "Grace", "expiresAt": future },
+                ],
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn ttl_invalid_read_commands_do_not_sweep_expired_documents() {
         let conn = test_conn();
@@ -12720,6 +12912,198 @@ mod tests {
         );
         assert_eq!(
             raw_ids_in_namespace(&conn, "app.all_expired"),
+            vec!["expired"]
+        );
+    }
+
+    #[test]
+    fn ttl_invalid_write_commands_do_not_sweep_before_preflight_errors() {
+        let conn = test_conn();
+
+        create_collection(
+            &conn,
+            &doc! {
+                "create": "bad_insert_validation",
+                "$db": "app",
+                "validator": ttl_name_validator(),
+            },
+        )
+        .unwrap();
+        seed_validated_ttl_name_fixture(&conn, "bad_insert_validation");
+        let insert = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "bad_insert_validation",
+                "$db": "app",
+                "documents": [{ "_id": "bad", "expiresAt": bson::DateTime::now() }],
+            },
+        )
+        .unwrap();
+        assert_eq!(insert.get_i32("n").unwrap(), 0);
+        assert_eq!(write_errors(&insert)[0].get_i32("code").unwrap(), 121);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_insert_validation"),
+            vec!["expired", "future"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_update_entry");
+        let update = update_documents(
+            &conn,
+            &doc! {
+                "update": "bad_update_entry",
+                "$db": "app",
+                "updates": [1_i32],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&update)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_update_entry"),
+            vec!["expired", "future"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_update_query");
+        let update = update_documents(
+            &conn,
+            &doc! {
+                "update": "bad_update_query",
+                "$db": "app",
+                "updates": [{ "q": { "category": { "$near": "old" } }, "u": { "$set": { "seen": true } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&update)[0].get_str("errmsg").unwrap(),
+            "unsupported query operator $near"
+        );
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_update_query"),
+            vec!["expired", "future"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_delete_entry");
+        let delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "bad_delete_entry",
+                "$db": "app",
+                "deletes": [1_i32],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&delete)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_delete_entry"),
+            vec!["expired", "future"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_delete_query");
+        let delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "bad_delete_query",
+                "$db": "app",
+                "deletes": [{ "q": { "category": { "$near": "old" } }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&delete)[0].get_str("errmsg").unwrap(),
+            "unsupported query operator $near"
+        );
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_delete_query"),
+            vec!["expired", "future"]
+        );
+    }
+
+    #[test]
+    fn ttl_invalid_find_and_modify_paths_do_not_sweep_expired_documents() {
+        let conn = test_conn();
+
+        seed_ttl_command_fixture(&conn, "bad_fam_hint");
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "bad_fam_hint",
+                "$db": "app",
+                "query": { "category": "old" },
+                "hint": "missing_1",
+                "update": { "$set": { "seen": true } },
+            },
+        )
+        .unwrap();
+        assert_command_error(&response);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_fam_hint"),
+            vec!["expired", "future"]
+        );
+
+        seed_ttl_command_fixture(&conn, "bad_fam_update");
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "bad_fam_update",
+                "$db": "app",
+                "query": { "category": "old" },
+                "update": { "$set": { "_id": "changed" } },
+            },
+        )
+        .unwrap();
+        assert_command_error(&response);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_fam_update"),
+            vec!["expired", "future"]
+        );
+
+        create_collection(
+            &conn,
+            &doc! {
+                "create": "bad_fam_validation",
+                "$db": "app",
+                "validator": ttl_name_validator(),
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "bad_fam_validation",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 }],
+            },
+        )
+        .unwrap();
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "bad_fam_validation",
+                "$db": "app",
+                "documents": [{ "_id": "expired", "name": "Ada", "expiresAt": past }],
+            },
+        )
+        .unwrap();
+
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "bad_fam_validation",
+                "$db": "app",
+                "query": { "_id": "expired" },
+                "update": { "$set": { "name": 5_i32 } },
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert_eq!(response.get_i32("code").unwrap(), 121);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_fam_validation"),
             vec!["expired"]
         );
     }
