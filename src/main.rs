@@ -2071,6 +2071,74 @@ fn count_matching_documents(
     Ok(matched)
 }
 
+#[derive(Debug, PartialEq)]
+enum CountPlan {
+    Empty,
+    IdEquality(String),
+    IndexedEquality {
+        index_name: String,
+        key_value: String,
+    },
+    Fallback,
+}
+
+fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<CountPlan> {
+    if filter.is_empty() {
+        return Ok(CountPlan::Empty);
+    }
+    if let Some(value) = exact_equality_filter_value(filter, "_id") {
+        return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
+    }
+    let Some((field, value)) = exact_single_equality_filter(filter) else {
+        return Ok(CountPlan::Fallback);
+    };
+    if matches!(value, Bson::Array(_)) {
+        return Ok(CountPlan::Fallback);
+    }
+    let Some(index) = indexes_for_namespace(conn, namespace)?
+        .into_iter()
+        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
+    else {
+        return Ok(CountPlan::Fallback);
+    };
+    Ok(CountPlan::IndexedEquality {
+        index_name: index.name,
+        key_value: id_key_from_bson(value),
+    })
+}
+
+fn exact_single_equality_filter(filter: &Document) -> Option<(&str, &Bson)> {
+    if filter.len() != 1 {
+        return None;
+    }
+    let (field, value) = filter.iter().next()?;
+    if field.starts_with('$') {
+        return None;
+    }
+    exact_equality_value(value).map(|value| (field.as_str(), value))
+}
+
+fn exact_equality_filter_value<'a>(filter: &'a Document, field: &str) -> Option<&'a Bson> {
+    if filter.len() != 1 {
+        return None;
+    }
+    filter.get(field).and_then(exact_equality_value)
+}
+
+fn exact_equality_value(value: &Bson) -> Option<&Bson> {
+    if !is_operator_document(value) {
+        return Some(value);
+    }
+    let Bson::Document(operators) = value else {
+        return None;
+    };
+    if operators.len() == 1 {
+        operators.get("$eq")
+    } else {
+        None
+    }
+}
+
 fn distinct_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
     values_at_path(document, path)
         .into_iter()
@@ -6958,6 +7026,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.get_i64("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn count_planner_classifies_safe_and_fallback_filters() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "active": 1_i32 }, "name": "active_1" }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! {}).unwrap(),
+            CountPlan::Empty
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "_id": "u1" }).unwrap(),
+            CountPlan::IdEquality("str:u1".to_string())
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "_id": { "$eq": "u1" } }).unwrap(),
+            CountPlan::IdEquality("str:u1".to_string())
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "active": true }).unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "active_1".to_string(),
+                key_value: "bool:true".to_string(),
+            }
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "active": { "$eq": true } }).unwrap(),
+            CountPlan::IndexedEquality {
+                index_name: "active_1".to_string(),
+                key_value: "bool:true".to_string(),
+            }
+        );
+
+        for filter in [
+            doc! { "tags": ["math"] },
+            doc! { "$or": [{ "active": true }] },
+            doc! { "active": { "$in": [true] } },
+            doc! { "active": { "$ne": false } },
+            doc! { "active": true, "name": "Ada" },
+            doc! { "name": "Ada" },
+            doc! { "profile.city": "Rome" },
+        ] {
+            assert_eq!(
+                plan_count(&conn, "app.users", &filter).unwrap(),
+                CountPlan::Fallback
+            );
+        }
     }
 
     #[test]

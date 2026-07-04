@@ -93,13 +93,19 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Count planner design and safety tests
+- [x] Milestone 0: Count planner design and safety tests
 - [ ] Milestone 1: Empty and `_id` count pushdown
 - [ ] Milestone 2: Indexed scalar equality count pushdown
 - [ ] Milestone 3: Aggregation `$match` + `$count` pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Count Planner Design And Safety Tests
+
+Status 2026-07-04:
+
+- Added a conservative count planner that recognizes empty filters, exact `_id` equality, and exact indexed scalar equality, while falling back for arrays, logical operators, unsupported operators, multi-predicate filters, and unindexed fields.
+- Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test planner`; `cargo test`.
+- Commit: `dd66683`.
 
 Problem:
 
