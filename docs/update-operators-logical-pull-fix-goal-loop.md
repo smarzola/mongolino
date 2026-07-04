@@ -67,10 +67,10 @@ The fix is complete only when:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Add failing logical `$pull` tests
-- [ ] Milestone 1: Route document logical predicates through the query matcher
-- [ ] Milestone 2: Harden scalar preservation and unsupported logical errors
-- [ ] Milestone 3: Final verification and commit
+- [x] Milestone 0: Add failing logical `$pull` tests
+- [x] Milestone 1: Route document logical predicates through the query matcher
+- [x] Milestone 2: Harden scalar preservation and unsupported logical errors
+- [x] Milestone 3: Final verification and commit
 
 ## Milestone 0: Add Failing Logical `$pull` Tests
 
@@ -154,3 +154,21 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 Commit requirement:
 
 - Commit with a focused message such as `Fix logical pull predicates`.
+
+Status 2026-07-04: Complete. Implemented `$pull` routing for document array elements with supported top-level logical predicates through the existing query matcher, while preserving scalar predicate and whole-document `$eq` behavior. Added PyMongo e2e, Rust, and spec corpus coverage for `$or`, `$and`, `$nor`, no-match behavior, malformed logical operands, and mixed logical plus unsupported top-level operators. Verification run:
+
+```bash
+cargo fmt
+git diff --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked python -m json.tool tests/spec_corpus/update_array_operators.json
+cargo fmt -- --check
+cargo test update
+cargo test pull_document_arrays_supports_logical_predicates
+cargo test
+cargo build
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+```
+
+Results: formatter check, JSON parsing, focused Rust tests, full Rust tests, build, uv lock check, and uv sync passed. The sandboxed PyMongo e2e command collected 114 items but failed at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1` (`2 failed, 6 passed, 1 skipped, 105 errors`). The same `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` command passed outside the sandbox with `113 passed, 1 skipped in 57.43s`. Fix commit: `4bc3759c73312b29a302c2c92040746ff9491ea8`.
