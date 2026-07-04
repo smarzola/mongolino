@@ -140,7 +140,7 @@ Status 2026-07-04: Complete. Added BSON ObjectId numeric code `7` to `$type`
 parsing, added mixed `$type` array coverage containing `7`, and made `$all: []`
 return no matches explicitly. Verification: `cargo fmt -- --check` passed;
 `cargo test type` passed; `cargo test all` passed; `cargo test elem` passed.
-Commit: pending.
+Commit: `8f4e69d`.
 
 ## Milestone 2: Cross-Command Adversarial Coverage And Verification
 
@@ -194,7 +194,7 @@ tests/e2e/test_query_language.py tests/e2e/test_spec_corpus.py` failed at
 localhost port allocation with `PermissionError: [Errno 1] Operation not
 permitted`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
 --locked pytest tests/e2e/test_query_language.py tests/e2e/test_spec_corpus.py`
-passed with 29 tests. Commit: pending.
+passed with 29 tests. Commit: `8f4e69d`.
 
 ## Final Response Requirements
 

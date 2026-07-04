@@ -135,7 +135,7 @@ When a milestone is complete:
 - [x] Milestone 1: Regex predicate support
 - [x] Milestone 2: `$type`, `$size`, and `$all`
 - [x] Milestone 3: `$elemMatch` scalar and document semantics
-- [ ] Milestone 4: Cross-command/e2e/spec coverage and docs
+- [x] Milestone 4: Cross-command/e2e/spec coverage and docs
 
 ## Milestone 0: Matcher Architecture And Error Model
 
@@ -330,7 +330,7 @@ test find_matcher` passed; after `cargo build`, unsandboxed
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
 tests/e2e/test_query_language.py tests/e2e/test_crud.py
 tests/e2e/test_find_and_modify.py` passed with 41 tests; `cargo test` passed.
-Commit: pending.
+Commit: `c0f5d90`.
 
 ## Milestone 4: Cross-Command/E2E/Spec Coverage And Docs
 
@@ -377,6 +377,17 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 ```
 
+Status 2026-07-04: Complete. Added aggregation `$match` e2e and spec coverage,
+converted the old unsupported-regex corpus case to supported coverage, refreshed
+stale `$pull` regex error expectations to unsupported regex-option errors, and
+updated README plus the compatibility roadmap scorecard from 49% to 55%.
+Verification: `cargo fmt -- --check` passed; `cargo test` passed; `cargo build`
+passed; `cargo run --bin mongolino-bench -- --profile ci --check-budget`
+passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` passed;
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` passed;
+unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+pytest tests/e2e` passed with 167 tests. Commit: pending.
+
 Adversarial repair 2026-07-04: Added `$type` numeric code `7` for ObjectId,
 mixed `$type` array coverage containing `7`, and explicit Mongo-compatible
 `$all: []` behavior that returns no matches. Added Rust matcher, PyMongo e2e,
@@ -385,7 +396,7 @@ type`, `cargo test all`, `cargo test elem`, `cargo test`, and `cargo build`
 passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
 pytest tests/e2e/test_query_language.py tests/e2e/test_spec_corpus.py` was
 blocked by localhost binding permissions; the same command passed unsandboxed
-with 29 tests. Commit: pending.
+with 29 tests. Commit: `8f4e69d`.
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.

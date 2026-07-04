@@ -60,7 +60,7 @@ Compatibility flags:
 | `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$unwind`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`; supports bounded group keys and `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, and `$addToSet`; preserves the PyMongo `count_documents()` `$group` shape; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`. | No general expression language, `$lookup`, `$facet`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$out`, `$merge`, `$geoNear`, window stages, allowDiskUse, collation, hint, read concern, write concern, explain, maxTimeMS, or `let`. Unsupported shapes return command errors. |
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order. | No collation, hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key and validation `writeErrors`, supports ordered/unordered batches, and honors `bypassDocumentValidation: true`. | No write concern, retryable writes, or sessions beyond accepting `lsid`. |
-| `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, and conservative scalar equality lookup through supported indexes. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, or tailable cursors. Unsupported operators return command errors. |
+| `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$type`, `$size`, `$all`, `$elemMatch`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, and conservative scalar equality lookup through supported indexes. | No `$where`, geospatial/text search, collation, read concern, or tailable cursors. Unsupported operators and unsupported predicate shapes return command errors. |
 | `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, `fields`/`projection`, pre-image or post-image return, update/replacement upsert, supported update modifiers, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, unique-index enforcement, and maintained index entries. | No array filters, pipeline updates, positional updates, collation, hint, write concern, maxTimeMS, `let`, retryable writes, or transaction semantics. Unsupported shapes return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
 | `killCursors` | Partial | Removes live per-client cursors and reports `cursorsKilled` or `cursorsNotFound`. | No cross-connection cursor lookup. Malformed cursor ids return command errors. |
@@ -94,6 +94,19 @@ works for scalars, documents, arrays, booleans, `null`, and comparable numeric
 types. Dotted paths can traverse embedded documents and arrays of documents.
 Unsupported or malformed operators return command errors instead of being
 silently accepted.
+
+The shared query matcher is used by `find`, `count`, `distinct`, aggregation
+`$match`, update/delete target selection, `findAndModify`, index membership
+checks, and `$pull` document predicates. Supported predicate shapes include
+exact BSON equality; dotted paths with limited array traversal; comparison
+operators; `$in`/`$nin`; `$exists`; `$not`; logical `$and`/`$or`/`$nor`;
+`$regex` with string or BSON regex operands and options `i`, `m`, and `s`;
+`$type` for common aliases and BSON type codes; `$size` for exact array length;
+scalar `$all`; `$all` with supported `$elemMatch` clauses; and `$elemMatch` for
+scalar and document arrays. Unsupported regex options, invalid regex patterns,
+malformed `$type`/`$size`/`$all`/`$elemMatch` operands, JavaScript `$where`,
+geospatial/text predicates, expression predicates, and collation-aware matching
+remain explicit errors.
 
 Projection supports inclusion or exclusion mode, with `_id` as the only allowed
 mode override. Sort supports top-level or dotted fields with `1` or `-1`; missing

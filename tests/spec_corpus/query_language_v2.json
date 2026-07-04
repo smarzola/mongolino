@@ -220,6 +220,9 @@
       "expect_documents": [
         {
           "_id": "u1"
+        },
+        {
+          "_id": "u4"
         }
       ]
     },
@@ -288,6 +291,38 @@
       "projection": {
         "_id": 1
       },
+      "expect_documents": [
+        {
+          "_id": "u2"
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "items": {
+              "$elemMatch": {
+                "kind": "a",
+                "score": {
+                  "$gte": 5
+                }
+              }
+            }
+          }
+        },
+        {
+          "$project": {
+            "_id": 1
+          }
+        },
+        {
+          "$sort": {
+            "_id": 1
+          }
+        }
+      ],
       "expect_documents": [
         {
           "_id": "u2"

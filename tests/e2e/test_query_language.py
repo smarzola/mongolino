@@ -111,6 +111,27 @@ def test_type_size_and_all_predicates_find_and_count(collection):
         )
     ) == ["u2"]
 
+    aggregate_ids = [
+        doc["_id"]
+        for doc in collection.aggregate(
+            [
+                {
+                    "$match": {
+                        "items": {
+                            "$elemMatch": {
+                                "kind": "a",
+                                "score": {"$gte": 5},
+                            }
+                        }
+                    }
+                },
+                {"$project": {"_id": 1}},
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    ]
+    assert aggregate_ids == ["u2"]
+
 
 def test_type_size_and_all_malformed_predicates_are_errors(collection):
     collection.insert_one({"_id": "u1", "tags": ["math"], "name": "Ada"})

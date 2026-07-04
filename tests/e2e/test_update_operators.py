@@ -382,7 +382,7 @@ def test_array_update_operator_errors_preserve_documents(collection):
         {"$pullAll": {"tags": "x"}},
         {"$push": {"name": "x"}},
         {"$pull": {"name": "Ada"}},
-        {"$pull": {"docs": {"name": {"$regex": "^A"}}}},
+        {"$pull": {"docs": {"name": {"$regex": "^A", "$options": "x"}}}},
         {"$pull": {"docs": {"$or": [{"name": "Ada"}], "$where": "bad"}}},
         {"$pull": {"docs": {"$and": []}}},
         {"$pull": {"docs": {"$nor": [{"name": "Ada"}, "bad"]}}},

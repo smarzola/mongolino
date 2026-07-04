@@ -1,8 +1,7 @@
 {
-  "name": "unsupported regex tracking case",
+  "name": "regex query tracking case",
   "source": "crud",
-  "status": "skip",
-  "skip_reason": "Regex query matching is outside mongolino's documented subset.",
+  "status": "supported",
   "setup": [
     {
       "_id": "u1",

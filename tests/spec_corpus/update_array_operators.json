@@ -251,14 +251,15 @@
         "$pull": {
           "docs": {
             "kind": {
-              "$regex": "^a"
+              "$regex": "^a",
+              "$options": "x"
             }
           }
         }
       },
       "expect_error": {
         "type": "WriteError",
-        "contains": "unsupported query operator $regex"
+        "contains": "$regex option x is not supported"
       }
     },
     {

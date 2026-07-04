@@ -12,8 +12,9 @@ Current implementation has a practical CRUD, aggregation, validation, and index
 subset, but several major MongoDB application surfaces remain unsupported or
 intentionally conservative:
 
-- Query predicates do not support `$regex`, `$elemMatch`, `$type`, `$size`, or
-  `$all`.
+- Query predicates now support a practical `$regex`, `$elemMatch`, `$type`,
+  `$size`, and `$all` subset; JavaScript, geospatial/text, expression, and
+  collation-aware predicates remain unsupported.
 - Index planning does not support compound prefix scans, range scans, sort
   pushdown, `hint`, or `explain`.
 - TTL index metadata/expiration behavior is unsupported.
@@ -31,14 +32,14 @@ claim of full MongoDB parity.
 
 | Area | Weight | Current | Target After 7 Uplifts |
 | --- | ---: | ---: | ---: |
-| Query predicate compatibility | 20% | 11% | 17% |
+| Query predicate compatibility | 20% | 17% | 17% |
 | Index planning and diagnostics | 15% | 8% | 13% |
 | Index lifecycle/TTL/collation behavior | 15% | 5% | 11% |
 | Aggregation compatibility | 20% | 9% | 15% |
 | Update language compatibility | 15% | 8% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 49% | 81% |
+| Total | 100% | 55% | 81% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -46,9 +47,9 @@ repo-local scorecard while preserving explicit errors for unsupported features.
 ## Uplifts
 
 1. Query Language v2
-   - Add `$regex`, `$elemMatch`, `$type`, `$size`, and `$all` for the supported
-     BSON/query subset.
-   - Harden null/missing and array traversal edge cases.
+   - Complete in uplift 1. Added `$regex`, `$elemMatch`, `$type`, `$size`, and
+     `$all` for the supported BSON/query subset.
+   - Hardened malformed predicate errors and practical array traversal cases.
    - Prompt: `docs/query-language-v2-goal-loop.md`.
 
 2. Index Planner v2
