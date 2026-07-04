@@ -17,10 +17,10 @@ const DOCUMENT_VALIDATION_ERROR_CODE: i32 = 121;
 
 static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(1);
 
-type Result<T> = std::result::Result<T, MongolinoError>;
+pub(crate) type Result<T> = std::result::Result<T, MongolinoError>;
 
 #[derive(Debug)]
-enum MongolinoError {
+pub(crate) enum MongolinoError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     BsonDe(bson::de::Error),
@@ -80,7 +80,7 @@ struct WireMessage {
 }
 
 #[derive(Debug)]
-struct ClientState {
+pub(crate) struct ClientState {
     cursors: HashMap<i64, CursorState>,
     next_cursor_id: i64,
 }
@@ -179,7 +179,7 @@ fn init_database(path: &PathBuf) -> Result<()> {
     init_connection(&conn)
 }
 
-fn init_connection(conn: &Connection) -> Result<()> {
+pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     init_migration_schema(conn)?;
@@ -491,7 +491,7 @@ fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
     handle_command_with_state(conn, &mut client_state, command)
 }
 
-fn handle_command_with_state(
+pub(crate) fn handle_command_with_state(
     conn: &Connection,
     client_state: &mut ClientState,
     command: &Document,

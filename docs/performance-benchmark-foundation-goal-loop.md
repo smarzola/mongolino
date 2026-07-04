@@ -98,13 +98,23 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Benchmark harness design and workload seeding
+- [x] Milestone 0: Benchmark harness design and workload seeding
 - [ ] Milestone 1: Benchmark command and machine-readable output
 - [ ] Milestone 2: CI-friendly performance budget smoke
 - [ ] Milestone 3: Baseline results and SQLite pushdown roadmap
 - [ ] Milestone 4: Final correctness verification and docs
 
 ## Milestone 0: Benchmark Harness Design And Workload Seeding
+
+Status note:
+
+- 2026-07-04: Added `src/bin/mongolino-bench.rs` with configurable `smoke`,
+  `ci`, and `local` profiles. The harness opens temporary SQLite databases,
+  initializes them through `init_connection`, seeds documents through the real
+  `insert` command, creates maintained scalar indexes through `createIndexes`,
+  and exercises real command/storage/query paths without localhost, PyMongo,
+  Docker, or external services. Verification run:
+  `cargo fmt -- --check`; `cargo test`. Commit hash: pending.
 
 Problem:
 
