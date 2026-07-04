@@ -184,6 +184,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     init_migration_schema(conn)?;
     init_document_schema(conn)?;
+    ensure_index_metadata_columns(conn)?;
     Ok(())
 }
 
@@ -196,6 +197,26 @@ fn init_migration_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    Ok(())
+}
+
+fn ensure_index_metadata_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(indexes)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "sparse_index") {
+        conn.execute(
+            "ALTER TABLE indexes ADD COLUMN sparse_index INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "partial_filter_bson") {
+        conn.execute(
+            "ALTER TABLE indexes ADD COLUMN partial_filter_bson BLOB",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -2241,9 +2262,14 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
         return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
     }
     for index in indexes_for_namespace(conn, namespace)? {
-        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+        let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
+        if !filter_implies_index_membership(&index, filter)
+            || !count_filter_covered_by_index(&index, filter)
+        {
+            continue;
+        }
         if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
             continue;
         }
@@ -2268,6 +2294,11 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
         return Ok(CountPlan::Fallback);
     };
     if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+        return Ok(CountPlan::Fallback);
+    }
+    if !filter_implies_index_membership(&index, filter)
+        || !count_filter_covered_by_index(&index, filter)
+    {
         return Ok(CountPlan::Fallback);
     }
     Ok(CountPlan::IndexedEquality {
@@ -2335,6 +2366,8 @@ struct IndexSpec {
     name: String,
     key: Document,
     unique: bool,
+    sparse: bool,
+    partial_filter: Option<Document>,
 }
 
 fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
@@ -2353,9 +2386,17 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         }
         Err(_) => return Ok(command_error(9, "createIndexes requires an indexes array")),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["createIndexes", "indexes", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "createIndexes",
+            "indexes",
+            "$db",
+            "lsid",
+            "sparse",
+            "partialFilterExpression",
+        ],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -2365,7 +2406,18 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         let Bson::Document(index) = value else {
             return Ok(command_error(9, "index specs must be documents"));
         };
-        match parse_index_spec(index) {
+        let mut index = index.clone();
+        if let Some(sparse) = command.get("sparse")
+            && !index.contains_key("sparse")
+        {
+            index.insert("sparse", sparse.clone());
+        }
+        if let Some(partial_filter) = command.get("partialFilterExpression")
+            && !index.contains_key("partialFilterExpression")
+        {
+            index.insert("partialFilterExpression", partial_filter.clone());
+        }
+        match parse_index_spec(&index) {
             Ok(spec) => specs.push(spec),
             Err(response) => return Ok(response),
         }
@@ -2379,7 +2431,11 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
             return Ok(command_error(67, "cannot create explicit _id_ index"));
         }
         if let Some(existing) = index_by_name_tx(&tx, &namespace, &spec.name)? {
-            if existing.key == spec.key && existing.unique == spec.unique {
+            if existing.key == spec.key
+                && existing.unique == spec.unique
+                && existing.sparse == spec.sparse
+                && existing.partial_filter == spec.partial_filter
+            {
                 continue;
             }
             return Ok(command_error(
@@ -2442,6 +2498,12 @@ fn list_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         };
         if spec.unique {
             document.insert("unique", true);
+        }
+        if spec.sparse {
+            document.insert("sparse", true);
+        }
+        if let Some(partial_filter) = spec.partial_filter {
+            document.insert("partialFilterExpression", partial_filter);
         }
         batch.push(Bson::Document(document));
     }
@@ -2523,7 +2585,17 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
 }
 
 fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document> {
-    if let Some(errmsg) = reject_unsupported_command_keys(index, &["key", "name", "unique", "v"]) {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        index,
+        &[
+            "key",
+            "name",
+            "unique",
+            "v",
+            "sparse",
+            "partialFilterExpression",
+        ],
+    ) {
         return Err(command_error(72, &errmsg));
     }
     let key = match index.get_document("key") {
@@ -2546,12 +2618,36 @@ fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document
         Some(Bson::Boolean(value)) => *value,
         Some(_) => return Err(command_error(9, "unique must be a boolean")),
     };
+    let sparse = match index.get("sparse") {
+        None => false,
+        Some(Bson::Boolean(value)) => *value,
+        Some(_) => return Err(command_error(9, "sparse must be a boolean")),
+    };
+    let partial_filter = match index.get("partialFilterExpression") {
+        None => None,
+        Some(Bson::Document(filter)) => {
+            validate_partial_filter(filter)?;
+            Some(filter.clone())
+        }
+        Some(_) => {
+            return Err(command_error(
+                9,
+                "partialFilterExpression must be a document",
+            ));
+        }
+    };
     match index.get("v") {
         None | Some(Bson::Int32(2) | Bson::Int64(2)) => {}
         Some(_) => return Err(command_error(72, "only index version 2 is supported")),
     }
 
-    Ok(IndexSpec { name, key, unique })
+    Ok(IndexSpec {
+        name,
+        key,
+        unique,
+        sparse,
+        partial_filter,
+    })
 }
 
 fn validate_index_key(key: &Document) -> std::result::Result<(), Document> {
@@ -2579,6 +2675,94 @@ fn validate_index_key(key: &Document) -> std::result::Result<(), Document> {
     Ok(())
 }
 
+fn validate_partial_filter(filter: &Document) -> std::result::Result<(), Document> {
+    if filter.is_empty() {
+        return Err(command_error(
+            72,
+            "partialFilterExpression must not be empty",
+        ));
+    }
+    for (field, condition) in filter {
+        if field == "$and" {
+            let Bson::Array(clauses) = condition else {
+                return Err(command_error(
+                    72,
+                    "partialFilterExpression $and requires an array",
+                ));
+            };
+            if clauses.is_empty() {
+                return Err(command_error(
+                    72,
+                    "partialFilterExpression $and requires a non-empty array",
+                ));
+            }
+            for clause in clauses {
+                let Bson::Document(clause) = clause else {
+                    return Err(command_error(
+                        72,
+                        "partialFilterExpression $and entries must be documents",
+                    ));
+                };
+                validate_partial_filter(clause)?;
+            }
+            continue;
+        }
+        if field.starts_with('$') {
+            return Err(command_error(
+                72,
+                "partialFilterExpression only supports field predicates and $and",
+            ));
+        }
+        validate_partial_field_predicate(condition)?;
+    }
+    Ok(())
+}
+
+fn validate_partial_field_predicate(condition: &Bson) -> std::result::Result<(), Document> {
+    if !is_operator_document(condition) {
+        if numeric_value(condition).is_some()
+            || matches!(condition, Bson::Array(_) | Bson::Document(_))
+        {
+            return Err(command_error(
+                72,
+                "partialFilterExpression equality supports only non-numeric scalar values",
+            ));
+        }
+        return Ok(());
+    }
+    let Bson::Document(operators) = condition else {
+        unreachable!("operator document checked above");
+    };
+    if operators.len() != 1 {
+        return Err(command_error(
+            72,
+            "partialFilterExpression field predicates support one operator",
+        ));
+    }
+    match operators.iter().next() {
+        Some((operator, value)) if operator == "$eq" => {
+            if numeric_value(value).is_some() || matches!(value, Bson::Array(_) | Bson::Document(_))
+            {
+                return Err(command_error(
+                    72,
+                    "partialFilterExpression $eq supports only non-numeric scalar values",
+                ));
+            }
+            Ok(())
+        }
+        Some((operator, Bson::Boolean(true))) if operator == "$exists" => Ok(()),
+        Some((operator, _)) if operator == "$exists" => Err(command_error(
+            72,
+            "partialFilterExpression only supports $exists: true",
+        )),
+        Some((operator, _)) => Err(command_error(
+            72,
+            &format!("partialFilterExpression operator {operator} is not supported"),
+        )),
+        None => unreachable!("operator length checked above"),
+    }
+}
+
 fn generated_index_name(key: &Document) -> String {
     key.iter()
         .map(|(field, direction)| {
@@ -2599,12 +2783,17 @@ fn insert_index_tx(
     spec: &IndexSpec,
 ) -> std::result::Result<(), rusqlite::Error> {
     tx.execute(
-        "INSERT INTO indexes(namespace, name, key_bson, unique_index) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO indexes(namespace, name, key_bson, unique_index, sparse_index, partial_filter_bson) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             namespace,
             spec.name,
             encode_document(&spec.key)?,
-            if spec.unique { 1_i32 } else { 0_i32 }
+            if spec.unique { 1_i32 } else { 0_i32 },
+            if spec.sparse { 1_i32 } else { 0_i32 },
+            spec.partial_filter
+                .as_ref()
+                .map(encode_document)
+                .transpose()?,
         ],
     )?;
     Ok(())
@@ -2616,13 +2805,24 @@ fn index_by_name_tx(
     name: &str,
 ) -> Result<Option<IndexSpec>> {
     tx.query_row(
-        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 AND name = ?2",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 AND name = ?2",
         params![namespace, name],
         |row| {
             let name = row.get::<_, String>(0)?;
             let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
             let unique = row.get::<_, i32>(2)? != 0;
-            Ok(IndexSpec { name, key, unique })
+            let sparse = row.get::<_, i32>(3)? != 0;
+            let partial_filter = row
+                .get::<_, Option<Vec<u8>>>(4)?
+                .map(decode_document_sql)
+                .transpose()?;
+            Ok(IndexSpec {
+                name,
+                key,
+                unique,
+                sparse,
+                partial_filter,
+            })
         },
     )
     .optional()
@@ -2631,13 +2831,24 @@ fn index_by_name_tx(
 
 fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<IndexSpec>> {
     let mut stmt = conn.prepare(
-        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
         let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
         let unique = row.get::<_, i32>(2)? != 0;
-        Ok(IndexSpec { name, key, unique })
+        let sparse = row.get::<_, i32>(3)? != 0;
+        let partial_filter = row
+            .get::<_, Option<Vec<u8>>>(4)?
+            .map(decode_document_sql)
+            .transpose()?;
+        Ok(IndexSpec {
+            name,
+            key,
+            unique,
+            sparse,
+            partial_filter,
+        })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(Into::into)
@@ -2656,13 +2867,24 @@ fn unique_indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
         let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
         let unique = row.get::<_, i32>(2)? != 0;
-        Ok(IndexSpec { name, key, unique })
+        let sparse = row.get::<_, i32>(3)? != 0;
+        let partial_filter = row
+            .get::<_, Option<Vec<u8>>>(4)?
+            .map(decode_document_sql)
+            .transpose()?;
+        Ok(IndexSpec {
+            name,
+            key,
+            unique,
+            sparse,
+            partial_filter,
+        })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(Into::into)
@@ -2675,6 +2897,9 @@ fn validate_unique_index_tx(
 ) -> std::result::Result<(), String> {
     let mut seen = HashMap::new();
     for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+        if !document_belongs_to_index(spec, &stored.document)? {
+            continue;
+        }
         let key = unique_key_for_document(spec, &stored.document)?;
         if let Some(existing_id) = seen.insert(key.clone(), stored.id_key.clone()) {
             return Err(format!(
@@ -2698,6 +2923,9 @@ fn ensure_unique_constraints_tx(
     }
 
     for index in indexes {
+        if !document_belongs_to_index(&index, document)? {
+            continue;
+        }
         if unique_conflict_check_with_index_entries_tx(
             tx,
             namespace,
@@ -2712,6 +2940,9 @@ fn ensure_unique_constraints_tx(
             stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?
         {
             if excluding_id_key.is_some_and(|id_key| id_key == stored.id_key) {
+                continue;
+            }
+            if !document_belongs_to_index(&index, &stored.document)? {
                 continue;
             }
             let existing_key = unique_key_for_document(&index, &stored.document)?;
@@ -2733,6 +2964,9 @@ fn unique_conflict_check_with_index_entries_tx(
     document: &Document,
     excluding_id_key: Option<&str>,
 ) -> std::result::Result<bool, String> {
+    if !document_belongs_to_index(index, document)? {
+        return Ok(true);
+    }
     let key_value = if let Some(field) = single_field_index_name(index) {
         let values = values_at_path(document, field);
         let value = match values.as_slice() {
@@ -2771,6 +3005,25 @@ fn unique_conflict_check_with_index_entries_tx(
             "duplicate key error collection: {namespace} index: {} dup key: {wanted_key}",
             index.name
         ));
+    }
+    Ok(true)
+}
+
+fn document_belongs_to_index(
+    spec: &IndexSpec,
+    document: &Document,
+) -> std::result::Result<bool, String> {
+    if spec.sparse
+        && spec
+            .key
+            .keys()
+            .any(|field| get_document_path(document, field).is_none())
+    {
+        return Ok(false);
+    }
+    if let Some(partial_filter) = &spec.partial_filter {
+        return matches_filter(document, partial_filter)
+            .map_err(|err| format!("partialFilterExpression failed: {}", err.errmsg));
     }
     Ok(true)
 }
@@ -2881,6 +3134,9 @@ fn insert_index_entry_for_document_tx(
     id_key: &str,
     document: &Document,
 ) -> std::result::Result<(), rusqlite::Error> {
+    if !document_belongs_to_index(spec, document).map_err(sql_string_error_from_string)? {
+        return Ok(());
+    }
     if index_has_multikey_omission(spec, document) {
         tx.execute(
             "INSERT OR IGNORE INTO index_multikey_omissions(namespace, index_name, id_key) VALUES (?1, ?2, ?3)",
@@ -2991,7 +3247,7 @@ fn compound_key_from_document(
 }
 
 fn compound_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<String> {
-    if !is_compound_index(spec) || filter.len() != spec.key.len() {
+    if !is_compound_index(spec) || filter.keys().any(|key| key.starts_with('$')) {
         return None;
     }
     let mut parts = Vec::with_capacity(spec.key.len());
@@ -3003,6 +3259,114 @@ fn compound_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Optio
         parts.push(id_key_from_bson(value));
     }
     Some(encode_compound_planner_key(&parts))
+}
+
+fn planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<String> {
+    if let Some(field) = single_field_index_name(spec) {
+        let value = exact_equality_filter_part(filter, field)?;
+        if !is_compound_planner_scalar(value) {
+            return None;
+        }
+        return Some(id_key_from_bson(value));
+    }
+    compound_planner_key_for_filter(spec, filter)
+}
+
+fn filter_implies_index_membership(spec: &IndexSpec, filter: &Document) -> bool {
+    if spec.sparse
+        && spec
+            .key
+            .keys()
+            .any(|field| exact_equality_filter_part(filter, field).is_none())
+    {
+        return false;
+    }
+    spec.partial_filter
+        .as_ref()
+        .is_none_or(|partial| filter_implies_partial_filter(filter, partial))
+}
+
+fn filter_implies_partial_filter(filter: &Document, partial: &Document) -> bool {
+    partial.iter().all(|(field, condition)| {
+        if field == "$and" {
+            let Bson::Array(clauses) = condition else {
+                return false;
+            };
+            return clauses.iter().all(|clause| {
+                let Bson::Document(clause) = clause else {
+                    return false;
+                };
+                filter_implies_partial_filter(filter, clause)
+            });
+        }
+        filter.get(field).is_some_and(|query_condition| {
+            query_implies_partial_predicate(query_condition, condition)
+        })
+    })
+}
+
+fn query_implies_partial_predicate(query_condition: &Bson, partial_condition: &Bson) -> bool {
+    if partial_is_exists_true(partial_condition) {
+        return exact_equality_value(query_condition).is_some()
+            || matches!(
+                query_condition,
+                Bson::Document(document)
+                    if document.len() == 1
+                        && matches!(document.get("$exists"), Some(Bson::Boolean(true)))
+            );
+    }
+    let Some(query_value) = exact_equality_value(query_condition) else {
+        return false;
+    };
+    let Some(partial_value) = exact_equality_value(partial_condition) else {
+        return false;
+    };
+    bson_values_equal(query_value, partial_value)
+}
+
+fn partial_is_exists_true(condition: &Bson) -> bool {
+    matches!(
+        condition,
+        Bson::Document(document)
+            if document.len() == 1 && matches!(document.get("$exists"), Some(Bson::Boolean(true)))
+    )
+}
+
+fn count_filter_covered_by_index(spec: &IndexSpec, filter: &Document) -> bool {
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return false;
+    }
+    filter.iter().all(|(field, condition)| {
+        if spec.key.contains_key(field) {
+            exact_equality_value(condition).is_some()
+        } else {
+            spec.partial_filter.as_ref().is_some_and(|partial| {
+                partial_filter_contains_implied_field_predicate(partial, field, condition)
+            })
+        }
+    })
+}
+
+fn partial_filter_contains_implied_field_predicate(
+    partial: &Document,
+    field: &str,
+    query_condition: &Bson,
+) -> bool {
+    partial.iter().any(|(partial_field, partial_condition)| {
+        if partial_field == "$and" {
+            let Bson::Array(clauses) = partial_condition else {
+                return false;
+            };
+            return clauses.iter().any(|clause| {
+                let Bson::Document(clause) = clause else {
+                    return false;
+                };
+                partial_filter_contains_implied_field_predicate(clause, field, query_condition)
+            });
+        }
+        partial_field == field
+            && query_implies_partial_predicate(query_condition, partial_condition)
+    })
 }
 
 fn exact_equality_filter_part<'a>(filter: &'a Document, field: &str) -> Option<&'a Bson> {
@@ -3035,13 +3399,24 @@ fn indexes_for_namespace_tx(
     namespace: &str,
 ) -> Result<Vec<IndexSpec>> {
     let mut stmt = tx.prepare(
-        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 ORDER BY name",
+        "SELECT name, key_bson, unique_index, sparse_index, partial_filter_bson FROM indexes WHERE namespace = ?1 ORDER BY name",
     )?;
     stmt.query_map(params![namespace], |row| {
         let name = row.get::<_, String>(0)?;
         let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
         let unique = row.get::<_, i32>(2)? != 0;
-        Ok(IndexSpec { name, key, unique })
+        let sparse = row.get::<_, i32>(3)? != 0;
+        let partial_filter = row
+            .get::<_, Option<Vec<u8>>>(4)?
+            .map(decode_document_sql)
+            .transpose()?;
+        Ok(IndexSpec {
+            name,
+            key,
+            unique,
+            sparse,
+            partial_filter,
+        })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(Into::into)
@@ -3049,6 +3424,10 @@ fn indexes_for_namespace_tx(
 
 fn sql_string_error(err: MongolinoError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+}
+
+fn sql_string_error_from_string(err: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err)))
 }
 
 #[derive(Clone, Debug)]
@@ -3930,9 +4309,12 @@ fn plan_transaction_candidates(
         )));
     }
     for index in indexes_for_namespace_tx(tx, namespace)? {
-        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+        let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
         if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
             continue;
         }
@@ -3942,26 +4324,7 @@ fn plan_transaction_candidates(
             unique: index.unique,
         });
     }
-    let Some((field, value)) = exact_single_equality_filter(filter) else {
-        return Ok(TransactionCandidatePlan::Fallback);
-    };
-    if !is_write_candidate_pushdown_scalar(value) {
-        return Ok(TransactionCandidatePlan::Fallback);
-    }
-    let Some(index) = indexes_for_namespace_tx(tx, namespace)?
-        .into_iter()
-        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
-    else {
-        return Ok(TransactionCandidatePlan::Fallback);
-    };
-    if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
-        return Ok(TransactionCandidatePlan::Fallback);
-    }
-    Ok(TransactionCandidatePlan::IndexedEquality {
-        index_name: index.name,
-        key_value: id_key_from_bson(value),
-        unique: index.unique,
-    })
+    Ok(TransactionCandidatePlan::Fallback)
 }
 
 fn transaction_candidate_documents(
@@ -4048,13 +4411,6 @@ fn indexed_candidate_documents_tx(
         })
     })
     .collect::<Result<Vec<_>>>()
-}
-
-fn is_write_candidate_pushdown_scalar(value: &Bson) -> bool {
-    matches!(
-        value,
-        Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
-    )
 }
 
 fn insert_stored_document_tx(
@@ -5609,32 +5965,18 @@ fn indexed_candidate_documents(
     filter: &Document,
 ) -> Result<Option<Vec<Document>>> {
     for index in indexes_for_namespace(conn, namespace)? {
-        let Some(key_value) = compound_planner_key_for_filter(&index, filter) else {
+        let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
         if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
             continue;
         }
         return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
     }
-
-    let Some((field, value)) = simple_equality_filter_field(filter) else {
-        return Ok(None);
-    };
-    if matches!(value, Bson::Array(_)) {
-        return Ok(None);
-    }
-    let Some(index) = indexes_for_namespace(conn, namespace)?
-        .into_iter()
-        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
-    else {
-        return Ok(None);
-    };
-    if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
-        return Ok(None);
-    }
-    let key_value = id_key_from_bson(value);
-    indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value)
+    Ok(None)
 }
 
 fn indexed_candidate_documents_by_key(
@@ -5722,24 +6064,6 @@ fn shape_documents(
     }
 
     Ok(docs)
-}
-
-fn simple_equality_filter_field(filter: &Document) -> Option<(&str, &Bson)> {
-    for (field, value) in filter {
-        if field.starts_with('$') {
-            continue;
-        }
-        if !is_operator_document(value) {
-            return Some((field.as_str(), value));
-        }
-        if let Bson::Document(operators) = value
-            && operators.len() == 1
-            && let Some(eq) = operators.get("$eq")
-        {
-            return Some((field.as_str(), eq));
-        }
-    }
-    None
 }
 
 #[derive(Debug)]
@@ -7768,6 +8092,8 @@ mod tests {
             name: "compound_1".to_string(),
             key: doc! { "profile.city": 1_i32, "active": -1_i32 },
             unique: false,
+            sparse: false,
+            partial_filter: None,
         };
         let document = doc! {
             "_id": "u1",
@@ -7784,6 +8110,8 @@ mod tests {
             name: "compound_reversed_1".to_string(),
             key: doc! { "active": -1_i32, "profile.city": 1_i32 },
             unique: false,
+            sparse: false,
+            partial_filter: None,
         };
         assert_eq!(
             planner_key_for_document(&reversed, &document),
@@ -7807,6 +8135,8 @@ mod tests {
             name: "compound_1".to_string(),
             key: doc! { "profile.city": 1_i32, "active": -1_i32 },
             unique: false,
+            sparse: false,
+            partial_filter: None,
         };
 
         assert_eq!(
@@ -9106,6 +9436,54 @@ mod tests {
     }
 
     #[test]
+    fn index_commands_roundtrip_sparse_and_partial_metadata() {
+        let conn = test_conn();
+
+        let created = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_sparse", "sparse": true },
+                    {
+                        "key": { "email": 1_i32 },
+                        "name": "email_active_partial",
+                        "partialFilterExpression": { "active": true },
+                    },
+                    {
+                        "key": { "handle": 1_i32 },
+                        "name": "handle_exists_partial",
+                        "partialFilterExpression": { "$and": [{ "handle": { "$exists": true } }] },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(created.get_i32("numIndexesAfter").unwrap(), 4);
+
+        let listed = list_indexes(
+            &conn,
+            &doc! { "listIndexes": "users", "$db": "app", "cursor": {} },
+        )
+        .unwrap();
+        let batch = first_batch(&listed);
+        let sparse = batch
+            .iter()
+            .find(|index| index.get_str("name").unwrap() == "email_sparse")
+            .unwrap();
+        assert_eq!(sparse.get_bool("sparse").unwrap(), true);
+        let partial = batch
+            .iter()
+            .find(|index| index.get_str("name").unwrap() == "email_active_partial")
+            .unwrap();
+        assert_eq!(
+            partial.get_document("partialFilterExpression").unwrap(),
+            &doc! { "active": true }
+        );
+    }
+
+    #[test]
     fn drop_indexes_all_removes_multikey_omission_sentinels() {
         let conn = test_conn();
         insert_documents(
@@ -9200,7 +9578,16 @@ mod tests {
                 &doc! {
                     "createIndexes": "users",
                     "$db": "app",
-                    "indexes": [{ "key": { "name": 1_i32 }, "partialFilterExpression": { "active": true } }],
+                    "indexes": [{ "key": { "name": 1_i32 }, "partialFilterExpression": { "age": { "$gt": 30_i32 } } }],
+                },
+            )
+            .unwrap(),
+            create_indexes(
+                &conn,
+                &doc! {
+                    "createIndexes": "users",
+                    "$db": "app",
+                    "indexes": [{ "key": { "name": 1_i32 }, "partialFilterExpression": { "age": 30_i32 } }],
                 },
             )
             .unwrap(),

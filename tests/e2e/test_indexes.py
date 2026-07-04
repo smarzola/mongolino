@@ -47,6 +47,31 @@ def test_create_list_and_drop_indexes(collection):
     assert index_names(collection) == ["_id_", "city_active_1", "profile.city_-1"]
 
 
+def test_sparse_and_partial_index_metadata_roundtrip(collection):
+    collection.create_index([("email", ASCENDING)], name="email_sparse", sparse=True)
+    collection.create_index(
+        [("email", ASCENDING)],
+        name="email_active_partial",
+        partialFilterExpression={"active": True},
+    )
+    collection.create_index(
+        [("handle", ASCENDING)],
+        name="handle_exists_partial",
+        partialFilterExpression={"handle": {"$exists": True}},
+    )
+
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+
+    assert indexes["email_sparse"]["sparse"] is True
+    assert indexes["email_active_partial"]["partialFilterExpression"] == {"active": True}
+    assert indexes["handle_exists_partial"]["partialFilterExpression"] == {
+        "handle": {"$exists": True}
+    }
+
+    collection.drop_index("email_active_partial")
+    assert "email_active_partial" not in index_names(collection)
+
+
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
     collection.create_index([("email", ASCENDING)], name="email_1")
     assert collection.create_index([("email", ASCENDING)], name="email_1") == "email_1"
@@ -90,10 +115,19 @@ def test_unsupported_index_options_are_explicit(collection):
         collection.create_index(
             [("email", ASCENDING)],
             name="email_partial",
-            partialFilterExpression={"active": True},
+            partialFilterExpression={"age": {"$gt": 30}},
         )
     assert partial_error.value.code == 72
-    assert "partialFilterExpression is not supported" in str(partial_error.value)
+    assert "partialFilterExpression operator $gt is not supported" in str(partial_error.value)
+
+    with pytest.raises(OperationFailure) as numeric_partial_error:
+        collection.create_index(
+            [("email", ASCENDING)],
+            name="email_numeric_partial",
+            partialFilterExpression={"age": 30},
+        )
+    assert numeric_partial_error.value.code == 72
+    assert "non-numeric scalar" in str(numeric_partial_error.value)
 
     with pytest.raises(OperationFailure) as id_error:
         collection.drop_index("_id_")

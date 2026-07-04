@@ -144,7 +144,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Metadata model and parser
+- [x] Milestone 0: Metadata model and parser
 - [ ] Milestone 1: Sparse membership and unique semantics
 - [ ] Milestone 2: Partial filter subset and unique semantics
 - [ ] Milestone 3: Planner-safe sparse/partial pushdown
@@ -186,6 +186,11 @@ cargo fmt -- --check
 cargo test index
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py
 ```
+
+Status 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test index`,
+and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_indexes.py` (unsandboxed after sandboxed localhost bind failed).
+Commit: this milestone commit.
 
 ## Milestone 1: Sparse Membership And Unique Semantics
 
