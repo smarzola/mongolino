@@ -77,6 +77,9 @@ struct WireMessage {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+struct ClientState {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
@@ -144,6 +147,24 @@ fn init_database(path: &PathBuf) -> Result<()> {
 fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    init_migration_schema(conn)?;
+    init_document_schema(conn)?;
+    Ok(())
+}
+
+fn init_migration_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn init_document_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS documents (
@@ -165,9 +186,10 @@ fn init_connection(conn: &Connection) -> Result<()> {
 async fn serve_client(mut stream: TcpStream, config: Config) -> Result<()> {
     let conn = Connection::open(&config.sqlite_path)?;
     init_connection(&conn)?;
+    let mut client_state = ClientState::default();
 
     while let Some(message) = read_wire_message(&mut stream).await? {
-        let response = handle_wire_message(&conn, message)?;
+        let response = handle_wire_message(&conn, &mut client_state, message)?;
         stream.write_all(&response).await?;
     }
 
@@ -202,10 +224,14 @@ async fn read_wire_message(stream: &mut TcpStream) -> Result<Option<WireMessage>
     }))
 }
 
-fn handle_wire_message(conn: &Connection, message: WireMessage) -> Result<Vec<u8>> {
+fn handle_wire_message(
+    conn: &Connection,
+    client_state: &mut ClientState,
+    message: WireMessage,
+) -> Result<Vec<u8>> {
     match message.opcode {
-        OP_MSG => handle_op_msg(conn, message),
-        OP_QUERY => handle_op_query(conn, message),
+        OP_MSG => handle_op_msg(conn, client_state, message),
+        OP_QUERY => handle_op_query(conn, client_state, message),
         opcode => build_op_msg_response(
             message.request_id,
             command_error(59, &format!("unsupported opcode {opcode}")),
@@ -213,13 +239,21 @@ fn handle_wire_message(conn: &Connection, message: WireMessage) -> Result<Vec<u8
     }
 }
 
-fn handle_op_msg(conn: &Connection, message: WireMessage) -> Result<Vec<u8>> {
+fn handle_op_msg(
+    conn: &Connection,
+    client_state: &mut ClientState,
+    message: WireMessage,
+) -> Result<Vec<u8>> {
     let command = parse_op_msg_document(&message.payload)?;
-    let response = handle_command(conn, &command)?;
+    let response = handle_command_with_state(conn, client_state, &command)?;
     build_op_msg_response(message.request_id, response)
 }
 
-fn handle_op_query(conn: &Connection, message: WireMessage) -> Result<Vec<u8>> {
+fn handle_op_query(
+    conn: &Connection,
+    client_state: &mut ClientState,
+    message: WireMessage,
+) -> Result<Vec<u8>> {
     let (full_collection_name, query) = parse_op_query(&message.payload)?;
     let db_name = full_collection_name
         .split_once('.')
@@ -227,7 +261,7 @@ fn handle_op_query(conn: &Connection, message: WireMessage) -> Result<Vec<u8>> {
         .unwrap_or("admin");
     let mut command = query;
     command.insert("$db", db_name);
-    let response = handle_command(conn, &command)?;
+    let response = handle_command_with_state(conn, client_state, &command)?;
     build_op_reply_response(message.request_id, response)
 }
 
@@ -364,6 +398,15 @@ fn read_document_at(bytes: &[u8]) -> Result<(Document, usize)> {
 }
 
 fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
+    let mut client_state = ClientState::default();
+    handle_command_with_state(conn, &mut client_state, command)
+}
+
+fn handle_command_with_state(
+    conn: &Connection,
+    _client_state: &mut ClientState,
+    command: &Document,
+) -> Result<Document> {
     let Some(command_name) = command_name(command) else {
         return Ok(command_error(59, "empty command document"));
     };
@@ -2071,6 +2114,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_batch(&response).len(), 1);
+    }
+
+    #[test]
+    fn find_batch_size_currently_returns_closed_cursor_and_drops_remainder() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "sort": { "_id": 1_i32 },
+                "batchSize": 1_i32,
+            },
+        )
+        .unwrap();
+        let cursor = response.get_document("cursor").unwrap();
+
+        assert_eq!(cursor.get_i64("id").unwrap(), 0);
+        let batch = first_batch(&response);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].get_str("_id").unwrap(), "u1");
+    }
+
+    #[test]
+    fn init_connection_installs_migration_scaffolding() {
+        let conn = test_conn();
+
+        let migrations_table: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(migrations_table, "schema_migrations");
     }
 
     #[test]

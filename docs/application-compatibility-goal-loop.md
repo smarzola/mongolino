@@ -105,7 +105,8 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Baseline and architecture preparation
+- [x] Milestone 0: Baseline and architecture preparation
+  - Status 2026-07-04: Baseline verification before edits: `cargo fmt -- --check` passed; `cargo test` passed (39 tests); `cargo build` passed; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed at localhost bind with `PermissionError: [Errno 1] Operation not permitted`; rerun outside the sandbox passed (40 passed, 1 skipped). Added per-client command context scaffolding, migration helper scaffolding, and tests pinning the previous closed-cursor batch behavior. Milestone verification after edits: `cargo fmt -- --check` passed; `cargo test` passed (41 tests); `cargo build` passed with one existing-style dead-code warning for the test-only `handle_command` wrapper; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` passed (40 passed, 1 skipped). Commit hash reported after commit.
 - [ ] Milestone 1: Server-side cursor state and `getMore`
 - [ ] Milestone 2: Cursor lifecycle hardening and `killCursors`
 - [ ] Milestone 3: Durable collection catalog and lifecycle commands
