@@ -1,0 +1,72 @@
+{
+  "name": "count and distinct metadata",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "active": true,
+      "profile": {
+        "city": "Rome"
+      },
+      "tags": [
+        "math",
+        "logic"
+      ]
+    },
+    {
+      "_id": "u2",
+      "active": false,
+      "profile": {
+        "city": "London"
+      },
+      "tags": [
+        "compiler"
+      ]
+    },
+    {
+      "_id": "u3",
+      "active": true,
+      "profile": {
+        "city": "Rome"
+      },
+      "tags": [
+        "math"
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "count_documents",
+      "filter": {
+        "active": true
+      },
+      "expect_result": {
+        "count": 2
+      }
+    },
+    {
+      "name": "distinct",
+      "key": "profile.city",
+      "expect_result": {
+        "values": [
+          "London",
+          "Rome"
+        ]
+      }
+    },
+    {
+      "name": "distinct",
+      "key": "tags",
+      "filter": {
+        "active": true
+      },
+      "expect_result": {
+        "values": [
+          "logic",
+          "math"
+        ]
+      }
+    }
+  ]
+}

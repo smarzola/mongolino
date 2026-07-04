@@ -148,6 +148,15 @@ def execute_operation(operation, collection):
         return collection.delete_one(operation.get("filter", {}))
     if name == "delete_many":
         return collection.delete_many(operation.get("filter", {}))
+    if name == "count_documents":
+        kwargs = {}
+        if "skip" in operation:
+            kwargs["skip"] = operation["skip"]
+        if "limit" in operation:
+            kwargs["limit"] = operation["limit"]
+        return collection.count_documents(operation.get("filter", {}), **kwargs)
+    if name == "distinct":
+        return collection.distinct(operation["key"], operation.get("filter"))
     if name == "command":
         database = collection.database.client[operation.get("database", collection.database.name)]
         return database.command(operation["command"])
@@ -164,11 +173,15 @@ def assert_result(result, expected):
                 "inserted_id",
                 "matched_count",
                 "modified_count",
-                "upserted_id",
-                "deleted_count",
-            )
-            if hasattr(result, key)
-        }
+            "upserted_id",
+            "deleted_count",
+        )
+        if hasattr(result, key)
+    }
+    if isinstance(result, int):
+        actual = {"count": result}
+    if isinstance(result, list):
+        actual = {"values": result}
     for key, value in expected.items():
         assert actual[key] == value
 

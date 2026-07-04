@@ -476,6 +476,9 @@ fn handle_command_with_state(
         "listCollections" => list_collections(conn, command),
         "drop" => drop_collection(conn, command),
         "dropDatabase" => drop_database(conn, command),
+        "count" => count_documents_command(conn, command),
+        "distinct" => distinct_command(conn, command),
+        "aggregate" => aggregate_command(conn, command),
         "insert" => insert_documents(conn, command),
         "find" => find_documents_with_state(conn, client_state, command),
         "getMore" => get_more(client_state, command),
@@ -695,6 +698,267 @@ fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
         "dropped": db,
         "ok": 1.0,
     })
+}
+
+fn count_documents_command(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("count") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "count command requires a collection name")),
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["count", "query", "skip", "limit", "$db", "lsid"],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+    let filter = match command.get("query") {
+        None => Document::new(),
+        Some(Bson::Document(filter)) => filter.clone(),
+        Some(_) => return Ok(command_error(9, "count query must be a document")),
+    };
+    let skip = match optional_i64(command, "skip") {
+        Ok(Some(value)) if value < 0 => return Ok(command_error(9, "skip must be non-negative")),
+        Ok(Some(value)) => value as usize,
+        Ok(None) => 0,
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let limit = match optional_i64(command, "limit") {
+        Ok(Some(value)) if value < 0 => return Ok(command_error(9, "limit must be non-negative")),
+        Ok(Some(0)) | Ok(None) => None,
+        Ok(Some(value)) => Some(value as usize),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+
+    let documents = documents_for_namespace(conn, &namespace(db, collection))?;
+    let count = match count_matching_documents(documents, &filter, skip, limit) {
+        Ok(count) => count,
+        Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+    };
+    Ok(doc! { "n": count, "ok": 1.0 })
+}
+
+fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("distinct") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "distinct command requires a collection name",
+            ));
+        }
+    };
+    let key = match command.get_str("key") {
+        Ok(key) if !key.is_empty() => key,
+        _ => return Ok(command_error(9, "distinct requires a non-empty key")),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["distinct", "key", "query", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+    let filter = match command.get("query") {
+        None => Document::new(),
+        Some(Bson::Document(filter)) => filter.clone(),
+        Some(_) => return Ok(command_error(9, "distinct query must be a document")),
+    };
+
+    let mut values = Vec::<Bson>::new();
+    for document in documents_for_namespace(conn, &namespace(db, collection))? {
+        match matches_filter(&document, &filter) {
+            Ok(true) => {
+                for value in distinct_values_at_path(&document, key) {
+                    if !values
+                        .iter()
+                        .any(|existing| bson_values_equal(existing, &value))
+                    {
+                        values.push(value);
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+        }
+    }
+    values.sort_by(compare_bson_order);
+    Ok(doc! { "values": values, "ok": 1.0 })
+}
+
+fn aggregate_command(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("aggregate") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "aggregate command requires a collection name",
+            ));
+        }
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["aggregate", "pipeline", "cursor", "$db", "lsid"],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+    match command.get("cursor") {
+        Some(Bson::Document(_)) => {}
+        _ => return Ok(command_error(9, "aggregate requires a cursor document")),
+    }
+    let pipeline = match command.get_array("pipeline") {
+        Ok(pipeline) => pipeline,
+        Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
+    };
+    let (filter, skip, limit) = match parse_count_documents_pipeline(pipeline) {
+        Ok(parsed) => parsed,
+        Err(response) => return Ok(response),
+    };
+    let documents = documents_for_namespace(conn, &namespace(db, collection))?;
+    let count = match count_matching_documents(documents, &filter, skip, limit) {
+        Ok(count) => count,
+        Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+    };
+
+    Ok(doc! {
+        "cursor": {
+            "id": 0_i64,
+            "ns": namespace(db, collection),
+            "firstBatch": [{ "_id": 1_i32, "n": count }],
+        },
+        "ok": 1.0,
+    })
+}
+
+fn parse_count_documents_pipeline(
+    pipeline: &[Bson],
+) -> std::result::Result<(Document, usize, Option<usize>), Document> {
+    let mut filter = Document::new();
+    let mut skip = 0_usize;
+    let mut limit = None;
+    let mut saw_group = false;
+
+    for stage in pipeline {
+        let Bson::Document(stage) = stage else {
+            return Err(command_error(
+                9,
+                "aggregate pipeline stages must be documents",
+            ));
+        };
+        if stage.len() != 1 {
+            return Err(command_error(
+                72,
+                "aggregate stages must contain one operator",
+            ));
+        }
+        if let Some(Bson::Document(match_filter)) = stage.get("$match") {
+            if saw_group {
+                return Err(command_error(
+                    72,
+                    "$match after count group is not supported",
+                ));
+            }
+            filter = match_filter.clone();
+        } else if let Some(skip_value) = stage.get("$skip") {
+            if saw_group {
+                return Err(command_error(
+                    72,
+                    "$skip after count group is not supported",
+                ));
+            }
+            skip = match non_negative_stage_usize(skip_value, "$skip") {
+                Ok(value) => value,
+                Err(err) => return Err(err),
+            };
+        } else if let Some(limit_value) = stage.get("$limit") {
+            if saw_group {
+                return Err(command_error(
+                    72,
+                    "$limit after count group is not supported",
+                ));
+            }
+            limit = Some(match non_negative_stage_usize(limit_value, "$limit") {
+                Ok(value) => value,
+                Err(err) => return Err(err),
+            });
+        } else if let Some(Bson::Document(group)) = stage.get("$group") {
+            if is_count_documents_group(group) {
+                saw_group = true;
+            } else {
+                return Err(command_error(
+                    72,
+                    "aggregate only supports PyMongo count_documents group shape",
+                ));
+            }
+        } else {
+            return Err(command_error(
+                72,
+                "aggregate only supports count_documents pipeline stages",
+            ));
+        }
+    }
+
+    if !saw_group {
+        return Err(command_error(
+            72,
+            "aggregate only supports count_documents pipeline",
+        ));
+    }
+
+    Ok((filter, skip, limit))
+}
+
+fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result<usize, Document> {
+    match value {
+        Bson::Int32(value) if *value >= 0 => Ok(*value as usize),
+        Bson::Int64(value) if *value >= 0 => Ok(*value as usize),
+        _ => Err(command_error(
+            9,
+            &format!("{operator} requires a non-negative integer"),
+        )),
+    }
+}
+
+fn is_count_documents_group(group: &Document) -> bool {
+    matches!(group.get("_id"), Some(Bson::Int32(1) | Bson::Int64(1)))
+        && matches!(
+            group.get("n"),
+            Some(Bson::Document(sum)) if matches!(sum.get("$sum"), Some(Bson::Int32(1) | Bson::Int64(1)))
+        )
+}
+
+fn count_matching_documents(
+    documents: Vec<Document>,
+    filter: &Document,
+    skip: usize,
+    limit: Option<usize>,
+) -> MatchResult<i64> {
+    let mut matched = 0_i64;
+    let mut skipped = 0_usize;
+    for document in documents {
+        match matches_filter(&document, filter) {
+            Ok(true) if skipped < skip => skipped += 1,
+            Ok(true) => {
+                matched += 1;
+                if limit.is_some_and(|limit| matched as usize >= limit) {
+                    break;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(matched)
+}
+
+fn distinct_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
+    values_at_path(document, path)
+        .into_iter()
+        .flat_map(|value| match value {
+            Bson::Array(values) => values.clone(),
+            value => vec![value.clone()],
+        })
+        .collect()
 }
 
 fn insert_collection_catalog(
@@ -2957,6 +3221,118 @@ mod tests {
             drop_database(
                 &conn,
                 &doc! { "dropDatabase": 1_i32, "$db": "app", "writeConcern": { "w": 1_i32 } },
+            )
+            .unwrap(),
+        ] {
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn count_command_respects_filter_skip_and_limit() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "users",
+                "$db": "app",
+                "query": { "active": true },
+                "skip": 1_i32,
+                "limit": 10_i32,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.get_i64("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn aggregate_count_documents_shape_is_supported() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "profile.city": "Rome" } },
+                    { "$skip": 1_i32 },
+                    { "$limit": 10_i32 },
+                    { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        let batch = first_batch(&response);
+        assert_eq!(batch[0].get_i64("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn distinct_command_supports_scalar_dotted_and_array_values() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let names = distinct_command(
+            &conn,
+            &doc! { "distinct": "users", "$db": "app", "key": "profile.city" },
+        )
+        .unwrap();
+        assert_eq!(
+            names.get_array("values").unwrap(),
+            &vec![
+                Bson::String("London".to_string()),
+                Bson::String("Rome".to_string())
+            ]
+        );
+
+        let tags = distinct_command(
+            &conn,
+            &doc! { "distinct": "users", "$db": "app", "key": "tags", "query": { "active": true } },
+        )
+        .unwrap();
+        assert_eq!(
+            tags.get_array("values").unwrap(),
+            &vec![
+                Bson::String("logic".to_string()),
+                Bson::String("math".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn count_distinct_and_aggregate_reject_unsupported_options() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        for response in [
+            count_documents_command(
+                &conn,
+                &doc! { "count": "users", "$db": "app", "query": [], },
+            )
+            .unwrap(),
+            count_documents_command(
+                &conn,
+                &doc! { "count": "users", "$db": "app", "hint": "_id_" },
+            )
+            .unwrap(),
+            distinct_command(
+                &conn,
+                &doc! { "distinct": "users", "$db": "app", "key": "name", "collation": {} },
+            )
+            .unwrap(),
+            aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "users",
+                    "$db": "app",
+                    "pipeline": [{ "$project": { "name": 1_i32 } }],
+                    "cursor": {},
+                },
             )
             .unwrap(),
         ] {
