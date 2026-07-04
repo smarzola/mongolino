@@ -105,7 +105,7 @@ Status 2026-07-04:
 
 - Added a conservative count planner that recognizes empty filters, exact `_id` equality, and exact indexed scalar equality, while falling back for arrays, logical operators, unsupported operators, multi-predicate filters, and unindexed fields.
 - Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test planner`; `cargo test`.
-- Commit: `dd66683`.
+- Commit: `adc43aa`.
 
 Problem:
 
