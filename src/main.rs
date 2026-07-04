@@ -6219,70 +6219,74 @@ fn matches_operator_document(values: &[&Bson], operators: &Document) -> MatchRes
     }
 
     for (operator, operand) in operators {
-        let matched = match operator.as_str() {
-            "$eq" => values
-                .iter()
-                .any(|candidate| bson_values_equal(candidate, operand)),
-            "$ne" => values
-                .iter()
-                .all(|candidate| !bson_values_equal(candidate, operand)),
-            "$gt" => values
-                .iter()
-                .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_gt())),
-            "$gte" => values
-                .iter()
-                .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_lt())),
-            "$lt" => values
-                .iter()
-                .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_lt())),
-            "$lte" => values
-                .iter()
-                .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_gt())),
-            "$in" => {
-                let Bson::Array(needles) = operand else {
-                    return Err(match_error(2, "$in requires an array"));
-                };
-                values.iter().any(|candidate| {
-                    needles
-                        .iter()
-                        .any(|needle| bson_values_equal(candidate, needle))
-                })
-            }
-            "$nin" => {
-                let Bson::Array(needles) = operand else {
-                    return Err(match_error(2, "$nin requires an array"));
-                };
-                values.iter().all(|candidate| {
-                    needles
-                        .iter()
-                        .all(|needle| !bson_values_equal(candidate, needle))
-                })
-            }
-            "$exists" => {
-                let Bson::Boolean(should_exist) = operand else {
-                    return Err(match_error(2, "$exists requires a boolean"));
-                };
-                !values.is_empty() == *should_exist
-            }
-            "$not" => {
-                let Bson::Document(nested) = operand else {
-                    return Err(match_error(2, "$not requires a document"));
-                };
-                !matches_operator_document(values, nested)?
-            }
-            _ => {
-                return Err(match_error(
-                    2,
-                    format!("unsupported query operator {operator}"),
-                ));
-            }
-        };
-
-        if !matched {
+        if !matches_operator_predicate(values, operator, operand)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn matches_operator_predicate(
+    values: &[&Bson],
+    operator: &str,
+    operand: &Bson,
+) -> MatchResult<bool> {
+    match operator {
+        "$eq" => Ok(values
+            .iter()
+            .any(|candidate| bson_values_equal(candidate, operand))),
+        "$ne" => Ok(values
+            .iter()
+            .all(|candidate| !bson_values_equal(candidate, operand))),
+        "$gt" => Ok(values
+            .iter()
+            .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_gt()))),
+        "$gte" => Ok(values
+            .iter()
+            .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_lt()))),
+        "$lt" => Ok(values
+            .iter()
+            .any(|candidate| compare_bson(candidate, operand, |ordering| ordering.is_lt()))),
+        "$lte" => Ok(values
+            .iter()
+            .any(|candidate| compare_bson(candidate, operand, |ordering| !ordering.is_gt()))),
+        "$in" => {
+            let Bson::Array(needles) = operand else {
+                return Err(match_error(2, "$in requires an array"));
+            };
+            Ok(values.iter().any(|candidate| {
+                needles
+                    .iter()
+                    .any(|needle| bson_values_equal(candidate, needle))
+            }))
+        }
+        "$nin" => {
+            let Bson::Array(needles) = operand else {
+                return Err(match_error(2, "$nin requires an array"));
+            };
+            Ok(values.iter().all(|candidate| {
+                needles
+                    .iter()
+                    .all(|needle| !bson_values_equal(candidate, needle))
+            }))
+        }
+        "$exists" => {
+            let Bson::Boolean(should_exist) = operand else {
+                return Err(match_error(2, "$exists requires a boolean"));
+            };
+            Ok(!values.is_empty() == *should_exist)
+        }
+        "$not" => {
+            let Bson::Document(nested) = operand else {
+                return Err(match_error(2, "$not requires a document"));
+            };
+            Ok(!matches_operator_document(values, nested)?)
+        }
+        _ => Err(match_error(
+            2,
+            format!("unsupported query operator {operator}"),
+        )),
+    }
 }
 
 fn is_operator_document(value: &Bson) -> bool {

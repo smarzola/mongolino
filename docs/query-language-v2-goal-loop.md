@@ -131,7 +131,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Matcher architecture and error model
+- [x] Milestone 0: Matcher architecture and error model
 - [ ] Milestone 1: Regex predicate support
 - [ ] Milestone 2: `$type`, `$size`, and `$all`
 - [ ] Milestone 3: `$elemMatch` scalar and document semantics
@@ -170,6 +170,12 @@ cargo test find_matcher
 cargo test update_array
 cargo test
 ```
+
+Status 2026-07-04: Complete. Split field-operator predicate evaluation into a
+single helper while preserving the existing matcher error model and supported
+operator behavior. Verification: `cargo fmt -- --check`, `cargo test
+find_matcher`, `cargo test update_array`, and `cargo test` passed. Commit:
+pending.
 
 ## Milestone 1: Regex Predicate Support
 
