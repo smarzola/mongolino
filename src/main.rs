@@ -201,6 +201,17 @@ fn init_migration_schema(conn: &Connection) -> Result<()> {
 fn init_document_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS collections (
+            namespace TEXT PRIMARY KEY,
+            db TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            options_bson BLOB
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_collections_db_name
+            ON collections(db, name);
+
         CREATE TABLE IF NOT EXISTS documents (
             namespace TEXT NOT NULL,
             id_key TEXT NOT NULL,
@@ -461,6 +472,10 @@ fn handle_command_with_state(
         }),
         "listDatabases" => list_databases(conn),
         "endSessions" => Ok(doc! { "ok": 1.0 }),
+        "create" => create_collection(conn, command),
+        "listCollections" => list_collections(conn, command),
+        "drop" => drop_collection(conn, command),
+        "dropDatabase" => drop_database(conn, command),
         "insert" => insert_documents(conn, command),
         "find" => find_documents_with_state(conn, client_state, command),
         "getMore" => get_more(client_state, command),
@@ -498,7 +513,12 @@ fn hello_response() -> Document {
 
 fn list_databases(conn: &Connection) -> Result<Document> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT substr(namespace, 1, instr(namespace, '.') - 1) FROM documents ORDER BY 1",
+        r#"
+        SELECT db FROM collections
+        UNION
+        SELECT DISTINCT substr(namespace, 1, instr(namespace, '.') - 1) FROM documents
+        ORDER BY 1
+        "#,
     )?;
     let db_names = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -514,6 +534,224 @@ fn list_databases(conn: &Connection) -> Result<Document> {
         "totalSize": 0_i64,
         "ok": 1.0,
     })
+}
+
+fn create_collection(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("create") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => {
+            return Ok(command_error(
+                9,
+                "create command requires a collection name",
+            ));
+        }
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(command, &["create", "$db", "lsid"]) {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let ns = namespace(db, collection);
+    match insert_collection_catalog(conn, db, collection) {
+        Ok(()) => Ok(doc! { "ok": 1.0 }),
+        Err(err) if is_sqlite_constraint(&err) || collection_exists(conn, &ns)? => {
+            Ok(command_error(48, "collection already exists"))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn list_collections(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "listCollections",
+            "nameOnly",
+            "authorizedCollections",
+            "filter",
+            "cursor",
+            "$db",
+            "lsid",
+        ],
+    ) {
+        return Ok(command_error(72, &errmsg));
+    }
+    let name_only = match optional_bool(command, "nameOnly") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Err(errmsg) = optional_bool(command, "authorizedCollections") {
+        return Ok(command_error(9, &errmsg));
+    }
+    match command.get("cursor") {
+        None => {}
+        Some(Bson::Document(cursor)) if cursor.is_empty() => {}
+        Some(_) => {
+            return Ok(command_error(
+                9,
+                "listCollections cursor must be an empty document",
+            ));
+        }
+    }
+    let filter_name = match command.get("filter") {
+        None => None,
+        Some(Bson::Document(filter)) if filter.is_empty() => None,
+        Some(Bson::Document(filter)) if filter.len() == 1 => match filter.get("name") {
+            Some(Bson::String(name)) => Some(name.clone()),
+            _ => {
+                return Ok(command_error(
+                    2,
+                    "listCollections filter only supports name equality",
+                ));
+            }
+        },
+        Some(Bson::Document(_)) => {
+            return Ok(command_error(
+                2,
+                "listCollections filter only supports name equality",
+            ));
+        }
+        Some(_) => {
+            return Ok(command_error(
+                9,
+                "listCollections filter must be a document",
+            ));
+        }
+    };
+
+    let collections = collection_names_for_db(conn, db)?;
+    let documents = collections
+        .into_iter()
+        .filter(|name| filter_name.as_ref().is_none_or(|filter| filter == name))
+        .map(|name| {
+            let mut doc = doc! {
+                "name": name.clone(),
+                "type": "collection",
+            };
+            if !name_only {
+                doc.insert("options", Bson::Document(Document::new()));
+                doc.insert("info", Bson::Document(doc! { "readOnly": false }));
+                doc.insert(
+                    "idIndex",
+                    Bson::Document(doc! { "v": 2_i32, "key": { "_id": 1_i32 }, "name": "_id_" }),
+                );
+            }
+            Bson::Document(doc)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(doc! {
+        "cursor": {
+            "id": 0_i64,
+            "ns": namespace(db, "$cmd.listCollections"),
+            "firstBatch": documents,
+        },
+        "ok": 1.0,
+    })
+}
+
+fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("drop") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "drop command requires a collection name")),
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(command, &["drop", "$db", "lsid"]) {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let ns = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM documents WHERE namespace = ?1", params![ns])?;
+    tx.execute("DELETE FROM collections WHERE namespace = ?1", params![ns])?;
+    tx.commit()?;
+
+    Ok(doc! {
+        "ns": ns,
+        "nIndexesWas": 1_i32,
+        "ok": 1.0,
+    })
+}
+
+fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["dropDatabase", "comment", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let prefix = format!("{db}.%");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM documents WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
+    tx.execute("DELETE FROM collections WHERE db = ?1", params![db])?;
+    tx.commit()?;
+
+    Ok(doc! {
+        "dropped": db,
+        "ok": 1.0,
+    })
+}
+
+fn insert_collection_catalog(
+    conn: &Connection,
+    db: &str,
+    collection: &str,
+) -> std::result::Result<(), rusqlite::Error> {
+    let ns = namespace(db, collection);
+    conn.execute(
+        "INSERT INTO collections(namespace, db, name) VALUES (?1, ?2, ?3)",
+        params![ns, db, collection],
+    )?;
+    Ok(())
+}
+
+fn ensure_collection_catalog_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> std::result::Result<(), rusqlite::Error> {
+    let Some((db, collection)) = namespace.split_once('.') else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO collections(namespace, db, name) VALUES (?1, ?2, ?3)",
+        params![namespace, db, collection],
+    )?;
+    Ok(())
+}
+
+fn collection_exists(conn: &Connection, namespace: &str) -> Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM collections WHERE namespace = ?1",
+            params![namespace],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn collection_names_for_db(conn: &Connection, db: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT name FROM collections WHERE db = ?1
+        UNION
+        SELECT DISTINCT substr(namespace, length(?1) + 2)
+          FROM documents
+         WHERE namespace LIKE ?2
+        ORDER BY 1
+        "#,
+    )?;
+    let prefix = format!("{db}.%");
+    let names = stmt
+        .query_map(params![db, prefix], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
@@ -569,6 +807,7 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0_i32;
     let mut write_errors = Vec::new();
+    ensure_collection_catalog_tx(&tx, &namespace)?;
 
     {
         let mut stmt = tx.prepare(
@@ -674,6 +913,7 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let mut upserted_count = 0_i32;
     let mut upserted = Vec::new();
     let mut write_errors = Vec::new();
+    ensure_collection_catalog_tx(&tx, &namespace)?;
 
     for (index, entry) in updates.iter().enumerate() {
         let result = apply_update_entry(&tx, &namespace, entry);
@@ -2199,6 +2439,12 @@ mod tests {
             .unwrap()
     }
 
+    fn bson_bytes(document: &Document) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        document.to_writer(&mut bytes).unwrap();
+        bytes
+    }
+
     fn assert_command_error(response: &Document) {
         assert_eq!(response.get_f64("ok").unwrap(), 0.0);
         assert!(response.contains_key("code"));
@@ -2589,6 +2835,136 @@ mod tests {
     }
 
     #[test]
+    fn catalog_create_and_list_collections_tracks_empty_collections() {
+        let conn = test_conn();
+
+        let create = create_collection(&conn, &doc! { "create": "empty", "$db": "app" }).unwrap();
+        assert_eq!(create.get_f64("ok").unwrap(), 1.0);
+
+        let list =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        let names = first_batch(&list)
+            .into_iter()
+            .map(|doc| doc.get_str("name").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["empty"]);
+
+        let dbs = list_databases(&conn).unwrap();
+        let names = dbs
+            .get_array("databases")
+            .unwrap()
+            .iter()
+            .map(|db| {
+                db.as_document()
+                    .unwrap()
+                    .get_str("name")
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"app".to_string()));
+    }
+
+    #[test]
+    fn catalog_surfaces_document_only_namespaces_and_write_creates_catalog() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO documents(namespace, id_key, bson) VALUES (?1, ?2, ?3)",
+            params!["legacy.users", "str:u1", bson_bytes(&doc! { "_id": "u1" })],
+        )
+        .unwrap();
+
+        let legacy =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "legacy" }).unwrap();
+        assert_eq!(first_batch(&legacy)[0].get_str("name").unwrap(), "users");
+
+        insert_documents(
+            &conn,
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1" }] },
+        )
+        .unwrap();
+        assert!(collection_exists(&conn, "app.users").unwrap());
+    }
+
+    #[test]
+    fn drop_collection_removes_documents_and_catalog_entry() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1" }] },
+        )
+        .unwrap();
+
+        let response = drop_collection(&conn, &doc! { "drop": "users", "$db": "app" }).unwrap();
+        assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+        assert!(
+            documents_for_namespace(&conn, "app.users")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            first_batch(
+                &list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn drop_database_removes_only_that_database() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1" }] },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! { "insert": "users", "$db": "other", "documents": [{ "_id": "u2" }] },
+        )
+        .unwrap();
+
+        let response = drop_database(&conn, &doc! { "dropDatabase": 1_i32, "$db": "app" }).unwrap();
+        assert_eq!(response.get_str("dropped").unwrap(), "app");
+        assert!(
+            documents_for_namespace(&conn, "app.users")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            documents_for_namespace(&conn, "other.users").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_commands_reject_unsupported_options() {
+        let conn = test_conn();
+
+        for response in [
+            create_collection(
+                &conn,
+                &doc! { "create": "users", "$db": "app", "validator": {} },
+            )
+            .unwrap(),
+            list_collections(
+                &conn,
+                &doc! { "listCollections": 1_i32, "$db": "app", "filter": { "type": "collection" } },
+            )
+            .unwrap(),
+            drop_collection(&conn, &doc! { "drop": "users", "$db": "app", "comment": "nope" })
+                .unwrap(),
+            drop_database(
+                &conn,
+                &doc! { "dropDatabase": 1_i32, "$db": "app", "writeConcern": { "w": 1_i32 } },
+            )
+            .unwrap(),
+        ] {
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
     fn empty_and_unknown_commands_are_command_errors() {
         let conn = test_conn();
 
@@ -2596,7 +2972,8 @@ mod tests {
         assert_command_error(&empty);
         assert!(empty.get_str("errmsg").unwrap().contains("empty command"));
 
-        let unknown = handle_command(&conn, &doc! { "drop": "users", "$db": "app" }).unwrap();
+        let unknown =
+            handle_command(&conn, &doc! { "createIndexes": "users", "$db": "app" }).unwrap();
         assert_command_error(&unknown);
         assert!(unknown.get_str("errmsg").unwrap().contains("not supported"));
     }

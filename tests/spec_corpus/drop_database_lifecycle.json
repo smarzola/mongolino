@@ -1,0 +1,45 @@
+{
+  "name": "drop database lifecycle",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "command",
+      "database": "drop_db_case",
+      "command": {
+        "create": "empty"
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "database": "drop_db_case",
+      "command": {
+        "dropDatabase": 1
+      },
+      "expect_result": {
+        "dropped": "drop_db_case",
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "database": "drop_db_case",
+      "command": {
+        "listCollections": 1,
+        "nameOnly": true
+      },
+      "expect_result": {
+        "cursor": {
+          "id": 0,
+          "ns": "drop_db_case.$cmd.listCollections",
+          "firstBatch": []
+        },
+        "ok": 1.0
+      }
+    }
+  ]
+}

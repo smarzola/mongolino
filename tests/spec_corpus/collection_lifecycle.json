@@ -1,0 +1,53 @@
+{
+  "name": "collection lifecycle",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "create": "lifecycle_empty"
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "listCollections": 1,
+        "nameOnly": true,
+        "filter": {
+          "name": "lifecycle_empty"
+        }
+      },
+      "expect_result": {
+        "cursor": {
+          "id": 0,
+          "ns": "e2e.$cmd.listCollections",
+          "firstBatch": [
+            {
+              "name": "lifecycle_empty",
+              "type": "collection"
+            }
+          ]
+        },
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "database": "e2e",
+      "command": {
+        "drop": "lifecycle_empty"
+      },
+      "expect_result": {
+        "ns": "e2e.lifecycle_empty",
+        "ok": 1.0
+      }
+    }
+  ]
+}

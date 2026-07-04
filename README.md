@@ -47,8 +47,12 @@ Compatibility flags:
 | `isMaster` / `ismaster` | Compatible | Same response shape as `hello`, with `ismaster` and `helloOk`. | Same handshake gaps as `hello`. |
 | `ping` | Compatible | Returns `{ ok: 1.0 }`. | None for basic ping behavior. |
 | `buildInfo` | Partial | Returns version, allocator/storage hints, BSON size, bitness, and `ok`. | Not byte-for-byte compatible with MongoDB server build metadata. |
-| `listDatabases` | Partial | Lists distinct database names derived from persisted namespaces. | Size accounting is placeholder `0`; empty databases are not tracked. |
+| `listDatabases` | Partial | Lists database names derived from the collection catalog and persisted document namespaces, including databases with empty collections. | Size accounting is placeholder `0`. |
 | `endSessions` | Stub | Returns `{ ok: 1.0 }`. | Sessions are not stored, validated, expired, or attached to operations. |
+| `create` | Partial | Creates a durable empty collection catalog entry. | Collection options such as validators, capped collections, clustered indexes, timeseries, and collation are unsupported. |
+| `listCollections` | Partial | Lists durable catalog entries and legacy document-only namespaces, with `nameOnly` and simple `name` equality filters. | Size/details are minimal; complex filters and collection metadata options are unsupported. |
+| `drop` | Partial | Drops a collection by removing its documents and catalog entry. | Index cleanup will become relevant once user indexes exist. |
+| `dropDatabase` | Partial | Drops catalog entries and documents for the selected database only. | No users, roles, profiling collections, or storage statistics. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key `writeErrors`, and supports ordered/unordered batches. | No write concern, bypass document validation, schema validation, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, and capped batch size. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, tailable cursors, or secondary indexes. Unsupported operators return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
@@ -71,6 +75,10 @@ Documents are stored as BSON blobs in SQLite:
 
 If an inserted document does not include `_id`, `mongolino` assigns a BSON
 ObjectId before writing it to SQLite.
+
+Collection names are also stored in a durable SQLite catalog, so empty
+collections created through `create` remain visible to `listCollections` and
+`listDatabases`.
 
 ## CRUD Compatibility Notes
 
