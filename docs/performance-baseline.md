@@ -14,6 +14,16 @@ schema initialization, BSON storage, index-entry maintenance, query matching,
 update, and aggregation paths. It does not bind localhost and does not require
 PyMongo, Docker, or an external MongoDB service.
 
+## TTL Sweep Coverage
+
+TTL expiration uses deterministic namespace-scoped sweeps at read/write command
+boundaries. Sweeps first check the namespace index catalog and only scan
+documents when that namespace has TTL indexes. No dedicated TTL benchmark is
+recorded yet; the CI budget remains useful for this uplift because broad
+unrelated scans would regress the existing find/count/update/aggregation
+command-handler benchmarks, while focused Rust and PyMongo tests verify the TTL
+namespace scoping and index-entry cleanup behavior directly.
+
 ## Commands
 
 ```sh

@@ -18,7 +18,8 @@ intentionally conservative:
 - Index planning now supports conservative compound prefix scans, safe scalar
   range scans, narrow sort pushdown, `hint`, and partial `explain`
   diagnostics. Broader index classes and unsafe shapes remain unsupported.
-- TTL index metadata/expiration behavior is unsupported.
+- TTL index metadata, deterministic expiration, and narrow TTL `collMod`
+  updates are supported for the documented single-field date subset.
 - Collation is rejected on find/count/distinct/aggregate/write paths.
 - Aggregation has no general expression language, `$addFields`, `$lookup`, or
   broader stage coverage.
@@ -35,12 +36,12 @@ claim of full MongoDB parity.
 | --- | ---: | ---: | ---: |
 | Query predicate compatibility | 20% | 17% | 17% |
 | Index planning and diagnostics | 15% | 15% | 15% |
-| Index lifecycle/TTL/collation behavior | 15% | 5% | 11% |
+| Index lifecycle/TTL/collation behavior | 15% | 11% | 11% |
 | Aggregation compatibility | 20% | 9% | 15% |
 | Update language compatibility | 15% | 8% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 62% | 83% |
+| Total | 100% | 68% | 83% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -60,8 +61,12 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt: `docs/index-planner-v2-goal-loop.md`.
 
 3. TTL Index Compatibility
-   - Add `expireAfterSeconds` index metadata, validation, listing, and
-     deterministic expiration/sweeper behavior.
+   - Complete in uplift 3. Added `expireAfterSeconds` index metadata,
+     validation, listing, deterministic namespace-scoped expiration/sweeper
+     behavior, and narrow TTL duration updates through `collMod`.
+   - Compound TTL, `_id` TTL, sparse/partial TTL combinations, background TTL
+     monitor timing, TTL conversion for non-TTL indexes, and collation-aware
+     indexes remain unsupported.
    - Prompt to write after Index Planner v2: `docs/ttl-index-goal-loop.md`.
 
 4. Collation Support
