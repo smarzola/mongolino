@@ -149,6 +149,25 @@ cargo test
 cargo build
 ```
 
+Run repeatable local performance benchmarks without binding localhost or using
+PyMongo:
+
+```sh
+cargo run --bin mongolino-bench -- --profile smoke
+cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-smoke.json
+cargo run --bin mongolino-bench -- --profile local --json /tmp/mongolino-bench-local.json
+```
+
+Profiles:
+
+- `smoke`: fast local check with small seeded collections.
+- `ci`: fast budget profile used by GitHub Actions.
+- `local`: larger baseline profile for before/after comparisons.
+
+The benchmark harness creates temporary SQLite databases, seeds data through
+`mongolino` command handlers, and exercises real insert, find, count, update,
+index-entry refresh, and aggregation paths.
+
 Run the PyMongo end-to-end suite with `uv`:
 
 ```sh

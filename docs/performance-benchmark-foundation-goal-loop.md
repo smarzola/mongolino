@@ -99,7 +99,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Benchmark harness design and workload seeding
-- [ ] Milestone 1: Benchmark command and machine-readable output
+- [x] Milestone 1: Benchmark command and machine-readable output
 - [ ] Milestone 2: CI-friendly performance budget smoke
 - [ ] Milestone 3: Baseline results and SQLite pushdown roadmap
 - [ ] Milestone 4: Final correctness verification and docs
@@ -114,7 +114,7 @@ Status note:
   `insert` command, creates maintained scalar indexes through `createIndexes`,
   and exercises real command/storage/query paths without localhost, PyMongo,
   Docker, or external services. Verification run:
-  `cargo fmt -- --check`; `cargo test`. Commit hash: pending.
+  `cargo fmt -- --check`; `cargo test`. Commit hash: `558595c`.
 
 Problem:
 
@@ -156,6 +156,17 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: Benchmark Command And Machine-Readable Output
+
+Status note:
+
+- 2026-07-04: Documented `cargo run --bin mongolino-bench -- --profile
+  smoke|ci|local` and JSON output. The smoke profile was run in readable and
+  JSON modes, producing `/tmp/mongolino-bench-smoke.json` with profile,
+  git commit, dataset size, iteration count, elapsed time, operations,
+  ops/sec, and latency fields. Verification run: `cargo fmt -- --check`;
+  `cargo test`; `cargo run --bin mongolino-bench -- --profile smoke`;
+  `cargo run --bin mongolino-bench -- --profile smoke --json
+  /tmp/mongolino-bench-smoke.json`. Commit hash: pending.
 
 Problem:
 
