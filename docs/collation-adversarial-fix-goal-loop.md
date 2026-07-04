@@ -93,8 +93,20 @@ When a milestone is complete:
    message.
 5. Report the commit hash in the goal-loop status before continuing.
 
-- [ ] Milestone 0: Fix collation-aware compound prefix key construction
+- [x] Milestone 0: Fix collation-aware compound prefix key construction
 - [ ] Milestone 1: PyMongo coverage and full verification
+
+## Status Notes
+
+- 2026-07-04: Milestone 0 complete in commit
+  `8227d9081fe50ad860ac7e1b02a9b88391c5d480`. Query-side compound prefix
+  planner keys and compound sort-prefix equality keys now use the owning index
+  collation. Added Rust regression coverage for case-insensitive compound
+  prefix find, hinted count, update, delete, findAndModify, matching hints, and
+  incompatible simple-collation hint no-mutation behavior. Verification passed:
+  `cargo fmt -- --check`; `cargo test collation`; `cargo test
+  compound_prefix`; `cargo test hint`; `cargo test update`; `cargo test
+  delete`; `cargo test find_and_modify`.
 
 ## Milestone 0: Fix Collation-Aware Compound Prefix Key Construction
 
