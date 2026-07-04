@@ -95,7 +95,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Count planner design and safety tests
 - [x] Milestone 1: Empty and `_id` count pushdown
-- [ ] Milestone 2: Indexed scalar equality count pushdown
+- [x] Milestone 2: Indexed scalar equality count pushdown
 - [ ] Milestone 3: Aggregation `$match` + `$count` pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
@@ -155,7 +155,7 @@ Status 2026-07-04:
 
 - Wired command `count` to use SQLite for empty filters and exact `_id` equality, with shared skip/limit adjustment. Indexed equality still falls back pending Milestone 2.
 - Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test`; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py` failed at `socket.bind(("127.0.0.1", 0))` with `PermissionError: [Errno 1] Operation not permitted`; unsandboxed rerun of the same PyMongo command passed.
-- Commit: pending.
+- Commit: `242cf4e`.
 
 Problem:
 
@@ -197,6 +197,13 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 2: Indexed Scalar Equality Count Pushdown
+
+Status 2026-07-04:
+
+- Extended SQLite count pushdown to exact scalar equality filters with a matching maintained single-field index, including dotted scalar paths represented in `index_entries`.
+- Added scalar safety rejection for array, document, and null indexed operands; unsupported, unindexed, and multi-predicate filters continue to fall back to the Rust matcher path.
+- Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test planner`; `cargo test index`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py tests/e2e/test_indexes.py`; `cargo test`.
+- Commit: pending.
 
 Problem:
 

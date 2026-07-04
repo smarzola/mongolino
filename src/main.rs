@@ -2087,7 +2087,11 @@ fn pushed_down_count(
     let total = match plan_count(conn, namespace, filter)? {
         CountPlan::Empty => sql_count_documents(conn, namespace)?,
         CountPlan::IdEquality(id_key) => sql_count_id_equality(conn, namespace, &id_key)?,
-        CountPlan::IndexedEquality { .. } | CountPlan::Fallback => return Ok(None),
+        CountPlan::IndexedEquality {
+            index_name,
+            key_value,
+        } => sql_count_index_entries(conn, namespace, &index_name, &key_value)?,
+        CountPlan::Fallback => return Ok(None),
     };
     Ok(Some(apply_count_skip_limit(total, skip, limit)))
 }
@@ -2104,6 +2108,19 @@ fn sql_count_id_equality(conn: &Connection, namespace: &str, id_key: &str) -> Re
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM documents WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
+        |row| row.get(0),
+    )?)
+}
+
+fn sql_count_index_entries(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    key_value: &str,
+) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM index_entries WHERE namespace = ?1 AND index_name = ?2 AND key_value = ?3",
+        params![namespace, index_name, key_value],
         |row| row.get(0),
     )?)
 }
@@ -2137,7 +2154,7 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     let Some((field, value)) = exact_single_equality_filter(filter) else {
         return Ok(CountPlan::Fallback);
     };
-    if matches!(value, Bson::Array(_)) {
+    if !is_count_pushdown_scalar(value) {
         return Ok(CountPlan::Fallback);
     }
     let Some(index) = indexes_for_namespace(conn, namespace)?
@@ -2150,6 +2167,18 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
         index_name: index.name,
         key_value: id_key_from_bson(value),
     })
+}
+
+fn is_count_pushdown_scalar(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::Double(_)
+            | Bson::String(_)
+            | Bson::Boolean(_)
+            | Bson::ObjectId(_)
+            | Bson::Int32(_)
+            | Bson::Int64(_)
+    )
 }
 
 fn exact_single_equality_filter(filter: &Document) -> Option<(&str, &Bson)> {
@@ -7122,6 +7151,8 @@ mod tests {
             doc! { "active": true, "name": "Ada" },
             doc! { "name": "Ada" },
             doc! { "profile.city": "Rome" },
+            doc! { "active": null },
+            doc! { "active": { "nested": true } },
         ] {
             assert_eq!(
                 plan_count(&conn, "app.users", &filter).unwrap(),
@@ -7173,6 +7204,114 @@ mod tests {
         );
         assert_eq!(
             pushed_down_count(&conn, "app.users", &doc! { "active": true }, 0, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn indexed_count_pushdown_tracks_index_entry_mutations() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32 }, "name": "city_1" }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Rome" },
+                0,
+                None
+            )
+            .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": { "$eq": "Rome" } },
+                1,
+                Some(1)
+            )
+            .unwrap(),
+            Some(1)
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "profile.city": "Milan" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Rome" },
+                0,
+                None
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Milan" },
+                0,
+                None
+            )
+            .unwrap(),
+            Some(1)
+        );
+
+        delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "_id": "u3" }, "limit": 1_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Rome" },
+                0,
+                None
+            )
+            .unwrap(),
+            Some(0)
+        );
+
+        drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "city_1" },
+        )
+        .unwrap();
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "profile.city": "Milan" },
+                0,
+                None
+            )
+            .unwrap(),
             None
         );
     }

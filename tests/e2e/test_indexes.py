@@ -153,6 +153,8 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
         "u1",
         "u3",
     ]
+    assert collection.count_documents({"profile.city": "Rome"}) == 2
+    assert collection.count_documents({"profile.city": {"$eq": "Rome"}}, skip=1, limit=1) == 1
 
     collection.update_one({"_id": "u1"}, {"$set": {"profile.city": "Milan"}})
     assert [doc["_id"] for doc in collection.find({"profile.city": "Rome"}).sort("_id", 1)] == [
@@ -161,11 +163,15 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
     assert [doc["_id"] for doc in collection.find({"profile.city": "Milan"}).sort("_id", 1)] == [
         "u1"
     ]
+    assert collection.count_documents({"profile.city": "Rome"}) == 1
+    assert collection.count_documents({"profile.city": "Milan"}) == 1
 
     collection.delete_one({"_id": "u3"})
     assert list(collection.find({"profile.city": "Rome"})) == []
+    assert collection.count_documents({"profile.city": "Rome"}) == 0
 
     collection.drop_index("city_1")
     assert [doc["_id"] for doc in collection.find({"profile.city": "Milan"}).sort("_id", 1)] == [
         "u1"
     ]
+    assert collection.count_documents({"profile.city": "Milan"}) == 1
