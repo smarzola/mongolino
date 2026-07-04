@@ -875,10 +875,16 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
 
-    let documents = documents_for_namespace(conn, &namespace(db, collection))?;
-    let count = match count_matching_documents(documents, &filter, skip, limit) {
-        Ok(count) => count,
-        Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+    let ns = namespace(db, collection);
+    let count = match pushed_down_count(conn, &ns, &filter, skip, limit)? {
+        Some(count) => count,
+        None => {
+            let documents = documents_for_namespace(conn, &ns)?;
+            match count_matching_documents(documents, &filter, skip, limit) {
+                Ok(count) => count,
+                Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+            }
+        }
     };
     Ok(doc! { "n": count, "ok": 1.0 })
 }
@@ -2069,6 +2075,45 @@ fn count_matching_documents(
         }
     }
     Ok(matched)
+}
+
+fn pushed_down_count(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    skip: usize,
+    limit: Option<usize>,
+) -> Result<Option<i64>> {
+    let total = match plan_count(conn, namespace, filter)? {
+        CountPlan::Empty => sql_count_documents(conn, namespace)?,
+        CountPlan::IdEquality(id_key) => sql_count_id_equality(conn, namespace, &id_key)?,
+        CountPlan::IndexedEquality { .. } | CountPlan::Fallback => return Ok(None),
+    };
+    Ok(Some(apply_count_skip_limit(total, skip, limit)))
+}
+
+fn sql_count_documents(conn: &Connection, namespace: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM documents WHERE namespace = ?1",
+        params![namespace],
+        |row| row.get(0),
+    )?)
+}
+
+fn sql_count_id_equality(conn: &Connection, namespace: &str, id_key: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM documents WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+        |row| row.get(0),
+    )?)
+}
+
+fn apply_count_skip_limit(total: i64, skip: usize, limit: Option<usize>) -> i64 {
+    let after_skip = total.saturating_sub(skip as i64);
+    match limit {
+        Some(limit) => after_skip.min(limit as i64),
+        None => after_skip,
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -7083,6 +7128,53 @@ mod tests {
                 CountPlan::Fallback
             );
         }
+    }
+
+    #[test]
+    fn count_pushdown_handles_empty_and_id_filters_with_bounds() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! {}, 0, None)
+                .unwrap()
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! {}, 1, Some(1))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! { "_id": "u1" }, 0, None)
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.users",
+                &doc! { "_id": { "$eq": "u1" } },
+                1,
+                None
+            )
+            .unwrap()
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! { "_id": "missing" }, 0, None)
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pushed_down_count(&conn, "app.users", &doc! { "active": true }, 0, None).unwrap(),
+            None
+        );
     }
 
     #[test]

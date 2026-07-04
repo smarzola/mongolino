@@ -94,7 +94,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Count planner design and safety tests
-- [ ] Milestone 1: Empty and `_id` count pushdown
+- [x] Milestone 1: Empty and `_id` count pushdown
 - [ ] Milestone 2: Indexed scalar equality count pushdown
 - [ ] Milestone 3: Aggregation `$match` + `$count` pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
@@ -150,6 +150,12 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: Empty And `_id` Count Pushdown
+
+Status 2026-07-04:
+
+- Wired command `count` to use SQLite for empty filters and exact `_id` equality, with shared skip/limit adjustment. Indexed equality still falls back pending Milestone 2.
+- Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test`; sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_metadata.py` failed at `socket.bind(("127.0.0.1", 0))` with `PermissionError: [Errno 1] Operation not permitted`; unsandboxed rerun of the same PyMongo command passed.
+- Commit: pending.
 
 Problem:
 

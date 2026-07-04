@@ -36,6 +36,11 @@ def seed(collection):
 def test_count_documents_and_estimated_count(collection):
     seed(collection)
 
+    assert collection.count_documents({}) == 3
+    assert collection.count_documents({}, skip=1, limit=1) == 1
+    assert collection.count_documents({"_id": "u1"}) == 1
+    assert collection.count_documents({"_id": {"$eq": "u1"}}, skip=1) == 0
+    assert collection.count_documents({"_id": "missing"}) == 0
     assert collection.count_documents({"active": True}) == 2
     assert collection.count_documents({"active": True}, skip=1, limit=10) == 1
     assert collection.estimated_document_count() == 3
