@@ -540,6 +540,57 @@ tests), `cargo build`, `cargo run --bin mongolino-bench -- --profile ci
 `socket.bind(("127.0.0.1", 0))` returning `PermissionError: [Errno 1]
 Operation not permitted`. Commit: final checkpoint commit; see handoff.
 
+## Parent Adversarial Review
+
+Status 2026-07-05: Initial parent review found one blocking planner mismatch in
+the completed collation uplift. Document-side compound-prefix index entries
+were encoded with `IndexSpec::collation`, but query-side prefix planner keys
+were still encoded with binary `id_key_from_bson`. That made non-simple
+case-insensitive compound-prefix indexes unsafe: unhinted candidate narrowing,
+hinted reads, counts, updates, deletes, and findAndModify could silently miss
+matching documents.
+
+Fix prompt: `docs/collation-adversarial-fix-goal-loop.md`.
+
+Fix commits:
+
+- `8227d90` - Fix collation compound prefix planner.
+- `4344ac0` - Document collation prefix planner milestone.
+- `7eeee13` - Cover collation compound prefix e2e.
+- `f95a90c` - Document collation e2e verification.
+
+Parent re-review accepted the fix. `prefix_planner_key_for_filter` now encodes
+query-side compound-prefix keys with the owning index collation, matching
+document-side index entries. The adjacent sort-prefix key construction now uses
+the index collation as well, keeping the same mismatch class out of that path.
+Rust coverage now exercises case-insensitive compound-prefix indexes across
+find, count, incompatible hints without mutation, update, findAndModify, and
+delete. PyMongo coverage now exercises the same driver-visible shape across
+CRUD and find_one_and_update.
+
+Parent verification passed:
+
+```bash
+cargo fmt -- --check
+cargo test collation
+cargo test compound_prefix
+cargo test hint
+cargo test update
+cargo test delete
+cargo test find_and_modify
+cargo test
+cargo build
+cargo run --bin mongolino-bench -- --profile ci --check-budget
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+```
+
+Results: `cargo test` passed with 173 main tests and 175 bench-target tests.
+`cargo build` passed with existing dead-code warnings. The CI benchmark budget
+passed. The sandboxed PyMongo e2e run was blocked by localhost bind permission,
+then the same unsandboxed command passed with 198 tests in 103.96 seconds.
+
 ## Final Response Requirements
 
 When the goal is complete, report:
