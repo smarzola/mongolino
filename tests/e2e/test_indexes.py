@@ -146,6 +146,32 @@ def test_unsupported_index_options_are_explicit(collection):
     assert id_error.value.code == 67
 
 
+def test_create_indexes_rejects_top_level_sparse_and_partial_options(collection):
+    with pytest.raises(OperationFailure) as sparse_error:
+        collection.database.command(
+            {
+                "createIndexes": collection.name,
+                "indexes": [{"key": {"email": ASCENDING}, "name": "email_1"}],
+                "sparse": True,
+            }
+        )
+    assert sparse_error.value.code == 72
+    assert "sparse is not supported for this command" in str(sparse_error.value)
+
+    with pytest.raises(OperationFailure) as partial_error:
+        collection.database.command(
+            {
+                "createIndexes": collection.name,
+                "indexes": [{"key": {"email": ASCENDING}, "name": "email_1"}],
+                "partialFilterExpression": {"active": True},
+            }
+        )
+    assert partial_error.value.code == 72
+    assert "partialFilterExpression is not supported for this command" in str(
+        partial_error.value
+    )
+
+
 def test_unique_index_creation_rejects_existing_duplicates(collection):
     collection.insert_many(
         [

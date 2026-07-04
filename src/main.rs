@@ -2386,17 +2386,9 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         }
         Err(_) => return Ok(command_error(9, "createIndexes requires an indexes array")),
     };
-    if let Some(errmsg) = reject_unsupported_command_keys(
-        command,
-        &[
-            "createIndexes",
-            "indexes",
-            "$db",
-            "lsid",
-            "sparse",
-            "partialFilterExpression",
-        ],
-    ) {
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["createIndexes", "indexes", "$db", "lsid"])
+    {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -2406,18 +2398,7 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         let Bson::Document(index) = value else {
             return Ok(command_error(9, "index specs must be documents"));
         };
-        let mut index = index.clone();
-        if let Some(sparse) = command.get("sparse")
-            && !index.contains_key("sparse")
-        {
-            index.insert("sparse", sparse.clone());
-        }
-        if let Some(partial_filter) = command.get("partialFilterExpression")
-            && !index.contains_key("partialFilterExpression")
-        {
-            index.insert("partialFilterExpression", partial_filter.clone());
-        }
-        match parse_index_spec(&index) {
+        match parse_index_spec(index) {
             Ok(spec) => specs.push(spec),
             Err(response) => return Ok(response),
         }
@@ -9530,6 +9511,30 @@ mod tests {
             partial.get_document("partialFilterExpression").unwrap(),
             &doc! { "active": true }
         );
+    }
+
+    #[test]
+    fn create_indexes_rejects_top_level_sparse_and_partial_options() {
+        let conn = test_conn();
+
+        for command in [
+            doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1" }],
+                "sparse": true,
+            },
+            doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1" }],
+                "partialFilterExpression": { "active": true },
+            },
+        ] {
+            let response = create_indexes(&conn, &command).unwrap();
+            assert_command_error(&response);
+            assert_eq!(response.get_i32("code").unwrap(), 72);
+        }
     }
 
     #[test]

@@ -60,3 +60,10 @@ Use unsandboxed execution for PyMongo e2e if localhost binding is blocked.
 
 Report commits, changed files, tests added, verification outcomes, and residual
 sparse/partial command-shape risks.
+
+## Status
+
+Status 2026-07-04: Complete. Removed command-level `sparse` and
+`partialFilterExpression` support from `createIndexes` while preserving
+per-index-spec sparse and partial parsing. Added Rust and PyMongo e2e coverage
+for explicit code `72` errors on top-level sparse/partial options.
