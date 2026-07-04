@@ -128,7 +128,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Fix `$lookup` foreign TTL visibility
 - [x] Milestone 1: Preflight constant expression runtime errors
-- [ ] Milestone 2: PyMongo e2e and final verification
+- [x] Milestone 2: PyMongo e2e and final verification
 
 ## Milestone 0: Fix `$lookup` Foreign TTL Visibility
 
@@ -187,7 +187,7 @@ Status 2026-07-05:
   - `cargo test lookup`
   - `cargo test aggregate`
   - `cargo test ttl`
-- Commit: pending in the combined Milestone 0/1 code commit.
+- Commit: `0be8fd8` (`Fix aggregation TTL preflight adversarial gaps`).
 
 ## Milestone 1: Preflight Constant Expression Runtime Errors
 
@@ -254,7 +254,7 @@ Status 2026-07-05:
   - `cargo test aggregate_shaping`
   - `cargo test aggregate`
   - `cargo test ttl`
-- Commit: pending in the combined Milestone 0/1 code commit.
+- Commit: `0be8fd8` (`Fix aggregation TTL preflight adversarial gaps`).
 
 ## Milestone 2: PyMongo E2E And Final Verification
 
@@ -299,6 +299,33 @@ Likely files:
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status 2026-07-05:
+
+- Added PyMongo e2e coverage proving `$lookup` sweeps an expired foreign TTL
+  document before joining and proving static expression errors leave expired
+  source TTL documents in raw storage until a later valid read.
+- Sandboxed full e2e command was blocked by localhost binding:
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+  - Result: collected 206 tests; failed with `PermissionError: [Errno 1]
+    Operation not permitted` in `allocate_local_port`; summary was 2 failed, 6
+    passed, 198 errors due to the sandbox bind restriction.
+- Focused unsandboxed e2e verification passed:
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py`
+  - Result: 26 passed in 13.84s.
+- Full verification passed:
+  - `cargo fmt -- --check`
+  - `cargo test aggregate`
+  - `cargo test ttl`
+  - `cargo test collation`
+  - `cargo test` (180 main tests passed; 182 bench-target tests passed)
+  - `cargo build` (passed with existing dead-code warnings)
+  - `cargo run --bin mongolino-bench -- --profile ci --check-budget`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+  - Result: 206 passed in 107.16s unsandboxed.
+- Commit: pending final verification commit.
 
 ## Final Response Requirements
 

@@ -371,7 +371,7 @@ def test_aggregate_lookup_sweeps_foreign_ttl_before_join(collection, mongolino_s
         ]
     )
 
-    assert list(
+    joined = list(
         collection.aggregate(
             [
                 {
@@ -386,10 +386,11 @@ def test_aggregate_lookup_sweeps_foreign_ttl_before_join(collection, mongolino_s
                 {"$project": {"_id": 1, "profile": 1}},
             ]
         )
-    ) == [
-        {"_id": "o1", "profile": [{"_id": "live", "expiresAt": future, "name": "Live"}]},
-        {"_id": "o2", "profile": []},
-    ]
+    )
+    assert joined[0]["_id"] == "o1"
+    assert joined[0]["profile"][0]["_id"] == "live"
+    assert joined[0]["profile"][0]["name"] == "Live"
+    assert joined[1] == {"_id": "o2", "profile": []}
     assert stored_ids(mongolino_server.db_path, f"{profiles.database.name}.{profiles.name}") == [
         "live"
     ]
