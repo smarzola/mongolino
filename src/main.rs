@@ -2222,6 +2222,15 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
         return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
     }
+    if let Some((index, key_value)) = indexes_for_namespace(conn, namespace)?
+        .into_iter()
+        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
+    {
+        return Ok(CountPlan::IndexedEquality {
+            index_name: index.name,
+            key_value,
+        });
+    }
     let Some((field, value)) = exact_single_equality_filter(filter) else {
         return Ok(CountPlan::Fallback);
     };
@@ -2692,15 +2701,21 @@ fn unique_conflict_check_with_index_entries_tx(
     document: &Document,
     excluding_id_key: Option<&str>,
 ) -> std::result::Result<bool, String> {
-    let Some(field) = single_field_index_name(index) else {
-        return Ok(false);
+    let key_value = if let Some(field) = single_field_index_name(index) {
+        let values = values_at_path(document, field);
+        let value = match values.as_slice() {
+            [value] if is_unique_pushdown_scalar(value) => *value,
+            _ => return Ok(false),
+        };
+        id_key_from_bson(value)
+    } else {
+        let Some(key_value) =
+            compound_key_from_document(index, document, is_unique_pushdown_scalar)
+        else {
+            return Ok(false);
+        };
+        key_value
     };
-    let values = values_at_path(document, field);
-    let value = match values.as_slice() {
-        [value] if is_unique_pushdown_scalar(value) => *value,
-        _ => return Ok(false),
-    };
-    let key_value = id_key_from_bson(value);
     let conflict = tx
         .query_row(
             r#"
@@ -2833,12 +2848,14 @@ fn insert_index_entry_for_document_tx(
 }
 
 fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
-    let field = single_field_index_name(spec)?;
-    let value = get_document_path(document, field)?;
-    if matches!(value, Bson::Array(_)) {
-        return None;
+    if let Some(field) = single_field_index_name(spec) {
+        let value = get_document_path(document, field)?;
+        if matches!(value, Bson::Array(_)) {
+            return None;
+        }
+        return Some(id_key_from_bson(value));
     }
-    Some(id_key_from_bson(value))
+    compound_key_from_document(spec, document, is_compound_planner_scalar)
 }
 
 fn single_field_index_name(spec: &IndexSpec) -> Option<&str> {
@@ -2847,6 +2864,69 @@ fn single_field_index_name(spec: &IndexSpec) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn is_compound_index(spec: &IndexSpec) -> bool {
+    spec.key.len() > 1
+}
+
+fn compound_key_from_document(
+    spec: &IndexSpec,
+    document: &Document,
+    is_safe_value: fn(&Bson) -> bool,
+) -> Option<String> {
+    if !is_compound_index(spec) {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(spec.key.len());
+    for field in spec.key.keys() {
+        let value = get_document_path(document, field)?;
+        if !is_safe_value(value) {
+            return None;
+        }
+        parts.push(id_key_from_bson(value));
+    }
+    Some(encode_compound_planner_key(&parts))
+}
+
+fn compound_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<String> {
+    if !is_compound_index(spec) || filter.len() != spec.key.len() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(spec.key.len());
+    for field in spec.key.keys() {
+        let value = exact_equality_filter_part(filter, field)?;
+        if !is_compound_planner_scalar(value) {
+            return None;
+        }
+        parts.push(id_key_from_bson(value));
+    }
+    Some(encode_compound_planner_key(&parts))
+}
+
+fn exact_equality_filter_part<'a>(filter: &'a Document, field: &str) -> Option<&'a Bson> {
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return None;
+    }
+    filter.get(field).and_then(exact_equality_value)
+}
+
+fn is_compound_planner_scalar(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::String(_) | Bson::Boolean(_) | Bson::ObjectId(_) | Bson::DateTime(_)
+    )
+}
+
+fn encode_compound_planner_key(parts: &[String]) -> String {
+    let mut key = format!("compound:{}", parts.len());
+    for part in parts {
+        key.push(':');
+        key.push_str(&part.len().to_string());
+        key.push(':');
+        key.push_str(part);
+    }
+    key
 }
 
 fn indexes_for_namespace_tx(
@@ -3746,6 +3826,15 @@ fn plan_transaction_candidates(
         return Ok(TransactionCandidatePlan::IdEquality(id_key_from_bson(
             value,
         )));
+    }
+    if let Some((index, key_value)) = indexes_for_namespace_tx(tx, namespace)?
+        .into_iter()
+        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
+    {
+        return Ok(TransactionCandidatePlan::IndexedEquality {
+            index_name: index.name,
+            key_value,
+        });
     }
     let Some((field, value)) = exact_single_equality_filter(filter) else {
         return Ok(TransactionCandidatePlan::Fallback);
@@ -5374,6 +5463,13 @@ fn indexed_candidate_documents(
     namespace: &str,
     filter: &Document,
 ) -> Result<Option<Vec<Document>>> {
+    if let Some((index, key_value)) = indexes_for_namespace(conn, namespace)?
+        .into_iter()
+        .find_map(|index| compound_planner_key_for_filter(&index, filter).map(|key| (index, key)))
+    {
+        return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
+    }
+
     let Some((field, value)) = simple_equality_filter_field(filter) else {
         return Ok(None);
     };
@@ -5387,6 +5483,15 @@ fn indexed_candidate_documents(
         return Ok(None);
     };
     let key_value = id_key_from_bson(value);
+    indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value)
+}
+
+fn indexed_candidate_documents_by_key(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    key_value: &str,
+) -> Result<Option<Vec<Document>>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT d.bson
@@ -5401,7 +5506,7 @@ fn indexed_candidate_documents(
         "#,
     )?;
     let documents = stmt
-        .query_map(params![namespace, index.name, key_value], |row| {
+        .query_map(params![namespace, index_name, key_value], |row| {
             row.get::<_, Vec<u8>>(0)
         })?
         .map(|row| decode_document(row?))
@@ -7434,6 +7539,77 @@ mod tests {
                 plan_count(&conn, "app.users", &filter).unwrap(),
                 CountPlan::Fallback
             );
+        }
+    }
+
+    #[test]
+    fn compound_planner_key_uses_index_order_and_safe_scalars() {
+        let spec = IndexSpec {
+            name: "compound_1".to_string(),
+            key: doc! { "profile.city": 1_i32, "active": -1_i32 },
+            unique: false,
+        };
+        let document = doc! {
+            "_id": "u1",
+            "active": true,
+            "profile": { "city": "Rome" },
+        };
+
+        assert_eq!(
+            planner_key_for_document(&spec, &document),
+            Some("compound:2:8:str:Rome:9:bool:true".to_string())
+        );
+
+        let reversed = IndexSpec {
+            name: "compound_reversed_1".to_string(),
+            key: doc! { "active": -1_i32, "profile.city": 1_i32 },
+            unique: false,
+        };
+        assert_eq!(
+            planner_key_for_document(&reversed, &document),
+            Some("compound:2:9:bool:true:8:str:Rome".to_string())
+        );
+
+        for unsafe_document in [
+            doc! { "_id": "missing", "profile": { "city": "Rome" } },
+            doc! { "_id": "null", "profile": { "city": "Rome" }, "active": Bson::Null },
+            doc! { "_id": "numeric", "profile": { "city": "Rome" }, "active": 1_i32 },
+            doc! { "_id": "array", "profile": { "city": "Rome" }, "active": [true] },
+            doc! { "_id": "document", "profile": { "city": "Rome" }, "active": { "nested": true } },
+        ] {
+            assert_eq!(planner_key_for_document(&spec, &unsafe_document), None);
+        }
+    }
+
+    #[test]
+    fn compound_filter_planner_requires_full_safe_equality_coverage() {
+        let spec = IndexSpec {
+            name: "compound_1".to_string(),
+            key: doc! { "profile.city": 1_i32, "active": -1_i32 },
+            unique: false,
+        };
+
+        assert_eq!(
+            compound_planner_key_for_filter(
+                &spec,
+                &doc! { "active": true, "profile.city": { "$eq": "Rome" } },
+            ),
+            Some("compound:2:8:str:Rome:9:bool:true".to_string())
+        );
+
+        for filter in [
+            doc! { "profile.city": "Rome" },
+            doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
+            doc! { "$or": [{ "profile.city": "Rome", "active": true }] },
+            doc! { "profile.city": "Rome", "active": { "$in": [true] } },
+            doc! { "profile.city": "Rome", "active": { "$ne": false } },
+            doc! { "profile.city": "Rome", "active": { "$eq": true, "$exists": true } },
+            doc! { "profile.city": "Rome", "active": Bson::Null },
+            doc! { "profile.city": "Rome", "active": 1_i32 },
+            doc! { "profile.city": "Rome", "active": [true] },
+            doc! { "profile.city": "Rome", "active": { "nested": true } },
+        ] {
+            assert_eq!(compound_planner_key_for_filter(&spec, &filter), None);
         }
     }
 

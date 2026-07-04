@@ -159,7 +159,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Compound key encoding and planner classification
+- [x] Milestone 0: Compound key encoding and planner classification
 - [ ] Milestone 1: Compound index entry maintenance
 - [ ] Milestone 2: Compound read and count pushdown
 - [ ] Milestone 3: Compound write target and unique pushdown
@@ -202,6 +202,14 @@ cargo fmt -- --check
 cargo test planner
 cargo test index
 ```
+
+Status:
+
+- 2026-07-04: Added conservative compound key encoding and full-key equality
+  filter classification. Compound planner keys use index key order and reject
+  numeric, null, missing, array, document, partial, extra-field, logical, and
+  unsupported operator filters. Verified with `cargo fmt -- --check`;
+  `cargo test planner`; `cargo test index`. Commit hash: pending.
 
 ## Milestone 1: Compound Index Entry Maintenance
 
