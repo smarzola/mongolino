@@ -1041,7 +1041,12 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     let ns = namespace(db, collection);
     let hint = match parse_optional_hint(command) {
         Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &ns)?, hint) {
-            Ok(hint) => Some(hint),
+            Ok(hint) => {
+                if let Err(errmsg) = validate_hint_collation(&hint, &collation, &filter) {
+                    return Ok(command_error(2, &errmsg));
+                }
+                Some(hint)
+            }
             Err(errmsg) => return Ok(command_error(2, &errmsg)),
         },
         Ok(None) => None,
@@ -7567,7 +7572,12 @@ fn find_documents_with_state(
     let ns = namespace(db, collection);
     let hint = match parse_optional_hint(command) {
         Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &ns)?, hint) {
-            Ok(hint) => Some(hint),
+            Ok(hint) => {
+                if let Err(errmsg) = validate_hint_collation(&hint, &collation, &filter) {
+                    return Ok(command_error(2, &errmsg));
+                }
+                Some(hint)
+            }
             Err(errmsg) => return Ok(command_error(2, &errmsg)),
         },
         Ok(None) => None,
@@ -10093,6 +10103,273 @@ mod tests {
         assert_eq!(
             documents_for_namespace(&conn, "app.events").unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn collation_index_metadata_roundtrip_and_duplicate_spec_comparison() {
+        let conn = test_conn();
+        let created = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    {
+                        "key": { "name": 1_i32 },
+                        "name": "name_ci",
+                        "collation": { "locale": "en", "strength": 2_i32 },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(created.get_i32("numIndexesAfter").unwrap(), 2);
+
+        let listed = list_indexes(
+            &conn,
+            &doc! { "listIndexes": "users", "$db": "app", "cursor": {} },
+        )
+        .unwrap();
+        let name_ci = first_batch(&listed)
+            .into_iter()
+            .find(|index| index.get_str("name").unwrap() == "name_ci")
+            .unwrap();
+        assert_eq!(
+            name_ci.get_document("collation").unwrap(),
+            &doc! { "locale": "en", "strength": 2_i32 }
+        );
+
+        let idempotent = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    {
+                        "key": { "name": 1_i32 },
+                        "name": "name_ci",
+                        "collation": { "locale": "en", "strength": 2_i32 },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(idempotent.get_i32("numIndexesAfter").unwrap(), 2);
+
+        let conflicting_simple = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_ci" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&conflicting_simple);
+        assert_eq!(conflicting_simple.get_i32("code").unwrap(), 85);
+    }
+
+    #[test]
+    fn collation_index_rejects_invalid_and_unsafe_interactions() {
+        let conn = test_conn();
+        for spec in [
+            doc! {
+                "key": { "name": 1_i32 },
+                "name": "bad_numeric",
+                "collation": { "locale": "en", "strength": 2_i32, "numericOrdering": true },
+            },
+            doc! {
+                "key": { "name": 1_i32 },
+                "name": "bad_partial",
+                "partialFilterExpression": { "active": true },
+                "collation": { "locale": "en", "strength": 2_i32 },
+            },
+            doc! {
+                "key": { "expiresAt": 1_i32 },
+                "name": "bad_ttl",
+                "expireAfterSeconds": 0_i32,
+                "collation": { "locale": "en", "strength": 2_i32 },
+            },
+        ] {
+            let response = create_indexes(
+                &conn,
+                &doc! { "createIndexes": "users", "$db": "app", "indexes": [spec] },
+            )
+            .unwrap();
+            assert_command_error(&response);
+            assert_eq!(response.get_i32("code").unwrap(), 72);
+        }
+        let listed = list_indexes(
+            &conn,
+            &doc! { "listIndexes": "users", "$db": "app", "cursor": {} },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&listed).len(), 1);
+    }
+
+    #[test]
+    fn collation_unique_index_enforces_case_insensitive_strings() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    {
+                        "key": { "email": 1_i32 },
+                        "name": "email_ci_unique",
+                        "unique": true,
+                        "collation": { "locale": "en", "strength": 2_i32 },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "Ada@example.test" },
+                    { "_id": "u2", "email": "grace@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let duplicate_insert = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u3", "email": "ada@example.test" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_insert)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let duplicate_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u2" }, "u": { "$set": { "email": "ADA@example.test" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_update)[0].get_i32("code").unwrap(),
+            11000
+        );
+    }
+
+    #[test]
+    fn collation_planner_uses_matching_index_and_rejects_incompatible_hints_before_ttl() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada" },
+                    { "_id": "u2", "name": "ada" },
+                    { "_id": "u3", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "name": 1_i32 }, "name": "name_simple" },
+                    {
+                        "key": { "name": 1_i32 },
+                        "name": "name_ci",
+                        "collation": { "locale": "en", "strength": 2_i32 },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let explain = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "ADA" },
+                "collation": { "locale": "en", "strength": 2_i32 },
+                "explain": true,
+            },
+        )
+        .unwrap();
+        let plan = explain
+            .get_document("queryPlanner")
+            .unwrap()
+            .get_document("winningPlan")
+            .unwrap();
+        assert_eq!(plan.get_str("scanStrategy").unwrap(), "indexExactEquality");
+        assert_eq!(plan.get_str("indexName").unwrap(), "name_ci");
+
+        let count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "users",
+                "$db": "app",
+                "query": { "name": "ADA" },
+                "collation": { "locale": "en", "strength": 2_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get_i64("n").unwrap(), 2);
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [{ "_id": "expired", "name": "Ada", "expiresAt": bson::DateTime::from_millis(1_700_000_000_000_i64) }],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "name": 1_i32 }, "name": "name_simple" },
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 0_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        let hinted = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "name": "ADA" },
+                "hint": "name_simple",
+                "collation": { "locale": "en", "strength": 2_i32 },
+            },
+        )
+        .unwrap();
+        assert_command_error(&hinted);
+        assert_eq!(hinted.get_i32("code").unwrap(), 2);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.events").unwrap().len(),
+            1
         );
     }
 

@@ -193,7 +193,7 @@ When a milestone is complete:
 - [x] Milestone 0: Collation parser and comparison model
 - [x] Milestone 1: Collation-aware read matching, sorting, and distinct
 - [x] Milestone 2: Collation-aware write target selection and no-mutation errors
-- [ ] Milestone 3: Index metadata, unique enforcement, and safe planning
+- [x] Milestone 3: Index metadata, unique enforcement, and safe planning
 - [ ] Milestone 4: PyMongo/spec-corpus adversarial coverage
 - [ ] Milestone 5: Benchmarks, docs, scorecard, final verification
 
@@ -342,7 +342,7 @@ command collation now drive write target matching and findAndModify sort
 selection, while invalid collation documents return errors before TTL sweeps or
 mutations. Verified with `cargo fmt -- --check`, `cargo test collation`,
 `cargo test update`, `cargo test delete`, `cargo test find_and_modify`, and
-`cargo test ttl`. Commit: pending.
+`cargo test ttl`. Commit: `06a3639`.
 
 ## Milestone 3: Index Metadata, Unique Enforcement, And Safe Planning
 
@@ -394,6 +394,15 @@ cargo test planner
 cargo test hint
 cargo test ttl
 ```
+
+Status 2026-07-04: Complete. Index specs persist/list supported collation
+metadata, duplicate index comparison includes collation, unsupported index
+collation combinations fail explicitly, single-field unique string indexes
+enforce case-insensitive conflicts, and planner/hint paths use only matching
+collation-aware indexes. Verified with `cargo fmt -- --check`,
+`cargo test collation`, `cargo test index`, `cargo test unique`,
+`cargo test planner`, `cargo test hint`, and `cargo test ttl`. Commit:
+pending.
 
 ## Milestone 4: PyMongo/Spec-Corpus Adversarial Coverage
 
