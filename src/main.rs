@@ -4793,7 +4793,7 @@ fn prefix_planner_key_for_filter(spec: &IndexSpec, filter: &Document) -> Option<
         if !is_compound_planner_scalar(value) {
             return None;
         }
-        parts.push(id_key_from_bson(value));
+        parts.push(spec.collation.id_key_from_bson(value));
     }
     if parts.is_empty() || parts.len() >= spec.key.len() {
         return None;
@@ -8447,7 +8447,7 @@ fn compound_sort_pushdown_plan_for_index(
         if !is_compound_planner_scalar(value) {
             return None;
         }
-        equality_parts.push(id_key_from_bson(value));
+        equality_parts.push(index.collation.id_key_from_bson(value));
     }
     None
 }
@@ -10370,6 +10370,255 @@ mod tests {
         assert_eq!(
             documents_for_namespace(&conn, "app.events").unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn collation_compound_prefix_planner_uses_index_keys_for_targets_and_hints() {
+        let conn = test_conn();
+        let collation = doc! { "locale": "en", "strength": 2_i32 };
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "e1", "account": "Acme", "created": "2026-01-01", "state": "queued" },
+                    { "_id": "e2", "account": "ACME", "created": "2026-01-02", "state": "queued" },
+                    { "_id": "e3", "account": "Beta", "created": "2026-01-03", "state": "queued" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    {
+                        "key": { "account": 1_i32, "created": 1_i32 },
+                        "name": "account_created_ci",
+                        "collation": collation.clone(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefix_planner_key_for_filter(
+                &indexes_for_namespace(&conn, "app.events")
+                    .unwrap()
+                    .into_iter()
+                    .find(|index| index.name == "account_created_ci")
+                    .unwrap(),
+                &doc! { "account": "ACME" },
+            ),
+            Some((1, "compound-prefix:1:11:str-ci:acme".to_string()))
+        );
+        assert!(matches!(
+            planner_v2_plan_for_query(
+                &conn,
+                "app.events",
+                &doc! { "account": "ACME" },
+                None,
+                &Collation::EnglishCaseInsensitive,
+            )
+            .unwrap(),
+            PlannerV2Plan::IndexEqualityPrefix { index_name, prefix_len, key_value, .. }
+                if index_name == "account_created_ci"
+                    && prefix_len == 1
+                    && key_value == "compound-prefix:1:11:str-ci:acme"
+        ));
+
+        let find = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "account": "ACME" },
+                "hint": "account_created_ci",
+                "collation": collation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&find)
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["e1", "e2"]
+        );
+
+        let count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "events",
+                "$db": "app",
+                "query": { "account": "ACME" },
+                "hint": "account_created_ci",
+                "collation": collation.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get_i64("n").unwrap(), 2);
+
+        let bad_hint = find_documents(
+            &conn,
+            &doc! {
+                "find": "events",
+                "$db": "app",
+                "filter": { "account": "ACME" },
+                "hint": "account_created_ci",
+                "collation": { "locale": "simple" },
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_hint);
+        assert_eq!(bad_hint.get_i32("code").unwrap(), 2);
+
+        let bad_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "events",
+                "$db": "app",
+                "updates": [{
+                    "q": { "account": "ACME" },
+                    "u": { "$set": { "state": "bad" } },
+                    "multi": true,
+                    "hint": "account_created_ci",
+                    "collation": { "locale": "simple" },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_update)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(
+            find_ids_in(&conn, "events", doc! { "state": "bad" }),
+            Vec::<String>::new()
+        );
+
+        let updated = update_documents(
+            &conn,
+            &doc! {
+                "update": "events",
+                "$db": "app",
+                "updates": [{
+                    "q": { "account": "ACME" },
+                    "u": { "$set": { "state": "matched" } },
+                    "multi": true,
+                    "hint": "account_created_ci",
+                    "collation": collation.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_i32("n").unwrap(), 2);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! {
+                        "find": "events",
+                        "$db": "app",
+                        "filter": { "state": "matched" },
+                        "sort": { "_id": 1_i32 },
+                    },
+                )
+                .unwrap()
+            )
+            .iter()
+            .map(|doc| doc.get_str("_id").unwrap().to_string())
+            .collect::<Vec<_>>(),
+            vec!["e1", "e2"]
+        );
+
+        let modified = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "events",
+                "$db": "app",
+                "query": { "account": "ACME" },
+                "update": { "$set": { "state": "fam" } },
+                "hint": "account_created_ci",
+                "collation": collation.clone(),
+                "new": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            modified
+                .get_document("value")
+                .unwrap()
+                .get_str("state")
+                .unwrap(),
+            "fam"
+        );
+        assert_eq!(
+            find_ids_in(&conn, "events", doc! { "state": "fam" }),
+            vec!["e1"]
+        );
+
+        let bad_delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "events",
+                "$db": "app",
+                "deletes": [{
+                    "q": { "account": "ACME" },
+                    "limit": 1_i32,
+                    "hint": "account_created_ci",
+                    "collation": { "locale": "simple" },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_delete)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(
+            count_documents_command(
+                &conn,
+                &doc! { "count": "events", "$db": "app", "query": { "account": "ACME" }, "collation": collation.clone() },
+            )
+            .unwrap()
+            .get_i64("n")
+            .unwrap(),
+            2
+        );
+
+        let deleted = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "events",
+                "$db": "app",
+                "deletes": [{
+                    "q": { "account": "ACME" },
+                    "limit": 1_i32,
+                    "hint": "account_created_ci",
+                    "collation": collation,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted.get_i32("n").unwrap(), 1);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! {
+                        "find": "events",
+                        "$db": "app",
+                        "filter": {},
+                        "sort": { "_id": 1_i32 },
+                    },
+                )
+                .unwrap()
+            )
+            .iter()
+            .map(|doc| doc.get_str("_id").unwrap().to_string())
+            .collect::<Vec<_>>(),
+            vec!["e2", "e3"]
         );
     }
 
