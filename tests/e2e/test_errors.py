@@ -77,7 +77,7 @@ def test_top_level_where_operator_is_explicit_error(collection):
 
 def test_unsupported_command_remains_explicit(mongo_client):
     with pytest.raises(OperationFailure) as excinfo:
-        mongo_client.e2e.command("createIndexes", "users", indexes=[])
+        mongo_client.e2e.command("collStats", "users")
 
     assert excinfo.value.code == 59
-    assert "command 'createIndexes' is not supported yet" in str(excinfo.value)
+    assert "command 'collStats' is not supported yet" in str(excinfo.value)

@@ -8,13 +8,12 @@
       "name": "command",
       "database": "e2e",
       "command": {
-        "createIndexes": "users",
-        "indexes": []
+        "collStats": "users"
       },
       "expect_error": {
         "type": "OperationFailure",
         "code": 59,
-        "contains": "command 'createIndexes' is not supported yet"
+        "contains": "command 'collStats' is not supported yet"
       }
     }
   ]

@@ -66,7 +66,7 @@ Compatibility flags:
 | BSON storage | Partial | Stores BSON blobs in SQLite and derives a stable primary key from `_id`. Inserts with operator-shaped field names store those names as data. | No typed secondary indexes, schema validation, document size enforcement beyond message size, or query planning. |
 | Authentication | Unsupported | No auth challenge or credential validation. | No SCRAM, x.509, keyfile, localhost exception, users, roles, or permissions. |
 | Transactions | Unsupported | No multi-operation transaction protocol. | No sessions, transaction numbers, retryable writes, snapshot reads, or rollback semantics. |
-| Indexes | Unsupported | SQLite has only internal storage indexes for namespace scans and `_id` primary-key lookups. | MongoDB `createIndexes`, `listIndexes`, `dropIndexes`, unique indexes beyond `_id`, and query planner behavior are not implemented. |
+| Indexes | Partial | Supports `createIndexes`, `listIndexes`, and `dropIndexes` metadata for simple ascending/descending single-field and compound keys, lists virtual `_id_`, stores `unique: true` metadata, and rejects unsupported index options explicitly. | Unique index enforcement and secondary-index query planning are not implemented yet. Text, geospatial, hashed, wildcard, partial, sparse, TTL, hidden, collation, and background semantics are unsupported. |
 
 ## Current Storage Model
 

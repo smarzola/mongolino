@@ -64,6 +64,6 @@ def test_port_allocation_is_ephemeral():
 
 def test_unsupported_command_returns_operation_failure(mongo_client):
     with pytest.raises(OperationFailure) as excinfo:
-        mongo_client.admin.command("createIndexes", "users", indexes=[])
+        mongo_client.admin.command("collStats", "users")
 
     assert excinfo.value.code == 59

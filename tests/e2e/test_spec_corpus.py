@@ -157,6 +157,16 @@ def execute_operation(operation, collection):
         return collection.count_documents(operation.get("filter", {}), **kwargs)
     if name == "distinct":
         return collection.distinct(operation["key"], operation.get("filter"))
+    if name == "create_index":
+        return collection.create_index(
+            list(operation["keys"].items()),
+            name=operation.get("index_name"),
+            unique=operation.get("unique", False),
+        )
+    if name == "list_index_names":
+        return [index["name"] for index in collection.list_indexes()]
+    if name == "drop_index":
+        return collection.drop_index(operation["index_name"])
     if name == "command":
         database = collection.database.client[operation.get("database", collection.database.name)]
         return database.command(operation["command"])
@@ -182,6 +192,10 @@ def assert_result(result, expected):
         actual = {"count": result}
     if isinstance(result, list):
         actual = {"values": result}
+    if isinstance(result, str):
+        actual = {"name": result}
+    if result is None:
+        actual = {"ok": None}
     for key, value in expected.items():
         assert actual[key] == value
 

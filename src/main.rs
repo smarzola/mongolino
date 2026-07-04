@@ -212,6 +212,18 @@ fn init_document_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_collections_db_name
             ON collections(db, name);
 
+        CREATE TABLE IF NOT EXISTS indexes (
+            namespace TEXT NOT NULL,
+            name TEXT NOT NULL,
+            key_bson BLOB NOT NULL,
+            unique_index INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (namespace, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_indexes_namespace
+            ON indexes(namespace);
+
         CREATE TABLE IF NOT EXISTS documents (
             namespace TEXT NOT NULL,
             id_key TEXT NOT NULL,
@@ -479,6 +491,9 @@ fn handle_command_with_state(
         "count" => count_documents_command(conn, command),
         "distinct" => distinct_command(conn, command),
         "aggregate" => aggregate_command(conn, command),
+        "createIndexes" => create_indexes(conn, command),
+        "listIndexes" => list_indexes(conn, command),
+        "dropIndexes" => drop_indexes(conn, command),
         "insert" => insert_documents(conn, command),
         "find" => find_documents_with_state(conn, client_state, command),
         "getMore" => get_more(client_state, command),
@@ -668,6 +683,7 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM documents WHERE namespace = ?1", params![ns])?;
     tx.execute("DELETE FROM collections WHERE namespace = ?1", params![ns])?;
+    tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?;
     tx.commit()?;
 
     Ok(doc! {
@@ -692,6 +708,10 @@ fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
         params![prefix],
     )?;
     tx.execute("DELETE FROM collections WHERE db = ?1", params![db])?;
+    tx.execute(
+        "DELETE FROM indexes WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
     tx.commit()?;
 
     Ok(doc! {
@@ -959,6 +979,300 @@ fn distinct_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
             value => vec![value.clone()],
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct IndexSpec {
+    name: String,
+    key: Document,
+    unique: bool,
+}
+
+fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("createIndexes") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "createIndexes requires a collection name")),
+    };
+    let index_values = match command.get_array("indexes") {
+        Ok(values) if !values.is_empty() => values,
+        Ok(_) => {
+            return Ok(command_error(
+                9,
+                "createIndexes requires a non-empty indexes array",
+            ));
+        }
+        Err(_) => return Ok(command_error(9, "createIndexes requires an indexes array")),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["createIndexes", "indexes", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+
+    let namespace = namespace(db, collection);
+    let mut specs = Vec::new();
+    for value in index_values {
+        let Bson::Document(index) = value else {
+            return Ok(command_error(9, "index specs must be documents"));
+        };
+        match parse_index_spec(index) {
+            Ok(spec) => specs.push(spec),
+            Err(response) => return Ok(response),
+        }
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    ensure_collection_catalog_tx(&tx, &namespace)?;
+    let before = index_count_tx(&tx, &namespace)? + 1;
+    for spec in &specs {
+        if spec.name == "_id_" {
+            return Ok(command_error(67, "cannot create explicit _id_ index"));
+        }
+        if let Some(existing) = index_by_name_tx(&tx, &namespace, &spec.name)? {
+            if existing.key == spec.key && existing.unique == spec.unique {
+                continue;
+            }
+            return Ok(command_error(
+                85,
+                "index already exists with a different specification",
+            ));
+        }
+        insert_index_tx(&tx, &namespace, spec)?;
+    }
+    let after = index_count_tx(&tx, &namespace)? + 1;
+    tx.commit()?;
+
+    Ok(doc! {
+        "numIndexesBefore": before,
+        "numIndexesAfter": after,
+        "createdCollectionAutomatically": false,
+        "ok": 1.0,
+    })
+}
+
+fn list_indexes(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("listIndexes") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "listIndexes requires a collection name")),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["listIndexes", "cursor", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+    match command.get("cursor") {
+        None => {}
+        Some(Bson::Document(_)) => {}
+        Some(_) => return Ok(command_error(9, "listIndexes cursor must be a document")),
+    }
+
+    let ns = namespace(db, collection);
+    let mut batch = vec![Bson::Document(doc! {
+        "v": 2_i32,
+        "key": { "_id": 1_i32 },
+        "name": "_id_",
+    })];
+    for spec in indexes_for_namespace(conn, &ns)? {
+        let mut document = doc! {
+            "v": 2_i32,
+            "key": spec.key,
+            "name": spec.name,
+        };
+        if spec.unique {
+            document.insert("unique", true);
+        }
+        batch.push(Bson::Document(document));
+    }
+
+    Ok(doc! {
+        "cursor": {
+            "id": 0_i64,
+            "ns": namespace(db, collection),
+            "firstBatch": batch,
+        },
+        "ok": 1.0,
+    })
+}
+
+fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
+    let db = command.get_str("$db").unwrap_or("test");
+    let collection = match command.get_str("dropIndexes") {
+        Ok(collection) if !collection.is_empty() => collection,
+        _ => return Ok(command_error(9, "dropIndexes requires a collection name")),
+    };
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["dropIndexes", "index", "$db", "lsid"])
+    {
+        return Ok(command_error(72, &errmsg));
+    }
+    let index = match command.get("index") {
+        Some(Bson::String(name)) if !name.is_empty() => name.clone(),
+        Some(Bson::Document(key)) => generated_index_name(key),
+        _ => {
+            return Ok(command_error(
+                9,
+                "dropIndexes requires an index name or key document",
+            ));
+        }
+    };
+    if index == "_id_" {
+        return Ok(command_error(67, "cannot drop _id_ index"));
+    }
+
+    let ns = namespace(db, collection);
+    let tx = conn.unchecked_transaction()?;
+    let before = index_count_tx(&tx, &ns)? + 1;
+    let removed = if index == "*" {
+        tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?
+    } else {
+        tx.execute(
+            "DELETE FROM indexes WHERE namespace = ?1 AND name = ?2",
+            params![ns, index],
+        )?
+    };
+    if removed == 0 && index != "*" {
+        return Ok(command_error(27, "index not found"));
+    }
+    let after = index_count_tx(&tx, &ns)? + 1;
+    tx.commit()?;
+
+    Ok(doc! {
+        "nIndexesWas": before,
+        "numIndexesBefore": before,
+        "numIndexesAfter": after,
+        "ok": 1.0,
+    })
+}
+
+fn parse_index_spec(index: &Document) -> std::result::Result<IndexSpec, Document> {
+    if let Some(errmsg) = reject_unsupported_command_keys(index, &["key", "name", "unique", "v"]) {
+        return Err(command_error(72, &errmsg));
+    }
+    let key = match index.get_document("key") {
+        Ok(key) if !key.is_empty() => key.clone(),
+        _ => {
+            return Err(command_error(
+                9,
+                "index spec requires a non-empty key document",
+            ));
+        }
+    };
+    validate_index_key(&key)?;
+    let name = match index.get_str("name") {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        Ok(_) => return Err(command_error(9, "index name must not be empty")),
+        Err(_) => generated_index_name(&key),
+    };
+    let unique = match index.get("unique") {
+        None => false,
+        Some(Bson::Boolean(value)) => *value,
+        Some(_) => return Err(command_error(9, "unique must be a boolean")),
+    };
+    match index.get("v") {
+        None | Some(Bson::Int32(2) | Bson::Int64(2)) => {}
+        Some(_) => return Err(command_error(72, "only index version 2 is supported")),
+    }
+
+    Ok(IndexSpec { name, key, unique })
+}
+
+fn validate_index_key(key: &Document) -> std::result::Result<(), Document> {
+    for (field, direction) in key {
+        if field.is_empty()
+            || field.starts_with('$')
+            || field.split('.').any(|part| part.is_empty())
+        {
+            return Err(command_error(
+                9,
+                "index field names must be non-empty paths",
+            ));
+        }
+        match direction {
+            Bson::Int32(1) | Bson::Int64(1) | Bson::Int32(-1) | Bson::Int64(-1) => {}
+            Bson::String(kind) => {
+                return Err(command_error(
+                    72,
+                    &format!("{kind} indexes are not supported"),
+                ));
+            }
+            _ => return Err(command_error(72, "index directions must be 1 or -1")),
+        }
+    }
+    Ok(())
+}
+
+fn generated_index_name(key: &Document) -> String {
+    key.iter()
+        .map(|(field, direction)| {
+            let direction = match direction {
+                Bson::Int32(value) => *value as i64,
+                Bson::Int64(value) => *value,
+                _ => 1,
+            };
+            format!("{field}_{direction}")
+        })
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn insert_index_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    spec: &IndexSpec,
+) -> std::result::Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT INTO indexes(namespace, name, key_bson, unique_index) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            namespace,
+            spec.name,
+            encode_document(&spec.key)?,
+            if spec.unique { 1_i32 } else { 0_i32 }
+        ],
+    )?;
+    Ok(())
+}
+
+fn index_by_name_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<IndexSpec>> {
+    tx.query_row(
+        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 AND name = ?2",
+        params![namespace, name],
+        |row| {
+            let name = row.get::<_, String>(0)?;
+            let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
+            let unique = row.get::<_, i32>(2)? != 0;
+            Ok(IndexSpec { name, key, unique })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn indexes_for_namespace(conn: &Connection, namespace: &str) -> Result<Vec<IndexSpec>> {
+    let mut stmt = conn.prepare(
+        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 ORDER BY name",
+    )?;
+    stmt.query_map(params![namespace], |row| {
+        let name = row.get::<_, String>(0)?;
+        let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
+        let unique = row.get::<_, i32>(2)? != 0;
+        Ok(IndexSpec { name, key, unique })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(Into::into)
+}
+
+fn index_count_tx(tx: &rusqlite::Transaction<'_>, namespace: &str) -> Result<i32> {
+    Ok(tx.query_row(
+        "SELECT COUNT(*) FROM indexes WHERE namespace = ?1",
+        params![namespace],
+        |row| row.get::<_, i32>(0),
+    )?)
 }
 
 fn insert_collection_catalog(
@@ -2578,6 +2892,20 @@ fn decode_document(bytes: Vec<u8>) -> Result<Document> {
     Ok(Document::from_reader(&mut Cursor::new(bytes))?)
 }
 
+fn encode_document(document: &Document) -> std::result::Result<Vec<u8>, rusqlite::Error> {
+    let mut encoded = Vec::new();
+    document.to_writer(&mut encoded).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+    })?;
+    Ok(encoded)
+}
+
+fn decode_document_sql(bytes: Vec<u8>) -> std::result::Result<Document, rusqlite::Error> {
+    Document::from_reader(&mut Cursor::new(bytes)).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(err))
+    })
+}
+
 fn ensure_document_id(document: &mut Document) {
     if !document.contains_key("_id") {
         document.insert("_id", ObjectId::new());
@@ -3341,6 +3669,116 @@ mod tests {
     }
 
     #[test]
+    fn index_commands_create_list_and_drop_metadata() {
+        let conn = test_conn();
+
+        let created = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
+                    { "key": { "profile.city": -1_i32 } },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(created.get_i32("numIndexesBefore").unwrap(), 1);
+        assert_eq!(created.get_i32("numIndexesAfter").unwrap(), 3);
+
+        let listed = list_indexes(
+            &conn,
+            &doc! { "listIndexes": "users", "$db": "app", "cursor": {} },
+        )
+        .unwrap();
+        let names = first_batch(&listed)
+            .into_iter()
+            .map(|index| index.get_str("name").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["_id_", "email_1", "profile.city_-1"]);
+
+        let dropped = drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "email_1" },
+        )
+        .unwrap();
+        assert_eq!(dropped.get_i32("numIndexesAfter").unwrap(), 2);
+        let names = first_batch(
+            &list_indexes(&conn, &doc! { "listIndexes": "users", "$db": "app" }).unwrap(),
+        )
+        .into_iter()
+        .map(|index| index.get_str("name").unwrap().to_string())
+        .collect::<Vec<_>>();
+        assert_eq!(names, vec!["_id_", "profile.city_-1"]);
+    }
+
+    #[test]
+    fn index_duplicate_create_is_idempotent_but_conflicts_error() {
+        let conn = test_conn();
+        let command = doc! {
+            "createIndexes": "users",
+            "$db": "app",
+            "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1" }],
+        };
+        create_indexes(&conn, &command).unwrap();
+        let repeated = create_indexes(&conn, &command).unwrap();
+        assert_eq!(repeated.get_f64("ok").unwrap(), 1.0);
+
+        let conflict = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": -1_i32 }, "name": "email_1" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&conflict);
+        assert_eq!(conflict.get_i32("code").unwrap(), 85);
+    }
+
+    #[test]
+    fn index_commands_reject_unsupported_shapes() {
+        let conn = test_conn();
+
+        for response in [
+            create_indexes(
+                &conn,
+                &doc! { "createIndexes": "users", "$db": "app", "indexes": [] },
+            )
+            .unwrap(),
+            create_indexes(
+                &conn,
+                &doc! {
+                    "createIndexes": "users",
+                    "$db": "app",
+                    "indexes": [{ "key": { "name": "text" }, "name": "name_text" }],
+                },
+            )
+            .unwrap(),
+            create_indexes(
+                &conn,
+                &doc! {
+                    "createIndexes": "users",
+                    "$db": "app",
+                    "indexes": [{ "key": { "name": 1_i32 }, "partialFilterExpression": { "active": true } }],
+                },
+            )
+            .unwrap(),
+            drop_indexes(&conn, &doc! { "dropIndexes": "users", "$db": "app", "index": "_id_" })
+                .unwrap(),
+            list_indexes(
+                &conn,
+                &doc! { "listIndexes": "users", "$db": "app", "cursor": "bad" },
+            )
+            .unwrap(),
+        ] {
+            assert_command_error(&response);
+        }
+    }
+
+    #[test]
     fn empty_and_unknown_commands_are_command_errors() {
         let conn = test_conn();
 
@@ -3348,8 +3786,7 @@ mod tests {
         assert_command_error(&empty);
         assert!(empty.get_str("errmsg").unwrap().contains("empty command"));
 
-        let unknown =
-            handle_command(&conn, &doc! { "createIndexes": "users", "$db": "app" }).unwrap();
+        let unknown = handle_command(&conn, &doc! { "collStats": "users", "$db": "app" }).unwrap();
         assert_command_error(&unknown);
         assert!(unknown.get_str("errmsg").unwrap().contains("not supported"));
     }

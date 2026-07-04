@@ -1,0 +1,43 @@
+{
+  "name": "index catalog commands",
+  "source": "unified-test-format",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "create_index",
+      "keys": {
+        "email": 1
+      },
+      "index_name": "email_1",
+      "unique": true,
+      "expect_result": {
+        "name": "email_1"
+      }
+    },
+    {
+      "name": "list_index_names",
+      "expect_result": {
+        "values": [
+          "_id_",
+          "email_1"
+        ]
+      }
+    },
+    {
+      "name": "drop_index",
+      "index_name": "email_1",
+      "expect_result": {
+        "ok": null
+      }
+    },
+    {
+      "name": "list_index_names",
+      "expect_result": {
+        "values": [
+          "_id_"
+        ]
+      }
+    }
+  ]
+}
