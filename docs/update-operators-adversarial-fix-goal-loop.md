@@ -66,10 +66,10 @@ The fix is complete only when:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Reproduce the gap with failing tests
-- [ ] Milestone 1: Implement document element predicate matching for `$pull`
-- [ ] Milestone 2: Harden unsupported-predicate and no-partial-write behavior
-- [ ] Milestone 3: Final docs, verification, and commit
+- [x] Milestone 0: Reproduce the gap with failing tests
+- [x] Milestone 1: Implement document element predicate matching for `$pull`
+- [x] Milestone 2: Harden unsupported-predicate and no-partial-write behavior
+- [x] Milestone 3: Final docs, verification, and commit
 
 ## Milestone 0: Reproduce The Gap
 
@@ -153,3 +153,44 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 Commit requirement:
 
 - Commit with a focused message such as `Fix pull document predicate matching`.
+
+## Completion Status
+
+Date: 2026-07-04
+
+Fix commit: `8d33df39be9bae85c9f0325ca38ac2927f728a3d` (`Fix pull document predicate matching`)
+
+Implemented:
+
+- `$pull` now applies the existing matcher subset when both the pull condition and array element are documents.
+- Existing scalar equality and top-level scalar operator `$pull` behavior is preserved.
+- Unsupported document predicates such as `$regex` return explicit write errors and leave the stored document unchanged.
+- Coverage was added for `update_one`, `update_many`, `find_one_and_update`, unsupported predicates, no-partial-write behavior, Rust unit coverage, and the local PyMongo spec corpus.
+
+Verification run:
+
+```bash
+cargo fmt -- --check
+cargo test update
+cargo test
+cargo build
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+```
+
+Results:
+
+- `cargo fmt -- --check`: passed.
+- `cargo test update`: passed, 20 passed.
+- `cargo test`: passed, 100 passed.
+- `cargo build`: passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`: passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`: passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py`: passed outside the sandbox, 10 passed.
+- `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`: passed outside the sandbox, 112 passed, 1 skipped.
+
+Sandbox limitation:
+
+- Running `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py` inside the sandbox failed before tests could execute server behavior because localhost port allocation is blocked: `PermissionError: [Errno 1] Operation not permitted` at `sock.bind(("127.0.0.1", 0))` in `tests/e2e/conftest.py:103`.
