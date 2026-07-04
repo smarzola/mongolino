@@ -415,6 +415,24 @@ planning inside aggregation pipelines, possible SQLite grouping for bounded
 scalar fields, and any future side-table design for array-heavy `$unwind` and
 `$group` workloads.
 
+## Aggregation v2 Benchmark Coverage
+
+Recorded on 2026-07-05 as part of the Aggregation v2 compatibility uplift.
+The CI benchmark profile now includes two additional aggregation sentinels:
+
+- `aggregation_expression_add_fields`: runs `$match`, computed `$addFields`,
+  arithmetic/string expressions, and computed projection over the seeded users
+  collection.
+- `aggregation_lookup_single_document`: narrows to one source document, then
+  performs a same-collection simple equality `$lookup` against same-team
+  documents.
+
+These benchmarks intentionally keep broad expression and lookup execution in
+Rust. The CI budgets are coarse regression guards for severe slowdowns; they do
+not imply lookup has SQLite pushdown or indexed join planning. Future
+performance work can consider lookup-side candidate narrowing with maintained
+indexes once compatibility semantics have stabilized.
+
 ## Scalar Multikey Index Uplift Results
 
 Recorded on 2026-07-04 after scalar multikey index entry maintenance and

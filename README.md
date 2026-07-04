@@ -57,7 +57,7 @@ Compatibility flags:
 | `drop` | Partial | Drops a collection by removing its documents, catalog entry, user index metadata, and maintained index entries. | No view, change-stream, or storage-stat side effects. |
 | `dropDatabase` | Partial | Drops catalog entries and documents for the selected database only. | No users, roles, profiling collections, or storage statistics. |
 | `count` | Partial | Counts documents matching the supported filter subset, with `skip` and `limit`; supports explicit command `hint` for safe exact/prefix/range index plans, `explain: true` diagnostics, and the supported collation subset. Runs deterministic namespace-scoped TTL sweeps before non-explain counts. PyMongo `estimated_document_count()` uses this path. | No read concern, maxTimeMS, or storage-stat semantics. PyMongo `count_documents()` uses aggregate and does not get command-level count hints. Non-simple collation range filters are rejected. |
-| `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$unwind`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`; supports bounded group keys and `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, and `$addToSet`; preserves the PyMongo `count_documents()` `$group` shape; supports the documented collation subset for `$match`, `$sort`, and `$count`; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`; runs deterministic namespace-scoped TTL sweeps before reading. | No general expression language, `$lookup`, `$facet`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$out`, `$merge`, `$geoNear`, window stages, allowDiskUse, hint, read concern, write concern, explain, maxTimeMS, or `let`. Unsupported shapes return command errors. Non-simple collation range filters are rejected. |
+| `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$unwind`, `$group`, `$sort`, `$skip`, `$limit`, computed and inclusion/exclusion `$project`, `$addFields`/`$set`, `$unset`, `$replaceRoot`, `$replaceWith`, simple same-database equality `$lookup`, and `$count`; supports a bounded expression subset (`$literal`, `$ifNull`, string conversion/case operators, comparisons, boolean operators, `$cond`, and numeric arithmetic); supports bounded group keys and `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, and `$addToSet` over supported expressions; preserves the PyMongo `count_documents()` `$group` shape; supports the documented collation subset for `$match`, `$sort`, `$count`, expression comparisons, and simple `$lookup`; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`; runs deterministic namespace-scoped TTL sweeps before reading. | No `$lookup` pipeline/`let` form, cross-database lookup, `$facet`, `$bucket`, `$sortByCount`, `$out`, `$merge`, `$geoNear`, `$redact`, window stages, server-side JavaScript, allowDiskUse, hint, read concern, write concern, explain, maxTimeMS, aggregate command `let`, broad ICU collation, or full expression/operator parity. Unsupported shapes return command errors. Non-simple collation range filters are rejected. |
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order or supported collation order; de-duplicates strings under the supported collation subset; runs deterministic namespace-scoped TTL sweeps before reading. | No hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. Non-simple collation range filters are rejected. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key and validation `writeErrors`, supports ordered/unordered batches, and honors `bypassDocumentValidation: true`. | No write concern, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$type`, `$size`, `$all`, `$elemMatch`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, supported collation, `hint`, `explain: true`, conservative exact/prefix/range index narrowing, sort-aware reads for unique fully covered bool/ObjectId/date scalar index keys, and deterministic namespace-scoped TTL sweeps before non-explain reads. | No `$where`, geospatial/text search, read concern, tailable cursors, text/geospatial/hashed/wildcard index planning, broad sort pushdown, or non-simple collation range filters. Unsupported operators and unsupported predicate shapes return command errors. |
@@ -157,13 +157,15 @@ is present; bypass does not disable `_id` immutability or unique indexes.
 
 Aggregation is a document-stream subset. Each supported stage runs in order over
 the current stream, so `$limit` before `$skip` is intentionally different from
-`$skip` before `$limit`. Unsupported stages and projection expressions return
-command errors instead of being ignored. `$unwind` supports field-path strings
-and document form with `path`, `preserveNullAndEmptyArrays`, and
-`includeArrayIndex`. `$group` supports `_id` values of `null`, scalar literals,
-field paths, and simple document key specs. Accumulator operands are field paths
-or scalar literals where documented by tests; object, array, and operator
-expressions remain unsupported.
+`$skip` before `$limit`. Unsupported stages and unsupported expression shapes
+return command errors instead of being ignored. `$unwind` supports field-path
+strings and document form with `path`, `preserveNullAndEmptyArrays`, and
+`includeArrayIndex`. `$group`, computed `$project`, `$addFields`/`$set`,
+`$replaceRoot`, and `$replaceWith` share the bounded expression evaluator
+documented in the command table. Simple `$lookup` supports only same-database
+`from`/`localField`/`foreignField`/`as` equality joins; missing local or foreign
+fields compare as `null`, local arrays match scalar foreign values by any
+element, and unsupported pipeline/`let` forms return explicit command errors.
 
 ## Development
 

@@ -360,6 +360,46 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "aggregation_expression_add_fields",
+        args.profile.iterations,
+        doc! {
+            "aggregate": COLL,
+            "pipeline": [
+                { "$match": { "team": "platform" } },
+                {
+                    "$addFields": {
+                        "summary": { "$concat": ["$email", ":", "$team"] },
+                        "scorePlusOne": { "$add": ["$score", 1_i32] },
+                    }
+                },
+                { "$project": { "_id": 1_i32, "summary": 1_i32, "scorePlusOne": 1_i32 } },
+            ],
+            "cursor": { "batchSize": 1000_i32 },
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
+        "aggregation_lookup_single_document",
+        args.profile.iterations,
+        doc! {
+            "aggregate": COLL,
+            "pipeline": [
+                { "$match": { "_id": format!("user-{}", args.profile.documents / 2) } },
+                {
+                    "$lookup": {
+                        "from": COLL,
+                        "localField": "team",
+                        "foreignField": "team",
+                        "as": "sameTeam",
+                    }
+                },
+                { "$project": { "_id": 1_i32, "sameTeam": 1_i32 } },
+            ],
+            "cursor": { "batchSize": 1000_i32 },
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "aggregation_unwind_group",
         args.profile.iterations,
         doc! {
@@ -1136,6 +1176,8 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "update_partial_unique_check" => (80.0, 12.0),
         "update_multikey_target" => (80.0, 12.0),
         "aggregation_match_count" => (350.0, 3.0),
+        "aggregation_expression_add_fields" => (600.0, 1.5),
+        "aggregation_lookup_single_document" => (600.0, 1.5),
         "aggregation_unwind_group" => (600.0, 1.5),
         "find_compound_equality" => (80.0, 12.0),
         "find_multikey_scalar_equality" => (80.0, 12.0),

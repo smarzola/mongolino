@@ -211,7 +211,7 @@ def execute_operation(operation, collection):
             kwargs["batchSize"] = operation["batch_size"]
         if "collation" in operation:
             kwargs["collation"] = operation["collation"]
-        return list(collection.aggregate(operation["pipeline"], **kwargs))
+        return list(collection.aggregate(_expand_collection_placeholder(operation["pipeline"], collection.name), **kwargs))
     if name == "count_documents":
         kwargs = {}
         if "skip" in operation:

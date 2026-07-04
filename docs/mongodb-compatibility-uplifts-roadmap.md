@@ -27,8 +27,9 @@ intentionally conservative:
   ICU collation, numeric ordering, diacritic folding, locale-specific ordering,
   non-simple range predicates, and unsafe collation/index combinations remain
   unsupported.
-- Aggregation has no general expression language, `$addFields`, `$lookup`, or
-  broader stage coverage.
+- Aggregation now has a bounded expression language, computed shaping stages,
+  root replacement, computed group operands, and simple same-database equality
+  `$lookup`; advanced stages and full expression parity remain unsupported.
 - Update pipelines, positional operators, and `arrayFilters` are unsupported.
 - Sessions/retryable write/readConcern/writeConcern behavior is only minimally
   accepted or explicitly rejected.
@@ -43,11 +44,11 @@ claim of full MongoDB parity.
 | Query predicate compatibility | 20% | 18% | 18% |
 | Index planning and diagnostics | 15% | 15% | 15% |
 | Index lifecycle/TTL/collation behavior | 15% | 13% | 13% |
-| Aggregation compatibility | 20% | 10% | 15% |
+| Aggregation compatibility | 20% | 15% | 15% |
 | Update language compatibility | 15% | 8% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 72% | 86% |
+| Total | 100% | 77% | 86% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -87,9 +88,15 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt: `docs/collation-compatibility-goal-loop.md`.
 
 5. Aggregation v2
-   - Add expression evaluation, `$addFields`/`$set`, broader `$project`, and a
-     simple `$lookup` subset.
-   - Prompt to write after Collation: `docs/aggregation-v2-goal-loop.md`.
+   - Complete in uplift 5. Added a bounded aggregation expression evaluator,
+     computed `$project`, `$addFields`/`$set`, `$unset`, `$replaceRoot`,
+     `$replaceWith`, computed group operands, and simple same-database equality
+     `$lookup`.
+   - Unsupported `$lookup` pipeline/`let`, cross-database lookup, broad ICU
+     collation, full expression parity, `$facet`, `$bucket`, `$out`, `$merge`,
+     `$geoNear`, window stages, command `let`, allowDiskUse, hint, explain,
+     read concern, and write concern remain explicit command errors.
+   - Prompt: `docs/aggregation-v2-goal-loop.md`.
 
 6. Update Pipeline And Array Filters
    - Add update pipelines, positional `$`, `$[]`, `$[id]`, and `arrayFilters`

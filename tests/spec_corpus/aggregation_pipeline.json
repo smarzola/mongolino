@@ -6,6 +6,9 @@
     {
       "_id": "s1",
       "active": true,
+      "first": "Ada",
+      "last": "Lovelace",
+      "owner": "ADA",
       "score": 7,
       "setDoc": {
         "nested": [
@@ -24,6 +27,9 @@
     {
       "_id": "s2",
       "active": false,
+      "first": "Grace",
+      "last": "Hopper",
+      "owner": "grace",
       "score": 5,
       "setDoc": {
         "nested": [
@@ -39,6 +45,9 @@
     {
       "_id": "s3",
       "active": true,
+      "first": "Katherine",
+      "last": "Johnson",
+      "owner": "katherine",
       "score": 11,
       "setDoc": {
         "nested": [
@@ -162,6 +171,118 @@
       ]
     },
     {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "_id": "s1"
+          }
+        },
+        {
+          "$project": {
+            "_id": 0,
+            "display": {
+              "$concat": [
+                "$first",
+                " ",
+                "$last"
+              ]
+            },
+            "nested": {
+              "team": "$team",
+              "scoreText": {
+                "$toString": "$score"
+              }
+            }
+          }
+        },
+        {
+          "$addFields": {
+            "nested.lower": {
+              "$toLower": "$display"
+            }
+          }
+        },
+        {
+          "$set": {
+            "total": {
+              "$add": [
+                4,
+                6
+              ]
+            }
+          }
+        },
+        {
+          "$unset": "nested.scoreText"
+        }
+      ],
+      "expect_documents": [
+        {
+          "display": "Ada Lovelace",
+          "nested": {
+            "lower": "ada lovelace",
+            "team": "red"
+          },
+          "total": 10
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "_id": "s2"
+          }
+        },
+        {
+          "$replaceRoot": {
+            "newRoot": {
+              "id": "$_id",
+              "label": {
+                "$concat": [
+                  "$first",
+                  ":",
+                  "$team"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "id": "s2",
+          "label": "Grace:blue"
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "_id": "s3"
+          }
+        },
+        {
+          "$replaceWith": {
+            "id": "$_id",
+            "upperOwner": {
+              "$toUpper": "$owner"
+            }
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "id": "s3",
+          "upperOwner": "KATHERINE"
+        }
+      ]
+    },
+    {
       "name": "create_index",
       "keys": {
         "team": 1
@@ -186,6 +307,106 @@
       "expect_documents": [
         {
           "total": 2
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$group": {
+            "_id": {
+              "team": "$team",
+              "active": "$active"
+            },
+            "labels": {
+              "$push": {
+                "$concat": [
+                  "$first",
+                  ":",
+                  "$team"
+                ]
+              }
+            },
+            "scorePlusOne": {
+              "$sum": {
+                "$add": [
+                  "$score",
+                  1
+                ]
+              }
+            }
+          }
+        },
+        {
+          "$sort": {
+            "scorePlusOne": -1
+          }
+        },
+        {
+          "$limit": 1
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": {
+            "active": true,
+            "team": "red"
+          },
+          "labels": [
+            "Ada:red",
+            "Katherine:red"
+          ],
+          "scorePlusOne": 20
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$lookup": {
+            "from": "$$collection",
+            "localField": "team",
+            "foreignField": "team",
+            "as": "peers"
+          }
+        },
+        {
+          "$match": {
+            "_id": "s2"
+          }
+        },
+        {
+          "$project": {
+            "_id": 1,
+            "peers": 1
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "s2",
+          "peers": [
+            {
+              "_id": "s2",
+              "active": false,
+              "first": "Grace",
+              "last": "Hopper",
+              "owner": "grace",
+              "score": 5,
+              "setDoc": {
+                "nested": [
+                  1,
+                  2
+                ],
+                "shape": "same"
+              },
+              "setNumber": 1.0,
+              "setValue": 1,
+              "team": "blue"
+            }
+          ]
         }
       ]
     },
@@ -248,8 +469,8 @@
       ],
       "expect_error": {
         "type": "OperationFailure",
-        "code": 72,
-        "contains": "$lookup"
+        "code": 9,
+        "contains": "localField"
       }
     },
     {
@@ -372,8 +593,8 @@
       ],
       "expect_error": {
         "type": "OperationFailure",
-        "code": 72,
-        "contains": "$group"
+        "code": 9,
+        "contains": "$add"
       }
     },
     {
