@@ -1218,7 +1218,7 @@ fn aggregate_command_with_state(
             false,
         ));
     }
-    let documents = match aggregate_pipeline_documents(conn, &ns, pipeline, &collation)? {
+    let documents = match aggregate_pipeline_documents(conn, db, &ns, pipeline, &collation)? {
         Ok(documents) => documents,
         Err(response) => return Ok(response),
     };
@@ -1321,6 +1321,7 @@ fn parse_match_count_pipeline<'a>(pipeline: &'a [Bson]) -> Option<(&'a Document,
 
 fn aggregate_pipeline_documents(
     conn: &Connection,
+    db: &str,
     namespace: &str,
     pipeline: &[Bson],
     collation: &Collation,
@@ -1443,6 +1444,17 @@ fn aggregate_pipeline_documents(
                 }
                 documents = replaced;
             }
+            "$lookup" => {
+                let lookup = match parse_aggregate_lookup_stage(operand) {
+                    Ok(lookup) => lookup,
+                    Err(response) => return Ok(Err(response)),
+                };
+                documents =
+                    match apply_aggregate_lookup_stage(conn, db, documents, &lookup, collation)? {
+                        Ok(documents) => documents,
+                        Err(response) => return Ok(Err(response)),
+                    };
+            }
             "$count" => {
                 let Bson::String(field) = operand else {
                     return Ok(Err(command_error(
@@ -1553,10 +1565,7 @@ fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(
                 parse_aggregate_replace_root_stage(operator, operand)?;
             }
             "$lookup" => {
-                return Err(command_error(
-                    72,
-                    &format!("aggregate stage {operator} is not supported"),
-                ));
+                parse_aggregate_lookup_stage(operand)?;
             }
             "$count" => {
                 let Bson::String(field) = operand else {
@@ -1635,6 +1644,14 @@ struct AggregateUnsetSpec {
 #[derive(Clone, Debug, PartialEq)]
 struct AggregateReplaceRootSpec {
     expression: AggregationExpression,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateLookupSpec {
+    from: String,
+    local_field: String,
+    foreign_field: String,
+    as_field: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1909,6 +1926,146 @@ fn apply_aggregate_replace_root_stage(
             "$replaceRoot/$replaceWith expression must evaluate to a document",
         )),
     }
+}
+
+fn parse_aggregate_lookup_stage(
+    value: &Bson,
+) -> std::result::Result<AggregateLookupSpec, Document> {
+    let Bson::Document(spec) = value else {
+        return Err(command_error(9, "$lookup requires a document"));
+    };
+    for key in spec.keys() {
+        if !matches!(key.as_str(), "from" | "localField" | "foreignField" | "as") {
+            let code = if matches!(key.as_str(), "pipeline" | "let") {
+                72
+            } else {
+                72
+            };
+            return Err(command_error(
+                code,
+                &format!("$lookup option {key} is not supported"),
+            ));
+        }
+    }
+    let from = required_lookup_string(spec, "from")?;
+    validate_lookup_collection_name(&from)?;
+    let local_field = required_lookup_string(spec, "localField")?;
+    validate_aggregation_path(&local_field, "$lookup localField", true)?;
+    let foreign_field = required_lookup_string(spec, "foreignField")?;
+    validate_aggregation_path(&foreign_field, "$lookup foreignField", true)?;
+    let as_field = required_lookup_string(spec, "as")?;
+    validate_aggregation_output_path(&as_field, "$lookup as")?;
+    reject_path_collisions(std::slice::from_ref(&as_field), "$lookup")
+        .map_err(|errmsg| command_error(9, &errmsg))?;
+
+    Ok(AggregateLookupSpec {
+        from,
+        local_field,
+        foreign_field,
+        as_field,
+    })
+}
+
+fn required_lookup_string(spec: &Document, key: &str) -> std::result::Result<String, Document> {
+    match spec.get(key) {
+        Some(Bson::String(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(Bson::String(_)) => Err(command_error(
+            9,
+            &format!("$lookup {key} must not be empty"),
+        )),
+        Some(_) => Err(command_error(9, &format!("$lookup {key} must be a string"))),
+        None => Err(command_error(9, &format!("$lookup requires {key}"))),
+    }
+}
+
+fn validate_lookup_collection_name(collection: &str) -> std::result::Result<(), Document> {
+    if collection.contains('.') {
+        return Err(command_error(
+            72,
+            "$lookup cross-database namespaces are not supported",
+        ));
+    }
+    if collection.starts_with('$') || collection.contains('\0') {
+        return Err(command_error(9, "$lookup from must be a collection name"));
+    }
+    Ok(())
+}
+
+fn apply_aggregate_lookup_stage(
+    conn: &Connection,
+    db: &str,
+    documents: Vec<Document>,
+    spec: &AggregateLookupSpec,
+    collation: &Collation,
+) -> Result<std::result::Result<Vec<Document>, Document>> {
+    let foreign_namespace = namespace(db, &spec.from);
+    let foreign_documents = documents_for_namespace(conn, &foreign_namespace)?;
+    let mut out = Vec::with_capacity(documents.len());
+
+    for mut document in documents {
+        if lookup_as_path_collides(&document, &spec.as_field) {
+            return Ok(Err(command_error(
+                9,
+                "$lookup as path collides with an existing non-document field",
+            )));
+        }
+        let local_values = lookup_values_at_path(&document, &spec.local_field);
+        let mut matches = Vec::new();
+        for foreign in &foreign_documents {
+            let foreign_values = lookup_values_at_path(foreign, &spec.foreign_field);
+            if lookup_values_match(&local_values, &foreign_values, collation) {
+                matches.push(Bson::Document(foreign.clone()));
+            }
+        }
+        set_document_path(&mut document, &spec.as_field, Bson::Array(matches));
+        out.push(document);
+    }
+
+    Ok(Ok(out))
+}
+
+fn lookup_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
+    let values = values_at_path(document, path);
+    if values.is_empty() {
+        return vec![Bson::Null];
+    }
+    values
+        .into_iter()
+        .flat_map(|value| match value {
+            Bson::Array(values) => {
+                if values.is_empty() {
+                    vec![Bson::Null]
+                } else {
+                    values.clone()
+                }
+            }
+            value => vec![value.clone()],
+        })
+        .collect()
+}
+
+fn lookup_values_match(local: &[Bson], foreign: &[Bson], collation: &Collation) -> bool {
+    local.iter().any(|local| {
+        foreign
+            .iter()
+            .any(|foreign| collation.values_equal(local, foreign))
+    })
+}
+
+fn lookup_as_path_collides(document: &Document, path: &str) -> bool {
+    let mut parts = path.split('.').peekable();
+    let mut current = document;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return false;
+        }
+        match current.get(part) {
+            None => return false,
+            Some(Bson::Document(next)) => current = next,
+            Some(_) => return true,
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14598,6 +14755,234 @@ mod tests {
             )
             .unwrap();
             assert_command_error(&response);
+        }
+    }
+
+    #[test]
+    fn aggregate_lookup_supports_simple_equality_arrays_null_collation_and_cursor() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "orders",
+                "$db": "app",
+                "documents": [
+                    { "_id": "o1", "profileId": "p1", "profileIds": ["p2", "missing"], "owner": "ADA" },
+                    { "_id": "o2", "profileId": Bson::Null, "owner": "grace" },
+                    { "_id": "o3", "owner": "missing" },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "profiles",
+                "$db": "app",
+                "documents": [
+                    { "_id": "p1", "name": "Ada", "owner": "ada" },
+                    { "_id": "p2", "name": "Grace", "owner": "GRACE" },
+                    { "_id": "p3", "name": "Nullish", "profileId": Bson::Null },
+                    { "_id": "p4", "name": "MissingForeign" },
+                ],
+            },
+        )
+        .unwrap();
+        let mut client_state = ClientState::default();
+
+        let joined = aggregate_command_with_state(
+            &conn,
+            &mut client_state,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "profiles",
+                            "localField": "profileId",
+                            "foreignField": "_id",
+                            "as": "profile",
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "profiles",
+                            "localField": "profileIds",
+                            "foreignField": "_id",
+                            "as": "arrayMatches",
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "profiles",
+                            "localField": "profileId",
+                            "foreignField": "profileId",
+                            "as": "nullMatches",
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32, "profile": 1_i32, "arrayMatches": 1_i32, "nullMatches": 1_i32 } },
+                ],
+                "cursor": { "batchSize": 2_i32 },
+            },
+        )
+        .unwrap();
+
+        let id = cursor_id(&joined);
+        assert!(id > 0);
+        assert_eq!(
+            first_batch(&joined),
+            vec![
+                doc! { "_id": "o1", "profile": [{ "_id": "p1", "name": "Ada", "owner": "ada" }], "arrayMatches": [{ "_id": "p2", "name": "Grace", "owner": "GRACE" }], "nullMatches": [] },
+                doc! { "_id": "o2", "profile": [], "arrayMatches": [], "nullMatches": [
+                    { "_id": "p1", "name": "Ada", "owner": "ada" },
+                    { "_id": "p2", "name": "Grace", "owner": "GRACE" },
+                    { "_id": "p3", "name": "Nullish", "profileId": Bson::Null },
+                    { "_id": "p4", "name": "MissingForeign" },
+                ] },
+            ]
+        );
+        let next = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "orders", "$db": "app", "batchSize": 2_i32 },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&next), 0);
+        assert_eq!(
+            next_batch(&next),
+            vec![
+                doc! { "_id": "o3", "profile": [], "arrayMatches": [], "nullMatches": [
+                    { "_id": "p1", "name": "Ada", "owner": "ada" },
+                    { "_id": "p2", "name": "Grace", "owner": "GRACE" },
+                    { "_id": "p3", "name": "Nullish", "profileId": Bson::Null },
+                    { "_id": "p4", "name": "MissingForeign" },
+                ] }
+            ]
+        );
+
+        let collation = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "profiles",
+                            "localField": "owner",
+                            "foreignField": "owner",
+                            "as": "owners",
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32, "owners": 1_i32 } },
+                ],
+                "collation": { "locale": "en", "strength": 2_i32 },
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&collation),
+            vec![
+                doc! { "_id": "o1", "owners": [{ "_id": "p1", "name": "Ada", "owner": "ada" }] },
+                doc! { "_id": "o2", "owners": [{ "_id": "p2", "name": "Grace", "owner": "GRACE" }] },
+                doc! { "_id": "o3", "owners": [] },
+            ]
+        );
+
+        let self_lookup = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "orders",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "o1" } },
+                    {
+                        "$lookup": {
+                            "from": "orders",
+                            "localField": "_id",
+                            "foreignField": "_id",
+                            "as": "self",
+                        }
+                    },
+                    { "$project": { "_id": 1_i32, "self": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&self_lookup),
+            vec![
+                doc! { "_id": "o1", "self": [{ "_id": "o1", "profileId": "p1", "profileIds": ["p2", "missing"], "owner": "ADA" }] }
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_lookup_rejects_malformed_and_unsupported_forms_before_ttl() {
+        let conn = test_conn();
+        seed_ttl_command_fixture(&conn, "bad_lookup");
+
+        for pipeline in [
+            vec![Bson::Document(doc! { "$lookup": "bad" })],
+            vec![Bson::Document(doc! { "$lookup": { "from": "profiles" } })],
+            vec![Bson::Document(doc! {
+                "$lookup": {
+                    "from": "other.profiles",
+                    "localField": "profileId",
+                    "foreignField": "_id",
+                    "as": "profile",
+                }
+            })],
+            vec![Bson::Document(doc! {
+                "$lookup": {
+                    "from": "profiles",
+                    "localField": "profileId",
+                    "foreignField": "_id",
+                    "as": "profile",
+                    "pipeline": [],
+                }
+            })],
+            vec![Bson::Document(doc! {
+                "$lookup": {
+                    "from": "profiles",
+                    "localField": "profileId",
+                    "foreignField": "_id",
+                    "as": "profile",
+                    "let": {},
+                }
+            })],
+            vec![Bson::Document(doc! {
+                "$lookup": {
+                    "from": "profiles",
+                    "localField": "profile..id",
+                    "foreignField": "_id",
+                    "as": "profile",
+                }
+            })],
+            vec![Bson::Document(doc! {
+                "$lookup": {
+                    "from": "profiles",
+                    "localField": "profileId",
+                    "foreignField": "_id",
+                    "as": "$profile",
+                }
+            })],
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "bad_lookup",
+                    "$db": "app",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_invalid_ttl_read_preserves_expired(&conn, "bad_lookup", response);
         }
     }
 

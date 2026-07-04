@@ -205,6 +205,139 @@ def test_aggregate_replace_root_replace_with_and_group_computed_operands(collect
     ]
 
 
+def test_aggregate_lookup_simple_equality_arrays_null_collation_self_and_cursor(collection):
+    collection.insert_many(
+        [
+            {"_id": "o1", "profileId": "p1", "profileIds": ["p2", "missing"], "owner": "ADA"},
+            {"_id": "o2", "profileId": None, "owner": "grace"},
+            {"_id": "o3", "owner": "missing"},
+        ]
+    )
+    profiles = collection.database[f"{collection.name}_profiles"]
+    profiles.insert_many(
+        [
+            {"_id": "p1", "name": "Ada", "owner": "ada"},
+            {"_id": "p2", "name": "Grace", "owner": "GRACE"},
+            {"_id": "p3", "name": "Nullish", "profileId": None},
+            {"_id": "p4", "name": "MissingForeign"},
+        ]
+    )
+
+    cursor = collection.aggregate(
+        [
+            {
+                "$lookup": {
+                    "from": profiles.name,
+                    "localField": "profileId",
+                    "foreignField": "_id",
+                    "as": "profile",
+                }
+            },
+            {
+                "$lookup": {
+                    "from": profiles.name,
+                    "localField": "profileIds",
+                    "foreignField": "_id",
+                    "as": "arrayMatches",
+                }
+            },
+            {
+                "$lookup": {
+                    "from": profiles.name,
+                    "localField": "profileId",
+                    "foreignField": "profileId",
+                    "as": "nullMatches",
+                }
+            },
+            {"$sort": {"_id": 1}},
+            {"$project": {"_id": 1, "profile": 1, "arrayMatches": 1, "nullMatches": 1}},
+        ],
+        batchSize=2,
+    )
+
+    assert list(cursor) == [
+        {
+            "_id": "o1",
+            "profile": [{"_id": "p1", "name": "Ada", "owner": "ada"}],
+            "arrayMatches": [{"_id": "p2", "name": "Grace", "owner": "GRACE"}],
+            "nullMatches": [],
+        },
+        {
+            "_id": "o2",
+            "profile": [],
+            "arrayMatches": [],
+            "nullMatches": [
+                {"_id": "p1", "name": "Ada", "owner": "ada"},
+                {"_id": "p2", "name": "Grace", "owner": "GRACE"},
+                {"_id": "p3", "name": "Nullish", "profileId": None},
+                {"_id": "p4", "name": "MissingForeign"},
+            ],
+        },
+        {
+            "_id": "o3",
+            "profile": [],
+            "arrayMatches": [],
+            "nullMatches": [
+                {"_id": "p1", "name": "Ada", "owner": "ada"},
+                {"_id": "p2", "name": "Grace", "owner": "GRACE"},
+                {"_id": "p3", "name": "Nullish", "profileId": None},
+                {"_id": "p4", "name": "MissingForeign"},
+            ],
+        },
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "owner",
+                        "foreignField": "owner",
+                        "as": "owners",
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {"$project": {"_id": 1, "owners": 1}},
+            ],
+            collation={"locale": "en", "strength": 2},
+        )
+    ) == [
+        {"_id": "o1", "owners": [{"_id": "p1", "name": "Ada", "owner": "ada"}]},
+        {"_id": "o2", "owners": [{"_id": "p2", "name": "Grace", "owner": "GRACE"}]},
+        {"_id": "o3", "owners": []},
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "o1"}},
+                {
+                    "$lookup": {
+                        "from": collection.name,
+                        "localField": "_id",
+                        "foreignField": "_id",
+                        "as": "self",
+                    }
+                },
+                {"$project": {"_id": 1, "self": 1}},
+            ]
+        )
+    ) == [
+        {
+            "_id": "o1",
+            "self": [
+                {
+                    "_id": "o1",
+                    "profileId": "p1",
+                    "profileIds": ["p2", "missing"],
+                    "owner": "ADA",
+                }
+            ],
+        }
+    ]
+
+
 def test_aggregate_match_sort_and_count_with_collation(collection):
     collection.insert_many(
         [
@@ -679,8 +812,8 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
     seed_scores(collection)
 
     with pytest.raises(OperationFailure) as excinfo:
-        list(collection.aggregate([{"$lookup": {"from": "other"}}]))
-    assert "$lookup" in str(excinfo.value)
+        list(collection.aggregate([{"$facet": {"scores": [{"$match": {}}]}}]))
+    assert "$facet" in str(excinfo.value)
 
     for group in [
         {"_id": 1, "n": {"$sum": 1, "extra": 1}},
@@ -718,6 +851,85 @@ def test_aggregate_replace_root_rejects_malformed_and_non_document_results(colle
         ([{"$replaceWith": {"$dateDiff": {}}}], "$dateDiff"),
         ([{"$replaceRoot": {"newRoot": "$missing"}}], "document"),
         ([{"$replaceWith": "$score"}], "document"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
+
+
+def test_aggregate_lookup_rejects_malformed_and_unsupported_forms(collection):
+    seed_scores(collection)
+
+    for pipeline, contains in [
+        ([{"$lookup": "bad"}], "$lookup"),
+        ([{"$lookup": {"from": "profiles"}}], "localField"),
+        (
+            [
+                {
+                    "$lookup": {
+                        "from": "other.profiles",
+                        "localField": "profileId",
+                        "foreignField": "_id",
+                        "as": "profile",
+                    }
+                }
+            ],
+            "cross-database",
+        ),
+        (
+            [
+                {
+                    "$lookup": {
+                        "from": "profiles",
+                        "localField": "profileId",
+                        "foreignField": "_id",
+                        "as": "profile",
+                        "pipeline": [],
+                    }
+                }
+            ],
+            "pipeline",
+        ),
+        (
+            [
+                {
+                    "$lookup": {
+                        "from": "profiles",
+                        "localField": "profileId",
+                        "foreignField": "_id",
+                        "as": "profile",
+                        "let": {},
+                    }
+                }
+            ],
+            "let",
+        ),
+        (
+            [
+                {
+                    "$lookup": {
+                        "from": "profiles",
+                        "localField": "profile..id",
+                        "foreignField": "_id",
+                        "as": "profile",
+                    }
+                }
+            ],
+            "empty segment",
+        ),
+        (
+            [
+                {
+                    "$lookup": {
+                        "from": "profiles",
+                        "localField": "profileId",
+                        "foreignField": "_id",
+                        "as": "$profile",
+                    }
+                }
+            ],
+            "$",
+        ),
     ]:
         with pytest.raises(OperationFailure) as excinfo:
             list(collection.aggregate(pipeline))
