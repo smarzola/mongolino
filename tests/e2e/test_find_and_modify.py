@@ -94,6 +94,24 @@ def test_find_one_and_update_upsert_returns_inserted_document(collection):
     assert result["value"] == 1
 
 
+def test_find_and_modify_rejects_ambiguous_command_aliases_before_mutation(collection):
+    seed_jobs(collection)
+
+    with pytest.raises(OperationFailure) as excinfo:
+        collection.database.command(
+            {
+                "findAndModify": collection.name,
+                "findandmodify": collection.name,
+                "query": {"_id": "j1"},
+                "update": {"$set": {"state": "mutated"}},
+                "new": True,
+            }
+        )
+
+    assert "both command aliases" in str(excinfo.value)
+    assert collection.find_one({"_id": "j1"})["state"] == "queued"
+
+
 def test_find_and_modify_adversarial_errors_are_explicit(collection):
     seed_jobs(collection)
 

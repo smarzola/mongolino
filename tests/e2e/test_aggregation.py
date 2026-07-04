@@ -81,6 +81,16 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
         list(collection.aggregate([{"$group": {"_id": "$team", "n": {"$sum": 1}}}]))
     assert "count_documents group shape" in str(excinfo.value)
 
+    for group in [
+        {"_id": 1, "n": {"$sum": 1}, "extra": {"$sum": 1}},
+        {"_id": 1, "n": {"$sum": 1, "extra": 1}},
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            collection.database.command(
+                {"aggregate": collection.name, "pipeline": [{"$group": group}], "cursor": {}}
+            )
+        assert "count_documents group shape" in str(excinfo.value)
+
 
 def test_aggregate_batch_size_iterates_with_get_more(collection):
     seed_scores(collection)

@@ -67,7 +67,26 @@ When the milestone is complete:
 4. Commit the code, tests, docs, and status-note update with a focused commit message.
 5. Report the commit hash in the final response.
 
-- [ ] Milestone 1: Reject ambiguous command aliases and exact-match count `$group`
+- [x] Milestone 1: Reject ambiguous command aliases and exact-match count `$group`
+
+Status note 2026-07-04:
+
+- Implemented explicit rejection for `findAndModify` commands containing both `findAndModify` and `findandmodify` aliases before storage mutation.
+- Tightened PyMongo `count_documents()` `$group` support to exactly `{ "_id": 1, "n": { "$sum": 1 } }`.
+- Added Rust and PyMongo/direct-command adversarial coverage for ambiguous aliases, extra `$group` fields, and extra accumulator fields.
+- Verification commands run:
+  - `cargo fmt`
+  - `cargo fmt -- --check` passed
+  - `cargo test find_and_modify` passed
+  - `cargo test aggregate` passed
+  - `cargo test` passed, 79 passed
+  - `cargo build` passed
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` passed
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` passed
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_find_and_modify.py tests/e2e/test_aggregation.py` failed in sandbox with `PermissionError: [Errno 1] Operation not permitted` on `127.0.0.1` bind
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_find_and_modify.py tests/e2e/test_aggregation.py` passed unsandboxed, 13 passed
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` passed unsandboxed, 89 passed, 1 skipped
+- Commit: created after this status note; final hash reported in handoff.
 
 ## Milestone 1: Reject Ambiguous Command Aliases and Exact-Match Count `$group`
 

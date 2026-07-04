@@ -1017,6 +1017,13 @@ fn aggregate_pipeline_documents(
 }
 
 fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> Result<Document> {
+    if command.contains_key("findAndModify") && command.contains_key("findandmodify") {
+        return Ok(command_error(
+            9,
+            "findAndModify command cannot include both command aliases",
+        ));
+    }
+
     let db = command.get_str("$db").unwrap_or("test");
     let collection = match command.get_str(command_key) {
         Ok(collection) if !collection.is_empty() => collection,
@@ -1322,10 +1329,13 @@ fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result
 }
 
 fn is_count_documents_group(group: &Document) -> bool {
-    matches!(group.get("_id"), Some(Bson::Int32(1) | Bson::Int64(1)))
+    group.len() == 2
+        && matches!(group.get("_id"), Some(Bson::Int32(1) | Bson::Int64(1)))
         && matches!(
             group.get("n"),
-            Some(Bson::Document(sum)) if matches!(sum.get("$sum"), Some(Bson::Int32(1) | Bson::Int64(1)))
+            Some(Bson::Document(sum))
+                if sum.len() == 1
+                    && matches!(sum.get("$sum"), Some(Bson::Int32(1) | Bson::Int64(1)))
         )
 }
 
@@ -4668,6 +4678,12 @@ mod tests {
             vec![Bson::Document(
                 doc! { "$group": { "_id": "$state", "n": { "$sum": 1_i32 } } },
             )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32 }, "extra": { "$sum": 1_i32 } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32, "extra": 1_i32 } } },
+            )],
         ] {
             let response = aggregate_command(
                 &conn,
@@ -5306,6 +5322,38 @@ mod tests {
             let response = handle_command(&conn, &command).unwrap();
             assert_command_error(&response);
         }
+    }
+
+    #[test]
+    fn find_and_modify_rejects_ambiguous_command_aliases_before_mutation() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = handle_command(
+            &conn,
+            &doc! {
+                "findAndModify": "users",
+                "findandmodify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": "Mutated" } },
+                "new": true,
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert!(
+            response
+                .get_str("errmsg")
+                .unwrap()
+                .contains("both command aliases")
+        );
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada" }), vec!["u1"]);
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Mutated" }),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
