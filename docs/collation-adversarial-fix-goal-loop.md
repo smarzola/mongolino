@@ -94,7 +94,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before continuing.
 
 - [x] Milestone 0: Fix collation-aware compound prefix key construction
-- [ ] Milestone 1: PyMongo coverage and full verification
+- [x] Milestone 1: PyMongo coverage and full verification
 
 ## Status Notes
 
@@ -107,6 +107,22 @@ When a milestone is complete:
   `cargo fmt -- --check`; `cargo test collation`; `cargo test
   compound_prefix`; `cargo test hint`; `cargo test update`; `cargo test
   delete`; `cargo test find_and_modify`.
+- 2026-07-04: Milestone 1 PyMongo coverage complete in commit
+  `7eeee13fbe76c4cad47948293e6f50a8d88376cf`. Added driver coverage for
+  case-insensitive compound-prefix index metadata, hinted find, PyMongo
+  `count_documents`, hinted `count`, hinted update/delete target selection,
+  findOneAndUpdate target selection, and incompatible simple-collation hint
+  no-mutation behavior. Sandbox PyMongo e2e was blocked by
+  `socket.bind(("127.0.0.1", 0))` with `PermissionError: [Errno 1] Operation
+  not permitted`; reran outside the sandbox. Full verification passed with
+  these commands:
+  - `cargo fmt -- --check`
+  - `cargo test`
+  - `cargo build`
+  - `cargo run --bin mongolino-bench -- --profile ci --check-budget`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` with 198 passed
 
 ## Milestone 0: Fix Collation-Aware Compound Prefix Key Construction
 
