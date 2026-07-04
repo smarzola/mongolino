@@ -5,22 +5,34 @@
   "setup": [
     {
       "_id": "u1",
-      "group": "a"
+      "group": "a",
+      "kind": "indexed"
     },
     {
       "_id": "u2",
-      "group": "a"
+      "group": "a",
+      "kind": "indexed"
     },
     {
       "_id": "u3",
-      "group": "b"
+      "group": "b",
+      "kind": "fallback"
     }
   ],
   "operations": [
     {
+      "name": "create_index",
+      "keys": {
+        "kind": 1
+      },
+      "index_name": "kind_1"
+    },
+    {
       "name": "delete_one",
       "filter": {
-        "group": "a"
+        "_id": {
+          "$eq": "u1"
+        }
       },
       "expect_result": {
         "deleted_count": 1
@@ -29,17 +41,28 @@
     {
       "name": "delete_many",
       "filter": {
-        "group": "b"
+        "kind": "fallback"
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    },
+    {
+      "name": "delete_one",
+      "filter": {
+        "$or": [
+          {
+            "group": "missing"
+          },
+          {
+            "kind": "indexed"
+          }
+        ]
       },
       "expect_result": {
         "deleted_count": 1
       }
     }
   ],
-  "expect_final_documents": [
-    {
-      "_id": "u2",
-      "group": "a"
-    }
-  ]
+  "expect_final_documents": []
 }

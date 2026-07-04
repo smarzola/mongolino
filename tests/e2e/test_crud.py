@@ -203,6 +203,40 @@ def test_update_many_inc(collection):
     assert collection.find_one({"_id": "u3"})["score"] == 2
 
 
+def test_update_targets_id_indexed_scalar_and_fallback_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING)], name="city_1")
+    collection.create_index([("active", ASCENDING)], name="active_1")
+
+    by_id = collection.update_one({"_id": {"$eq": "u2"}}, {"$set": {"name": "Grace Hopper"}})
+    assert by_id.matched_count == 1
+    assert by_id.modified_count == 1
+
+    by_index = collection.update_one(
+        {"profile.city": "Rome"},
+        {"$set": {"team": "math"}},
+    )
+    assert by_index.matched_count == 1
+    assert by_index.modified_count == 1
+
+    many_by_index = collection.update_many({"active": True}, {"$inc": {"score": 1}})
+    assert many_by_index.matched_count == 2
+    assert many_by_index.modified_count == 2
+
+    fallback = collection.update_one(
+        {"$or": [{"name": "Nobody"}, {"age": 41}]},
+        {"$set": {"team": "fallback"}},
+    )
+    assert fallback.matched_count == 1
+    assert fallback.modified_count == 1
+
+    assert collection.find_one({"_id": "u2"})["name"] == "Grace Hopper"
+    assert collection.find_one({"_id": "u1"})["team"] == "math"
+    assert collection.find_one({"_id": "u1"})["score"] == 8
+    assert collection.find_one({"_id": "u3"})["team"] == "fallback"
+    assert collection.find_one({"_id": "u3"})["score"] == 1
+
+
 def test_replacement_update_and_upsert(collection):
     seed_users(collection)
 
@@ -254,6 +288,22 @@ def test_delete_one_many_and_repeated_noop(collection):
 
     missing = collection.delete_one({"_id": "u1"})
     assert missing.deleted_count == 0
+
+
+def test_delete_targets_id_indexed_scalar_and_fallback_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING)], name="city_1")
+    collection.create_index([("active", ASCENDING)], name="active_1")
+
+    by_id = collection.delete_one({"_id": {"$eq": "u2"}})
+    assert by_id.deleted_count == 1
+
+    by_index = collection.delete_one({"profile.city": "Rome"})
+    assert by_index.deleted_count == 1
+
+    fallback = collection.delete_many({"$or": [{"name": "Nobody"}, {"age": 41}]})
+    assert fallback.deleted_count == 1
+    assert ids(collection.find({})) == []
 
 
 def seed_users(collection):

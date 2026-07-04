@@ -175,3 +175,29 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
         "u1"
     ]
     assert collection.count_documents({"profile.city": "Milan"}) == 1
+
+
+def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test", "active": True},
+            {"_id": "u2", "email": "grace@example.test", "active": True},
+            {"_id": "u3", "email": "katherine@example.test", "active": False},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_1")
+    collection.create_index([("active", ASCENDING)], name="active_1")
+
+    one = collection.update_one(
+        {"email": "ada@example.test"},
+        {"$set": {"email": "ada.lovelace@example.test"}},
+    )
+    assert one.matched_count == 1
+    assert one.modified_count == 1
+    assert collection.find_one({"email": "ada@example.test"}) is None
+    assert collection.find_one({"email": "ada.lovelace@example.test"})["_id"] == "u1"
+
+    many = collection.delete_many({"active": True})
+    assert many.deleted_count == 2
+    assert collection.count_documents({"active": True}) == 0
+    assert [doc["_id"] for doc in collection.find({"active": False})] == ["u3"]

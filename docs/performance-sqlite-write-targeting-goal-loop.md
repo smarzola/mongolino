@@ -94,7 +94,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Transaction candidate planner
-- [ ] Milestone 1: Update/delete target narrowing
+- [x] Milestone 1: Update/delete target narrowing
 - [ ] Milestone 2: findAndModify target narrowing
 - [ ] Milestone 3: Unique conflict check pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
@@ -156,6 +156,17 @@ Acceptance criteria:
 - Fallback filters behave exactly as before.
 - Add Rust and PyMongo e2e coverage for `_id` and indexed scalar update/delete paths plus fallback cases.
 - Milestone status is marked done in this file and committed.
+
+Status 2026-07-04: Done. `apply_update_entry` and `apply_delete_entry`
+use transaction candidates for safe `_id` and indexed scalar equality filters,
+with Rust matcher validation preserved. Added PyMongo and spec corpus coverage
+for `_id`, indexed scalar, and fallback update/delete paths. Verification
+passed: `cargo fmt -- --check`, `cargo test update`, `cargo test delete`,
+`cargo test planner`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+--locked pytest tests/e2e/test_crud.py tests/e2e/test_indexes.py`
+(unsandboxed after sandbox localhost bind denial), `cargo test`, and extra
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_spec_corpus.py`. Commit: pending.
 
 Likely files:
 

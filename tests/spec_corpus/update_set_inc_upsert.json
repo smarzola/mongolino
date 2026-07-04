@@ -6,15 +6,33 @@
     {
       "_id": "u1",
       "name": "Ada",
-      "score": 1
+      "score": 1,
+      "team": "math",
+      "active": true
     },
     {
       "_id": "u2",
       "name": "Grace",
-      "score": 2
+      "score": 2,
+      "team": "compiler",
+      "active": true
     }
   ],
   "operations": [
+    {
+      "name": "create_index",
+      "keys": {
+        "team": 1
+      },
+      "index_name": "team_1"
+    },
+    {
+      "name": "create_index",
+      "keys": {
+        "active": 1
+      },
+      "index_name": "active_1"
+    },
     {
       "name": "update_one",
       "filter": {
@@ -31,8 +49,25 @@
       }
     },
     {
+      "name": "update_one",
+      "filter": {
+        "team": "compiler"
+      },
+      "update": {
+        "$set": {
+          "name": "Grace Hopper"
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
       "name": "update_many",
-      "filter": {},
+      "filter": {
+        "active": true
+      },
       "update": {
         "$inc": {
           "score": 3
@@ -41,6 +76,28 @@
       "expect_result": {
         "matched_count": 2,
         "modified_count": 2
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "$or": [
+          {
+            "name": "Nobody"
+          },
+          {
+            "team": "math"
+          }
+        ]
+      },
+      "update": {
+        "$set": {
+          "name": "Fallback Matched"
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
       }
     },
     {
@@ -67,13 +124,17 @@
   "expect_final_documents": [
     {
       "_id": "u1",
-      "name": "Ada Lovelace",
-      "score": 4
+      "name": "Fallback Matched",
+      "score": 4,
+      "team": "math",
+      "active": true
     },
     {
       "_id": "u2",
-      "name": "Grace",
-      "score": 5
+      "name": "Grace Hopper",
+      "score": 5,
+      "team": "compiler",
+      "active": true
     },
     {
       "_id": "u3",
