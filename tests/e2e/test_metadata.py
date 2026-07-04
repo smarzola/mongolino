@@ -125,19 +125,25 @@ def test_sparse_and_partial_indexed_count_uses_safe_membership_filters(collectio
     assert collection.count_documents({"active": True}) == 2
 
 
-def test_indexed_count_falls_back_when_index_has_array_omissions(collection):
+def test_scalar_multikey_indexed_count_uses_entries_and_validates_matches(collection):
     collection.insert_many(
         [
-            {"_id": "u1", "tags": ["math"], "active": True},
+            {"_id": "u1", "tags": ["math", "math"], "active": True},
             {"_id": "u2", "tags": "math", "active": True},
             {"_id": "u3", "tags": "math", "active": False},
+            {"_id": "u4", "tags": [{"name": "math"}], "active": True},
+            {"_id": "u5", "scores": [1, 2]},
         ]
     )
     collection.create_index("tags", name="tags_1")
     collection.create_index([("tags", 1), ("active", 1)], name="tags_active_1")
+    collection.create_index("scores", name="scores_1")
 
     assert collection.count_documents({"tags": "math"}) == 3
     assert collection.count_documents({"tags": "math", "active": True}) == 2
+    assert collection.count_documents({"tags": {"$eq": "math"}}, skip=1, limit=1) == 1
+    assert collection.count_documents({"tags": [{"name": "math"}]}) == 1
+    assert collection.count_documents({"scores": 1}) == 1
 
 
 def test_distinct_scalar_dotted_and_array_values(collection):

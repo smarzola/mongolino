@@ -301,7 +301,7 @@ def test_update_preserves_partial_unique_membership(collection):
     assert collection.find_one({"_id": "u4"})["active"] is True
 
 
-def test_update_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
+def test_update_targets_scalar_multikey_indexed_matches(collection):
     collection.insert_many(
         [
             {"_id": "u1", "tags": ["math"], "active": True},
@@ -403,7 +403,7 @@ def test_delete_targets_compound_indexed_filters(collection):
     assert ids(collection.find({})) == ["u2"]
 
 
-def test_delete_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
+def test_delete_targets_scalar_multikey_indexed_matches(collection):
     collection.insert_many(
         [
             {"_id": "u1", "tags": ["math"], "active": True},

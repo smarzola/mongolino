@@ -144,7 +144,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Multikey entry model and deduplication
 - [x] Milestone 1: Entry maintenance and mutation freshness
-- [ ] Milestone 2: Read/count/write planner pushdown
+- [x] Milestone 2: Read/count/write planner pushdown
 - [ ] Milestone 3: Unique and unsupported multikey semantics
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
@@ -235,7 +235,7 @@ Verified with `cargo fmt -- --check`, `cargo test index`, `cargo test update`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py`,
 and `cargo test`. The first sandboxed PyMongo attempt failed at localhost bind
 with `PermissionError: Operation not permitted`, then passed unsandboxed.
-Commit: pending.
+Commit: `bd725f2`.
 
 ## Milestone 2: Read/Count/Write Planner Pushdown
 
@@ -279,6 +279,16 @@ cargo test update
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_crud.py
 cargo test
 ```
+
+Status 2026-07-04: changed indexed count pushdown to load indexed candidates
+and validate them with the Rust matcher before counting; added PyMongo coverage
+for scalar multikey count, aggregation `$match` + `$count`, update, and delete
+targeting, with numeric/document fallback shapes still returning correct
+matcher results. Verified with `cargo fmt -- --check`, `cargo test find`,
+`cargo test count`, `cargo test aggregate_match_count`, `cargo test update`,
+`cargo build`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_crud.py`,
+and `cargo test`. Commit: pending.
 
 ## Milestone 3: Unique And Unsupported Multikey Semantics
 

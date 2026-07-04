@@ -2200,7 +2200,14 @@ fn pushed_down_count(
         CountPlan::IndexedEquality {
             index_name,
             key_value,
-        } => sql_count_index_entries(conn, namespace, &index_name, &key_value)?,
+        } => {
+            let candidates =
+                indexed_candidate_documents_by_key(conn, namespace, &index_name, &key_value)?
+                    .unwrap_or_default();
+            return count_matching_documents(candidates, filter, skip, limit)
+                .map(Some)
+                .map_err(|err| MongolinoError::Protocol(err.errmsg));
+        }
         CountPlan::Fallback => return Ok(None),
     };
     Ok(Some(apply_count_skip_limit(total, skip, limit)))
@@ -2218,19 +2225,6 @@ fn sql_count_id_equality(conn: &Connection, namespace: &str, id_key: &str) -> Re
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM documents WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
-        |row| row.get(0),
-    )?)
-}
-
-fn sql_count_index_entries(
-    conn: &Connection,
-    namespace: &str,
-    index_name: &str,
-    key_value: &str,
-) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(DISTINCT id_key) FROM index_entries WHERE namespace = ?1 AND index_name = ?2 AND key_value = ?3",
-        params![namespace, index_name, key_value],
         |row| row.get(0),
     )?)
 }

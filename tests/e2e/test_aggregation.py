@@ -143,22 +143,27 @@ def test_aggregate_match_count_uses_sparse_and_partial_membership_filters(collec
     ]
 
 
-def test_aggregate_match_count_falls_back_when_index_has_array_omissions(collection):
+def test_aggregate_match_count_uses_scalar_multikey_entries(collection):
     collection.insert_many(
         [
-            {"_id": "s1", "tags": ["red"], "active": True},
+            {"_id": "s1", "tags": ["red", "red"], "active": True},
             {"_id": "s2", "tags": "red", "active": True},
             {"_id": "s3", "tags": "red", "active": False},
+            {"_id": "s4", "scores": [1, 2]},
         ]
     )
     collection.create_index("tags", name="tags_1")
     collection.create_index([("tags", 1), ("active", 1)], name="tags_active_1")
+    collection.create_index("scores", name="scores_1")
 
     assert list(collection.aggregate([{"$match": {"tags": "red"}}, {"$count": "total"}])) == [
         {"total": 3}
     ]
     assert list(collection.aggregate([{"$match": {"tags": "red", "active": True}}, {"$count": "total"}])) == [
         {"total": 2}
+    ]
+    assert list(collection.aggregate([{"$match": {"scores": 1}}, {"$count": "total"}])) == [
+        {"total": 1}
     ]
 
 
