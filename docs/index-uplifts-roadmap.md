@@ -7,7 +7,7 @@ loop, verification, and push.
 
 ## Baseline
 
-Current index support after the sparse and partial planner uplift:
+Current index support after the scalar multikey planner uplift:
 
 - `createIndexes`, `listIndexes`, and `dropIndexes` are implemented.
 - `_id_` is always listed and cannot be dropped.
@@ -15,9 +15,10 @@ Current index support after the sparse and partial planner uplift:
 - `unique: true` is enforced for supported unique key shapes.
 - Maintained `index_entries` support safe single-field scalar planner paths and
   safe full-key compound scalar planner paths.
-- Maintained multikey omission sentinels disable single-field or compound
-  index-entry pushdown when an indexed path contains array traversal that would
-  otherwise be omitted from scalar planner entries.
+- Single-field indexes maintain one entry per distinct supported non-numeric
+  scalar array element, including dotted scalar leaves reached through arrays.
+  Unsupported multikey shapes still record omission sentinels and force
+  fallback.
 - Sparse indexes are accepted, persisted, listed, and maintained by indexing
   only documents where all indexed fields are present. Explicit `null` counts
   as present.
@@ -26,7 +27,8 @@ Current index support after the sparse and partial planner uplift:
   predicates and unsupported operators are explicit command errors.
 - Unique sparse and unique partial indexes enforce duplicates only among
   included documents.
-- Single-field scalar and full-key compound scalar indexes can accelerate
+- Single-field scalar, supported scalar multikey, and full-key compound scalar
+  indexes can accelerate
   `find`, `count`, aggregation `$match` + `$count`, update/delete target
   selection, findAndModify target selection, and safe non-numeric unique checks.
   Sparse and partial index entries are used only when the query filter safely
@@ -40,9 +42,10 @@ Major gaps:
   collation-aware compound behavior are absent.
 - Broader partial filter implication remains unsupported beyond the tested
   equality, `$eq`, `$exists: true`, and `$and` subset.
-- Multikey indexes do not have MongoDB-compatible array indexing semantics.
-  Current planners fall back to Rust matcher scans when indexed array values are
-  present; scalar multikey entry maintenance remains reserved for uplift 3.
+- Full MongoDB multikey semantics are not implemented. Compound multikey,
+  unique multikey, numeric arrays, document-valued array elements, `$elemMatch`,
+  geospatial arrays, text indexes, wildcard indexes, and collation-aware
+  multikey behavior are unsupported or fall back explicitly.
 - Query hints, index choice diagnostics, and broader sort/range pushdown are
   absent.
 - Text, geospatial, hashed, wildcard, collation-aware, hidden, and TTL indexes
@@ -53,17 +56,17 @@ Major gaps:
 The percentages below are a repo-local scorecard for common application index
 behavior, not a claim of full MongoDB parity.
 
-| Area | Weight | Baseline | After Uplift 1 | Target After 3 Uplifts |
-| --- | ---: | ---: | ---: | ---: |
-| Index command surface and catalog behavior | 15% | 10% | 11% | 12% |
-| Basic btree key specs and metadata | 15% | 8% | 11% | 12% |
-| Unique enforcement semantics | 20% | 12% | 14% | 16% |
-| Planner use for reads and writes | 25% | 8% | 15% | 17% |
-| Sparse/partial/multikey practical semantics | 20% | 1% | 1% | 6% |
-| Explicit unsupported behavior and tests | 5% | 4% | 4% | 5% |
-| Total | 100% | 43% | 56% | 68% |
+| Area | Weight | Baseline | After Uplift 1 | After Uplift 2 | After Uplift 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Index command surface and catalog behavior | 15% | 10% | 11% | 12% | 12% |
+| Basic btree key specs and metadata | 15% | 8% | 11% | 12% | 12% |
+| Unique enforcement semantics | 20% | 12% | 14% | 16% | 16% |
+| Planner use for reads and writes | 25% | 8% | 15% | 17% | 21% |
+| Sparse/partial/multikey practical semantics | 20% | 1% | 1% | 6% | 12% |
+| Explicit unsupported behavior and tests | 5% | 4% | 4% | 5% | 5% |
+| Total | 100% | 43% | 56% | 68% | 78% |
 
-Completion target for this goal: reach at least **75%** on this scorecard while
+Completion target for this goal: reach at least **78%** on this scorecard while
 preserving explicit errors for unsupported MongoDB index families.
 
 ## Performance Targets
@@ -100,6 +103,10 @@ Goal-level targets after all three index uplifts:
   benchmark.
 - Multikey equality find for scalar array elements: at least **5x faster** than
   collection scan when a maintained multikey index is safe to use.
+- Multikey equality count: below **1 ms/op** for safe scalar array element
+  counts.
+- Multikey write target selection: below **4 ms/op** for selective scalar array
+  equality update targeting.
 
 ## Uplift 1: Compound Index Planner And Benchmarks
 
@@ -157,6 +164,8 @@ Prompt to write after uplift 1 review: `docs/index-sparse-partial-goal-loop.md`.
 
 Target compatibility movement: **67% -> 78%**.
 
+Delivered compatibility movement: **68% -> 78%**.
+
 Target behavior:
 
 - Maintain one index entry per scalar array element for supported single-field
@@ -167,6 +176,24 @@ Target behavior:
   where unsupported.
 - Add PyMongo e2e coverage for array field queries and mutation freshness.
 - Add benchmark cases for array-element indexed find/count.
+
+Delivered behavior:
+
+- Single-field indexes maintain distinct entries for supported non-numeric
+  scalar array elements and dotted scalar leaves reached through arrays.
+- Repeated array elements deduplicate per document, and count pushdown uses
+  distinct document ids.
+- Scalar array equality find, update, delete, and findAndModify narrow through
+  maintained entries and still validate narrowed candidates with the Rust
+  matcher before returning or mutating documents.
+- Safe exact count and aggregation `$match` + `$count` use maintained entries
+  for scalar array equality.
+- Unique multikey, compound multikey, numeric arrays, document-valued array
+  elements, and unsupported operators remain explicit errors or matcher
+  fallbacks.
+- Local profile measurements after uplift 3: `find_multikey_scalar_equality`
+  `1.519 ms/op`, `count_multikey_scalar_equality` `0.029 ms/op`, and
+  `update_multikey_target` `2.042 ms/op`.
 
 Prompt to write after uplift 2 review: `docs/index-multikey-scalar-goal-loop.md`.
 

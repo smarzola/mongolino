@@ -146,7 +146,7 @@ When a milestone is complete:
 - [x] Milestone 1: Entry maintenance and mutation freshness
 - [x] Milestone 2: Read/count/write planner pushdown
 - [x] Milestone 3: Unique and unsupported multikey semantics
-- [ ] Milestone 4: Benchmarks, docs, and final verification
+- [x] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Multikey Entry Model And Deduplication
 
@@ -280,13 +280,12 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/te
 cargo test
 ```
 
-Status 2026-07-04: changed indexed count pushdown to load indexed candidates
-and validate them with the Rust matcher before counting; added PyMongo coverage
-for scalar multikey count, aggregation `$match` + `$count`, update, and delete
-targeting, with numeric/document fallback shapes still returning correct
-matcher results. Verified with `cargo fmt -- --check`, `cargo test find`,
-`cargo test count`, `cargo test aggregate_match_count`, `cargo test update`,
-`cargo build`,
+Status 2026-07-04: kept covered indexed count pushdown on distinct maintained
+entry document ids for safe equality filters; added PyMongo coverage for scalar
+multikey count, aggregation `$match` + `$count`, update, and delete targeting,
+with numeric/document fallback shapes still returning correct matcher results.
+Verified with `cargo fmt -- --check`, `cargo test find`, `cargo test count`,
+`cargo test aggregate_match_count`, `cargo test update`, `cargo build`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_crud.py`,
 and `cargo test`. Commit: `d01f7a3`.
 
@@ -339,7 +338,7 @@ coverage for unique array create, compound/dotted unique multikey create,
 update, upsert, and insert errors. Verified with `cargo fmt -- --check`,
 `cargo test unique`, `cargo test index`, `cargo build`,
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py`,
-and `cargo test`. Commit: pending.
+and `cargo test`. Commit: `4a45f3c`.
 
 ## Milestone 4: Benchmarks, Docs, And Final Verification
 
@@ -382,6 +381,22 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
+
+Status 2026-07-04: added `find_multikey_scalar_equality`,
+`count_multikey_scalar_equality`, and `update_multikey_target` benchmark cases
+and CI budget thresholds; updated the compatibility scorecard to 78%; recorded
+smoke, local, and CI benchmark evidence in the performance docs. Final local
+profile multikey numbers: find `1.519 ms/op`, count `0.029 ms/op`, update
+`2.042 ms/op`; find is about `20.3x` faster than collection scan. Verified with
+`cargo fmt -- --check`, `cargo test`, `cargo build`,
+`cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-index-multikey-smoke.json`,
+`cargo run --bin mongolino-bench -- --profile local --json /tmp/mongolino-bench-index-multikey-local.json`,
+`cargo run --bin mongolino-bench -- --profile ci --check-budget`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+(`159 passed, 1 skipped`; run unsandboxed for localhost binding). Commit:
+pending.
 
 ## Final Response Requirements
 

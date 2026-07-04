@@ -54,8 +54,8 @@ def test_inserted_collection_is_listed_and_drop_removes_catalog_and_documents(co
 def test_drop_removes_index_multikey_omission_sentinels(mongo_client, mongolino_server):
     db_name = unique_name("life")
     collection = mongo_client[db_name].users
-    collection.insert_one({"_id": "u1", "tags": ["math"]})
-    collection.create_index("tags", name="tags_1")
+    collection.insert_one({"_id": "u1", "scores": [1]})
+    collection.create_index("scores", name="scores_1")
 
     assert multikey_omission_count(mongolino_server.db_path, f"{db_name}.users") == 1
 
@@ -89,10 +89,10 @@ def test_drop_database_removes_only_target_database(mongo_client):
 def test_drop_database_removes_index_multikey_omission_sentinels(mongo_client, mongolino_server):
     target_name = unique_name("life")
     other_name = unique_name("life")
-    mongo_client[target_name].users.insert_one({"_id": "u1", "tags": ["math"]})
-    mongo_client[other_name].users.insert_one({"_id": "u2", "tags": ["math"]})
-    mongo_client[target_name].users.create_index("tags", name="tags_1")
-    mongo_client[other_name].users.create_index("tags", name="tags_1")
+    mongo_client[target_name].users.insert_one({"_id": "u1", "scores": [1]})
+    mongo_client[other_name].users.insert_one({"_id": "u2", "scores": [1]})
+    mongo_client[target_name].users.create_index("scores", name="scores_1")
+    mongo_client[other_name].users.create_index("scores", name="scores_1")
 
     assert multikey_omission_count(mongolino_server.db_path, f"{target_name}.users") == 1
     assert multikey_omission_count(mongolino_server.db_path, f"{other_name}.users") == 1

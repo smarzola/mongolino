@@ -404,3 +404,55 @@ Remaining pushdown candidates are aggregation-oriented: broader `$match`
 planning inside aggregation pipelines, possible SQLite grouping for bounded
 scalar fields, and any future side-table design for array-heavy `$unwind` and
 `$group` workloads.
+
+## Scalar Multikey Index Uplift Results
+
+Recorded on 2026-07-04 after scalar multikey index entry maintenance and
+planner pushdown. Benchmarks used the debug `cargo run --bin mongolino-bench`
+harness with the local profile and JSON output at
+`/tmp/mongolino-bench-index-multikey-local.json`.
+
+Delivered implementation:
+
+- Maintains one `index_entries` row per distinct supported non-numeric scalar
+  array element for single-field indexes.
+- Supports dotted scalar leaves reached through arrays when `values_at_path`
+  returns safe scalar leaves.
+- Uses maintained multikey entries for scalar equality find, count,
+  aggregation `$match` + `$count`, update/delete target selection, and
+  findAndModify target selection.
+- Keeps unique multikey and compound multikey unsupported with explicit errors
+  or fallback behavior.
+
+Local profile after scalar multikey uplift:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| find_collection_scan | 100 | 3078.41 | 32.48 | 30.784 |
+| find_multikey_scalar_equality | 100 | 151.90 | 658.34 | 1.519 |
+| count_multikey_scalar_equality | 100 | 2.95 | 33900.22 | 0.029 |
+| update_multikey_target | 100 | 204.20 | 489.72 | 2.042 |
+
+Headline movement:
+
+- `find_multikey_scalar_equality` is about `20.3x` faster than
+  `find_collection_scan` on the same local run and is below the `6 ms/op`
+  target.
+- `count_multikey_scalar_equality` is below the `1 ms/op` target.
+- `update_multikey_target` is below the `4 ms/op` target.
+
+Smoke profile after scalar multikey uplift:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| find_multikey_scalar_equality | 25 | 8.40 | 2974.91 | 0.336 |
+| count_multikey_scalar_equality | 25 | 0.84 | 29685.36 | 0.034 |
+| update_multikey_target | 25 | 14.10 | 1772.98 | 0.564 |
+
+CI profile budget check passed with:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| find_multikey_scalar_equality | 30 | 14.35 | 2091.19 | 0.478 |
+| count_multikey_scalar_equality | 30 | 0.88 | 34228.64 | 0.029 |
+| update_multikey_target | 30 | 23.76 | 1262.72 | 0.792 |

@@ -17,6 +17,7 @@ const COLL: &str = "users";
 const COMPOUND_COLL: &str = "compound_users";
 const PARTIAL_COLL: &str = "partial_users";
 const PARTIAL_UNIQUE_COLL: &str = "partial_unique_users";
+const MULTIKEY_COLL: &str = "multikey_users";
 
 #[derive(Clone, Copy, Debug)]
 struct Profile {
@@ -158,6 +159,16 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "find_multikey_scalar_equality",
+        args.profile.iterations,
+        doc! {
+            "find": MULTIKEY_COLL,
+            "filter": { "tags": multikey_target_tag(args.profile) },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "count_empty_filter",
         args.profile.iterations,
         doc! {
@@ -199,9 +210,19 @@ fn run() -> Result<()> {
             "$db": DB,
         },
     )?);
+    results.push(harness.bench_command(
+        "count_multikey_scalar_equality",
+        args.profile.iterations,
+        doc! {
+            "count": MULTIKEY_COLL,
+            "query": { "tags": multikey_target_tag(args.profile) },
+            "$db": DB,
+        },
+    )?);
     results.push(harness.bench_update_index_refresh()?);
     results.push(harness.bench_update_compound_target()?);
     results.push(harness.bench_update_partial_unique_check()?);
+    results.push(harness.bench_update_multikey_target()?);
     results.push(harness.bench_command(
         "aggregation_match_count",
         args.profile.iterations,
@@ -333,6 +354,7 @@ impl Harness {
         self.seed_compound_target_collection()?;
         self.seed_partial_collection()?;
         self.seed_partial_unique_collection()?;
+        self.seed_multikey_collection()?;
         Ok(())
     }
 
@@ -414,6 +436,32 @@ impl Harness {
                 .collect::<Vec<_>>();
             self.command(doc! {
                 "insert": PARTIAL_UNIQUE_COLL,
+                "documents": documents,
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn seed_multikey_collection(&mut self) -> Result<()> {
+        self.command(doc! {
+            "createIndexes": MULTIKEY_COLL,
+            "indexes": [
+                { "key": { "tags": 1_i32 }, "name": "tags_1" },
+            ],
+            "$db": DB,
+        })?;
+
+        let document_count = multikey_target_documents(self.profile);
+        for chunk_start in (0..document_count).step_by(self.profile.insert_batch) {
+            let chunk_end = (chunk_start + self.profile.insert_batch).min(document_count);
+            let documents = (chunk_start..chunk_end)
+                .map(multikey_seed_document)
+                .map(Bson::Document)
+                .collect::<Vec<_>>();
+            self.command(doc! {
+                "insert": MULTIKEY_COLL,
                 "documents": documents,
                 "ordered": true,
                 "$db": DB,
@@ -539,6 +587,34 @@ impl Harness {
         }
         Ok(BenchResult {
             name: "update_partial_unique_check",
+            dataset_size: document_count,
+            iterations: self.profile.iterations,
+            elapsed: start.elapsed(),
+            operations: self.profile.iterations,
+        })
+    }
+
+    fn bench_update_multikey_target(&mut self) -> Result<BenchResult> {
+        let start = Instant::now();
+        let target_tag = multikey_target_tag(self.profile);
+        let document_count = multikey_target_documents(self.profile);
+        for i in 0..self.profile.iterations {
+            self.command(doc! {
+                "update": MULTIKEY_COLL,
+                "updates": [
+                    {
+                        "q": { "tags": target_tag.clone() },
+                        "u": { "$set": { "multikeyTouched": i as i32 } },
+                        "multi": false,
+                        "upsert": false,
+                    }
+                ],
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(BenchResult {
+            name: "update_multikey_target",
             dataset_size: document_count,
             iterations: self.profile.iterations,
             elapsed: start.elapsed(),
@@ -691,6 +767,26 @@ fn partial_target_email(documents: usize) -> String {
     format!("user{}@example.test", index)
 }
 
+fn multikey_target_documents(profile: Profile) -> usize {
+    profile.documents.min(2_000)
+}
+
+fn multikey_target_index(profile: Profile) -> usize {
+    multikey_target_documents(profile) / 2
+}
+
+fn multikey_target_tag(profile: Profile) -> String {
+    format!("tag-{}", multikey_target_index(profile))
+}
+
+fn multikey_seed_document(i: usize) -> Document {
+    doc! {
+        "_id": format!("multikey-user-{i}"),
+        "tags": [format!("tag-{i}"), format!("bucket-{}", i % 16)],
+        "active": i % 2 == 0,
+    }
+}
+
 fn assert_ok(response: &Document, context: &str) -> Result<()> {
     match response.get_f64("ok") {
         Ok(value) if (value - 1.0).abs() < f64::EPSILON => Ok(()),
@@ -836,12 +932,15 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "count_simple_equality" => (250.0, 4.0),
         "count_compound_equality" => (25.0, 40.0),
         "count_partial_index_equality" => (25.0, 40.0),
+        "count_multikey_scalar_equality" => (25.0, 40.0),
         "update_index_refresh" => (150.0, 6.0),
         "update_compound_target" => (80.0, 12.0),
         "update_partial_unique_check" => (80.0, 12.0),
+        "update_multikey_target" => (80.0, 12.0),
         "aggregation_match_count" => (350.0, 3.0),
         "aggregation_unwind_group" => (600.0, 1.5),
         "find_compound_equality" => (80.0, 12.0),
+        "find_multikey_scalar_equality" => (80.0, 12.0),
         _ => (1_000.0, 1.0),
     };
     BudgetThreshold {
