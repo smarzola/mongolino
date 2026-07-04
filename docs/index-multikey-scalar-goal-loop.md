@@ -396,7 +396,7 @@ profile multikey numbers: find `1.519 ms/op`, count `0.029 ms/op`, update
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
 (`159 passed, 1 skipped`; run unsandboxed for localhost binding). Commit:
-pending.
+`74f092f`.
 
 ## Final Response Requirements
 
