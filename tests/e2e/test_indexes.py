@@ -1,6 +1,6 @@
 import pytest
 from pymongo import ASCENDING, DESCENDING
-from pymongo.errors import OperationFailure
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure
 
 
 pytestmark = pytest.mark.e2e
@@ -66,3 +66,74 @@ def test_unsupported_index_options_are_explicit(collection):
     with pytest.raises(OperationFailure) as id_error:
         collection.drop_index("_id_")
     assert id_error.value.code == 67
+
+
+def test_unique_index_creation_rejects_existing_duplicates(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "same@example.test"},
+            {"_id": "u2", "email": "same@example.test"},
+        ]
+    )
+
+    with pytest.raises(OperationFailure) as excinfo:
+        collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
+
+    assert excinfo.value.code == 11000
+    assert index_names(collection) == ["_id_"]
+
+
+def test_unique_index_enforces_insert_update_and_upsert(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test"},
+            {"_id": "u2", "email": "grace@example.test"},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u3", "email": "ada@example.test"})
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u2"}, {"$set": {"email": "ada@example.test"}})
+    assert collection.find_one({"_id": "u2"})["email"] == "grace@example.test"
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one(
+            {"_id": "u4"},
+            {"$set": {"email": "ada@example.test"}},
+            upsert=True,
+        )
+    assert collection.find_one({"_id": "u4"}) is None
+
+
+def test_unique_unordered_bulk_partial_success_and_drop_index(collection):
+    collection.create_index([("email", ASCENDING)], name="email_1", unique=True)
+
+    with pytest.raises(BulkWriteError) as excinfo:
+        collection.insert_many(
+            [
+                {"_id": "u1", "email": "same@example.test"},
+                {"_id": "u2", "email": "same@example.test"},
+                {"_id": "u3", "email": "other@example.test"},
+            ],
+            ordered=False,
+        )
+
+    assert excinfo.value.details["nInserted"] == 2
+    assert excinfo.value.details["writeErrors"][0]["index"] == 1
+
+    collection.drop_index("email_1")
+    collection.insert_one({"_id": "u4", "email": "same@example.test"})
+    assert collection.count_documents({"email": "same@example.test"}) == 2
+
+
+def test_unique_index_rejects_array_values(collection):
+    collection.insert_one({"_id": "u1", "emails": ["a@example.test"]})
+
+    with pytest.raises(OperationFailure) as excinfo:
+        collection.create_index([("emails", ASCENDING)], name="emails_1", unique=True)
+
+    assert excinfo.value.code == 72
+    assert "does not support array value" in str(excinfo.value)

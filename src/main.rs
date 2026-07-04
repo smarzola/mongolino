@@ -1038,6 +1038,16 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
                 "index already exists with a different specification",
             ));
         }
+        if spec.unique
+            && let Err(errmsg) = validate_unique_index_tx(&tx, &namespace, spec)
+        {
+            let code = if errmsg.starts_with("duplicate key error") {
+                11000
+            } else {
+                72
+            };
+            return Ok(command_error(code, &errmsg));
+        }
         insert_index_tx(&tx, &namespace, spec)?;
     }
     let after = index_count_tx(&tx, &namespace)? + 1;
@@ -1275,6 +1285,100 @@ fn index_count_tx(tx: &rusqlite::Transaction<'_>, namespace: &str) -> Result<i32
     )?)
 }
 
+fn unique_indexes_for_namespace_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<IndexSpec>> {
+    let mut stmt = tx.prepare(
+        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 AND unique_index = 1 ORDER BY name",
+    )?;
+    stmt.query_map(params![namespace], |row| {
+        let name = row.get::<_, String>(0)?;
+        let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
+        let unique = row.get::<_, i32>(2)? != 0;
+        Ok(IndexSpec { name, key, unique })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(Into::into)
+}
+
+fn validate_unique_index_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    spec: &IndexSpec,
+) -> std::result::Result<(), String> {
+    let mut seen = HashMap::new();
+    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())? {
+        let key = unique_key_for_document(spec, &stored.document)?;
+        if let Some(existing_id) = seen.insert(key.clone(), stored.id_key.clone()) {
+            return Err(format!(
+                "duplicate key error collection: {namespace} index: {} dup key: {key} existing _id: {existing_id}",
+                spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_constraints_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    document: &Document,
+    excluding_id_key: Option<&str>,
+) -> std::result::Result<(), String> {
+    let indexes = unique_indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    for index in indexes {
+        let wanted_key = unique_key_for_document(&index, document)?;
+        for stored in
+            stored_documents_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?
+        {
+            if excluding_id_key.is_some_and(|id_key| id_key == stored.id_key) {
+                continue;
+            }
+            let existing_key = unique_key_for_document(&index, &stored.document)?;
+            if existing_key == wanted_key {
+                return Err(format!(
+                    "duplicate key error collection: {namespace} index: {} dup key: {wanted_key}",
+                    index.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unique_key_for_document(
+    index: &IndexSpec,
+    document: &Document,
+) -> std::result::Result<String, String> {
+    let mut parts = Vec::new();
+    for field in index.key.keys() {
+        let values = values_at_path(document, field);
+        let value = match values.as_slice() {
+            [] => Bson::Null,
+            [value] if matches!(value, Bson::Array(_)) => {
+                return Err(format!(
+                    "unique index {} does not support array value at {field}",
+                    index.name
+                ));
+            }
+            [value] => (*value).clone(),
+            _ => {
+                return Err(format!(
+                    "unique index {} does not support multikey path {field}",
+                    index.name
+                ));
+            }
+        };
+        parts.push(format!("{field}:{}", id_key_from_bson(&value)));
+    }
+    Ok(parts.join("|"))
+}
+
 fn insert_collection_catalog(
     conn: &Connection,
     db: &str,
@@ -1379,7 +1483,7 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
         let id_key = id_key(&document)?;
         let mut encoded = Vec::new();
         document.to_writer(&mut encoded)?;
-        prepared.push((id_key, encoded));
+        prepared.push((id_key, encoded, document));
     }
 
     let tx = conn.unchecked_transaction()?;
@@ -1393,7 +1497,18 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
              VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
         )?;
 
-        for (index, (id_key, encoded)) in prepared.iter().enumerate() {
+        for (index, (id_key, encoded, document)) in prepared.iter().enumerate() {
+            if let Err(errmsg) = ensure_unique_constraints_tx(&tx, &namespace, document, None) {
+                write_errors.push(write_error(
+                    index as i32,
+                    unique_write_error_code(&errmsg),
+                    &errmsg,
+                ));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
             match stmt.execute(params![namespace, id_key, encoded]) {
                 Ok(_) => inserted += 1,
                 Err(err) if is_sqlite_constraint(&err) => {
@@ -1590,6 +1705,7 @@ fn apply_update_entry(
             .get("_id")
             .cloned()
             .ok_or_else(|| "upsert document is missing _id".to_string())?;
+        ensure_unique_constraints_tx(tx, namespace, &new_document, None)?;
         insert_stored_document_tx(tx, namespace, &new_document)
             .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
         return Ok(UpdateOutcome {
@@ -1608,6 +1724,7 @@ fn apply_update_entry(
             return Err("update cannot change _id".to_string());
         }
         if new_document != stored.document {
+            ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&stored.id_key))?;
             update_stored_document_tx(tx, namespace, &stored.id_key, &new_document)
                 .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
             modified += 1;
@@ -1694,6 +1811,14 @@ fn duplicate_or_sql_error(namespace: &str, document: &Document, err: rusqlite::E
 }
 
 fn update_error_code(errmsg: &str) -> i32 {
+    if errmsg.starts_with("duplicate key error") {
+        11000
+    } else {
+        2
+    }
+}
+
+fn unique_write_error_code(errmsg: &str) -> i32 {
     if errmsg.starts_with("duplicate key error") {
         11000
     } else {
@@ -3776,6 +3901,195 @@ mod tests {
         ] {
             assert_command_error(&response);
         }
+    }
+
+    #[test]
+    fn unique_index_creation_rejects_existing_duplicates() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "same@example.test" },
+                    { "_id": "u2", "email": "same@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1", "unique": true }],
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert_eq!(response.get_i32("code").unwrap(), 11000);
+    }
+
+    #[test]
+    fn unique_index_enforces_insert_update_and_upsert() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "ada@example.test" },
+                    { "_id": "u2", "email": "grace@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1", "unique": true }],
+            },
+        )
+        .unwrap();
+
+        let duplicate_insert = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u3", "email": "ada@example.test" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_insert)[0].get_i32("code").unwrap(),
+            11000
+        );
+
+        let duplicate_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u2" }, "u": { "$set": { "email": "ada@example.test" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_update)[0].get_i32("code").unwrap(),
+            11000
+        );
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u2" } },
+                )
+                .unwrap()
+            )[0]
+            .get_str("email")
+            .unwrap(),
+            "grace@example.test"
+        );
+
+        let duplicate_upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u4" },
+                        "u": { "$set": { "email": "ada@example.test" } },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_upsert)[0].get_i32("code").unwrap(),
+            11000
+        );
+    }
+
+    #[test]
+    fn unique_unordered_bulk_continues_and_drop_index_disables_enforcement() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1", "unique": true }],
+            },
+        )
+        .unwrap();
+
+        let response = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "ordered": false,
+                "documents": [
+                    { "_id": "u1", "email": "same@example.test" },
+                    { "_id": "u2", "email": "same@example.test" },
+                    { "_id": "u3", "email": "other@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(response.get_i32("n").unwrap(), 2);
+        assert_eq!(write_errors(&response)[0].get_i32("index").unwrap(), 1);
+
+        drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "email_1" },
+        )
+        .unwrap();
+        let allowed = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u4", "email": "same@example.test" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(allowed.get_i32("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn unique_index_rejects_array_values() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "emails": ["a@example.test"] }],
+            },
+        )
+        .unwrap();
+
+        let response = create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "emails": 1_i32 }, "name": "emails_1", "unique": true }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&response);
+        assert_eq!(response.get_i32("code").unwrap(), 72);
     }
 
     #[test]
