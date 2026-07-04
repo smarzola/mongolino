@@ -166,6 +166,47 @@
       "name": "aggregate",
       "pipeline": [
         {
+          "$match": {
+            "active": true
+          }
+        },
+        {
+          "$unwind": "$team"
+        },
+        {
+          "$group": {
+            "_id": "$team",
+            "ids": {
+              "$push": "$_id"
+            },
+            "uniqueTeams": {
+              "$addToSet": "$team"
+            }
+          }
+        },
+        {
+          "$sort": {
+            "_id": 1
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "red",
+          "ids": [
+            "s1",
+            "s3"
+          ],
+          "uniqueTeams": [
+            "red"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
           "$count": ""
         }
       ],

@@ -191,6 +191,61 @@ def test_aggregate_group_scalar_accumulators(collection):
     ) == [{"_id": {"team": "red", "active": True}, "n": 2}]
 
 
+def test_aggregate_unwind_group_array_accumulators_and_cursor(collection):
+    collection.insert_many(
+        [
+            {"_id": "p1", "active": True, "tags": ["red", "blue"], "score": 7},
+            {"_id": "p2", "active": True, "tags": ["red"], "score": 5},
+            {"_id": "p3", "active": True, "tags": ["blue", "red"]},
+            {"_id": "p4", "active": False, "tags": ["red"], "score": 99},
+        ]
+    )
+
+    cursor = collection.aggregate(
+        [
+            {"$match": {"active": True}},
+            {"$unwind": "$tags"},
+            {
+                "$group": {
+                    "_id": "$tags",
+                    "ids": {"$push": "$_id"},
+                    "scores": {"$push": "$score"},
+                    "uniqueIds": {"$addToSet": "$_id"},
+                    "uniqueLiteral": {"$addToSet": "seen"},
+                }
+            },
+            {"$sort": {"_id": 1}},
+            {
+                "$project": {
+                    "_id": 1,
+                    "ids": 1,
+                    "scores": 1,
+                    "uniqueIds": 1,
+                    "uniqueLiteral": 1,
+                }
+            },
+        ],
+        batchSize=1,
+    )
+
+    assert list(cursor) == [
+        {
+            "_id": "blue",
+            "ids": ["p1", "p3"],
+            "scores": [7, None],
+            "uniqueIds": ["p1", "p3"],
+            "uniqueLiteral": ["seen"],
+        },
+        {
+            "_id": "red",
+            "ids": ["p1", "p2", "p3"],
+            "scores": [7, 5, None],
+            "uniqueIds": ["p1", "p2", "p3"],
+            "uniqueLiteral": ["seen"],
+        },
+    ]
+
+
 def test_aggregate_unsupported_stage_is_explicit_error(collection):
     seed_scores(collection)
 

@@ -1273,6 +1273,8 @@ enum AccumulatorOp {
     Max,
     First,
     Last,
+    Push,
+    AddToSet,
 }
 
 #[derive(Clone, Debug)]
@@ -1289,6 +1291,8 @@ enum AccumulatorState {
     Max(Option<Bson>),
     First(Option<Bson>),
     Last(Option<Bson>),
+    Push(Vec<Bson>),
+    AddToSet(Vec<Bson>),
 }
 
 fn parse_group_stage(group: &Document) -> std::result::Result<GroupSpec, Document> {
@@ -1325,6 +1329,8 @@ fn parse_group_stage(group: &Document) -> std::result::Result<GroupSpec, Documen
             "$max" => AccumulatorOp::Max,
             "$first" => AccumulatorOp::First,
             "$last" => AccumulatorOp::Last,
+            "$push" => AccumulatorOp::Push,
+            "$addToSet" => AccumulatorOp::AddToSet,
             _ => {
                 return Err(command_error(
                     72,
@@ -1365,7 +1371,12 @@ fn parse_accumulator_expression(
             }
             _ => Err(command_error(72, "$group $avg supports field paths")),
         },
-        AccumulatorOp::Min | AccumulatorOp::Max | AccumulatorOp::First | AccumulatorOp::Last => {
+        AccumulatorOp::Min
+        | AccumulatorOp::Max
+        | AccumulatorOp::First
+        | AccumulatorOp::Last
+        | AccumulatorOp::Push
+        | AccumulatorOp::AddToSet => {
             parse_aggregation_expression(operand, "$group accumulator", false)
         }
     }
@@ -1431,6 +1442,8 @@ impl AccumulatorState {
             AccumulatorOp::Max => Self::Max(None),
             AccumulatorOp::First => Self::First(None),
             AccumulatorOp::Last => Self::Last(None),
+            AccumulatorOp::Push => Self::Push(Vec::new()),
+            AccumulatorOp::AddToSet => Self::AddToSet(Vec::new()),
         }
     }
 
@@ -1483,6 +1496,18 @@ impl AccumulatorState {
             Self::Last(current) => {
                 *current = Some(value.unwrap_or(Bson::Null));
             }
+            Self::Push(values) => {
+                values.push(value.unwrap_or(Bson::Null));
+            }
+            Self::AddToSet(values) => {
+                let value = value.unwrap_or(Bson::Null);
+                if !values
+                    .iter()
+                    .any(|existing| bson_values_equal(existing, &value))
+                {
+                    values.push(value);
+                }
+            }
         }
     }
 
@@ -1499,6 +1524,7 @@ impl AccumulatorState {
             Self::Min(value) | Self::Max(value) | Self::First(value) | Self::Last(value) => {
                 value.unwrap_or(Bson::Null)
             }
+            Self::Push(values) | Self::AddToSet(values) => Bson::Array(values),
         }
     }
 }
@@ -7270,6 +7296,82 @@ mod tests {
         assert_eq!(
             first_batch(&document_key),
             vec![doc! { "_id": { "team": "red", "active": true }, "n": 2_i64 }]
+        );
+    }
+
+    #[test]
+    fn aggregate_group_push_add_to_set_and_unwind_compose_with_cursor() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "posts",
+                "$db": "app",
+                "documents": [
+                    { "_id": "p1", "active": true, "tags": ["red", "blue"], "score": 7_i32 },
+                    { "_id": "p2", "active": true, "tags": ["red"], "score": 5_i32 },
+                    { "_id": "p3", "active": true, "tags": ["blue", "red"] },
+                    { "_id": "p4", "active": false, "tags": ["red"], "score": 99_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        let mut client_state = ClientState::default();
+
+        let response = aggregate_command_with_state(
+            &conn,
+            &mut client_state,
+            &doc! {
+                "aggregate": "posts",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "active": true } },
+                    { "$unwind": "$tags" },
+                    {
+                        "$group": {
+                            "_id": "$tags",
+                            "ids": { "$push": "$_id" },
+                            "scores": { "$push": "$score" },
+                            "uniqueIds": { "$addToSet": "$_id" },
+                            "uniqueLiteral": { "$addToSet": "seen" },
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32, "ids": 1_i32, "scores": 1_i32, "uniqueIds": 1_i32, "uniqueLiteral": 1_i32 } },
+                ],
+                "cursor": { "batchSize": 1_i32 },
+            },
+        )
+        .unwrap();
+
+        let id = cursor_id(&response);
+        assert!(id > 0);
+        assert_eq!(
+            first_batch(&response),
+            vec![doc! {
+                "_id": "blue",
+                "ids": ["p1", "p3"],
+                "scores": [7_i32, Bson::Null],
+                "uniqueIds": ["p1", "p3"],
+                "uniqueLiteral": ["seen"],
+            }]
+        );
+
+        let next = get_more(
+            &mut client_state,
+            &doc! { "getMore": id, "collection": "posts", "$db": "app", "batchSize": 1_i32 },
+        )
+        .unwrap();
+        assert_eq!(cursor_id(&next), 0);
+        assert_eq!(
+            next_batch(&next),
+            vec![doc! {
+                "_id": "red",
+                "ids": ["p1", "p2", "p3"],
+                "scores": [7_i32, 5_i32, Bson::Null],
+                "uniqueIds": ["p1", "p2", "p3"],
+                "uniqueLiteral": ["seen"],
+            }]
         );
     }
 
