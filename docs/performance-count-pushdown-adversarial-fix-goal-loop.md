@@ -6,6 +6,12 @@ Your objective is to fix an adversarial correctness issue found in the SQLite co
 
 This is a fix loop for performance uplift 2. Keep the performance uplift for safe cases, but do not allow a fast wrong count.
 
+## Status 2026-07-04
+
+- Fixed by making indexed scalar count planning fall back for numeric BSON values, preserving matcher semantics for `Int32`, `Int64`, and `Double` cross-type equality.
+- Preserved SQLite count pushdown for empty filters, exact `_id` equality, and non-numeric indexed scalar equality.
+- Added Rust planner/count/aggregation tests and PyMongo e2e coverage for mixed numeric indexed counts.
+
 ## Repository Rules
 
 Follow `AGENTS.md`.

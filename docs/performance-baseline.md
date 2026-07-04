@@ -103,7 +103,8 @@ Current behavior has these SQLite-backed fast paths:
 - Simple scalar equality `find` can use maintained `index_entries`, then still
   decodes matching BSON documents for final matcher compatibility.
 - `count` uses SQLite for empty filters, exact `_id` equality, and exact
-  indexed scalar equality with maintained single-field index entries.
+  non-numeric indexed scalar equality with maintained single-field index
+  entries.
 - Aggregation pipelines exactly shaped as `$match` followed by `$count` reuse
   the same safe count planner and avoid BSON namespace decode when the filter
   is pushdown-safe.
@@ -113,7 +114,9 @@ The remaining slow local results cluster around full namespace decode:
 - collection-scan `find` decodes every document before filtering;
 - unsupported count filters fall back to Rust matcher semantics, including
   arrays, logical operators, unsupported operators, multi-predicate filters,
-  unindexed fields, null equality, and document equality;
+  unindexed fields, null equality, document equality, and numeric indexed
+  equality where matcher semantics compare `Int32`, `Int64`, and `Double`
+  cross-type;
 - general aggregation still starts by loading the full namespace into memory,
   then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
 - update target selection still pays scan-like cost when the selected filter is

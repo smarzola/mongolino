@@ -1,4 +1,5 @@
 import pytest
+from bson.int64 import Int64
 from pymongo.errors import OperationFailure
 
 
@@ -54,6 +55,22 @@ def test_count_command_with_filter(collection):
     )
 
     assert response["n"] == 2
+
+
+def test_indexed_count_mixed_numeric_values_match_cross_type(collection):
+    collection.insert_many(
+        [
+            {"_id": "i32", "n": 1},
+            {"_id": "i64", "n": Int64(1)},
+            {"_id": "double", "n": 1.0},
+            {"_id": "other", "n": 2},
+        ]
+    )
+    collection.create_index("n", name="n_1")
+
+    assert collection.count_documents({"n": 1}) == 3
+    assert collection.count_documents({"n": {"$eq": Int64(1)}}) == 3
+    assert collection.count_documents({"n": 1.0}) == 3
 
 
 def test_distinct_scalar_dotted_and_array_values(collection):

@@ -2228,6 +2228,9 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     if !is_count_pushdown_scalar(value) {
         return Ok(CountPlan::Fallback);
     }
+    if numeric_value(value).is_some() {
+        return Ok(CountPlan::Fallback);
+    }
     let Some(index) = indexes_for_namespace(conn, namespace)?
         .into_iter()
         .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
@@ -7182,7 +7185,10 @@ mod tests {
             &doc! {
                 "createIndexes": "users",
                 "$db": "app",
-                "indexes": [{ "key": { "active": 1_i32 }, "name": "active_1" }],
+                "indexes": [
+                    { "key": { "active": 1_i32 }, "name": "active_1" },
+                    { "key": { "age": 1_i32 }, "name": "age_1" },
+                ],
             },
         )
         .unwrap();
@@ -7212,6 +7218,18 @@ mod tests {
                 index_name: "active_1".to_string(),
                 key_value: "bool:true".to_string(),
             }
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "age": 37_i32 }).unwrap(),
+            CountPlan::Fallback
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "age": { "$eq": 37_i64 } }).unwrap(),
+            CountPlan::Fallback
+        );
+        assert_eq!(
+            plan_count(&conn, "app.users", &doc! { "age": 37.0 }).unwrap(),
+            CountPlan::Fallback
         );
 
         for filter in [
@@ -7388,6 +7406,55 @@ mod tests {
     }
 
     #[test]
+    fn numeric_indexed_count_falls_back_to_matcher_semantics() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "numbers",
+                "$db": "app",
+                "documents": [
+                    { "_id": "i32", "n": 1_i32 },
+                    { "_id": "i64", "n": 1_i64 },
+                    { "_id": "double", "n": 1.0 },
+                    { "_id": "other", "n": 2_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "numbers",
+                "$db": "app",
+                "indexes": [{ "key": { "n": 1_i32 }, "name": "n_1" }],
+            },
+        )
+        .unwrap();
+
+        for filter in [
+            doc! { "n": 1_i32 },
+            doc! { "n": { "$eq": 1_i64 } },
+            doc! { "n": 1.0 },
+        ] {
+            assert_eq!(
+                plan_count(&conn, "app.numbers", &filter).unwrap(),
+                CountPlan::Fallback
+            );
+            assert_eq!(
+                pushed_down_count(&conn, "app.numbers", &filter, 0, None).unwrap(),
+                None
+            );
+            let response = count_documents_command(
+                &conn,
+                &doc! { "count": "numbers", "$db": "app", "query": filter },
+            )
+            .unwrap();
+            assert_eq!(response.get_i64("n").unwrap(), 3);
+        }
+    }
+
+    #[test]
     fn aggregate_count_documents_shape_is_supported() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -7508,6 +7575,55 @@ mod tests {
         assert_command_error(&response);
         assert_eq!(response.get_i32("code").unwrap(), 2);
         assert!(response.get_str("errmsg").unwrap().contains("$where"));
+    }
+
+    #[test]
+    fn aggregate_match_count_numeric_indexed_filter_uses_matcher_semantics() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "numbers",
+                "$db": "app",
+                "documents": [
+                    { "_id": "i32", "n": 1_i32 },
+                    { "_id": "i64", "n": 1_i64 },
+                    { "_id": "double", "n": 1.0 },
+                    { "_id": "other", "n": 2_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "numbers",
+                "$db": "app",
+                "indexes": [{ "key": { "n": 1_i32 }, "name": "n_1" }],
+            },
+        )
+        .unwrap();
+
+        for filter in [
+            doc! { "n": 1_i32 },
+            doc! { "n": { "$eq": 1_i64 } },
+            doc! { "n": 1.0 },
+        ] {
+            let response = aggregate_command(
+                &conn,
+                &doc! {
+                    "aggregate": "numbers",
+                    "$db": "app",
+                    "pipeline": [
+                        { "$match": filter },
+                        { "$count": "total" },
+                    ],
+                    "cursor": {},
+                },
+            )
+            .unwrap();
+            assert_eq!(first_batch(&response), vec![doc! { "total": 3_i64 }]);
+        }
     }
 
     #[test]

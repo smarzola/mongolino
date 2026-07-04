@@ -104,6 +104,7 @@ When a milestone is complete:
 Status 2026-07-04:
 
 - Added a conservative count planner that recognizes empty filters, exact `_id` equality, and exact indexed scalar equality, while falling back for arrays, logical operators, unsupported operators, multi-predicate filters, and unindexed fields.
+- Follow-up fix: indexed scalar count pushdown now also falls back for numeric BSON values because matcher equality compares `Int32`, `Int64`, and `Double` cross-type, while `index_entries.key_value` is type-tagged. Empty, `_id`, and non-numeric indexed scalar counts remain pushdown-safe.
 - Verification: `cargo fmt -- --check`; `cargo test count`; `cargo test planner`; `cargo test`.
 - Commit: `adc43aa`.
 

@@ -1,4 +1,5 @@
 import pytest
+from bson.int64 import Int64
 from pymongo.errors import OperationFailure
 
 
@@ -72,6 +73,23 @@ def test_aggregate_count(collection):
         {"total": 1}
     ]
     assert list(collection.aggregate([{"$match": {"team": "none"}}, {"$count": "total"}])) == []
+
+
+def test_aggregate_match_count_indexed_mixed_numeric_values(collection):
+    collection.insert_many(
+        [
+            {"_id": "i32", "n": 1},
+            {"_id": "i64", "n": Int64(1)},
+            {"_id": "double", "n": 1.0},
+            {"_id": "other", "n": 2},
+        ]
+    )
+    collection.create_index("n", name="n_1")
+
+    for filter in [{"n": 1}, {"n": {"$eq": Int64(1)}}, {"n": 1.0}]:
+        assert list(collection.aggregate([{"$match": filter}, {"$count": "total"}])) == [
+            {"total": 3}
+        ]
 
 
 def test_aggregate_match_count_fallback_preserves_filter_errors(collection):
