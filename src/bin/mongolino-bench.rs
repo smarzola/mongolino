@@ -4,7 +4,7 @@ mod mongolino;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -233,16 +233,19 @@ fn parse_args() -> Result<Args> {
 struct Harness {
     profile: Profile,
     conn: Connection,
+    _temp_db: TempBenchmarkDatabase,
     client_state: ClientState,
 }
 
 impl Harness {
     fn new(profile: Profile) -> Result<Self> {
-        let conn = Connection::open(temp_db_path("workload"))?;
+        let temp_db = TempBenchmarkDatabase::new("workload");
+        let conn = Connection::open(temp_db.path())?;
         init_connection(&conn)?;
         Ok(Self {
             profile,
             conn,
+            _temp_db: temp_db,
             client_state: ClientState::default(),
         })
     }
@@ -335,7 +338,8 @@ impl Harness {
 }
 
 fn bench_insert_batch(profile: Profile) -> Result<BenchResult> {
-    let conn = Connection::open(temp_db_path("insert"))?;
+    let temp_db = TempBenchmarkDatabase::new("insert");
+    let conn = Connection::open(temp_db.path())?;
     init_connection(&conn)?;
     let mut client_state = ClientState::default();
     let start = Instant::now();
@@ -365,6 +369,50 @@ fn bench_insert_batch(profile: Profile) -> Result<BenchResult> {
         elapsed: start.elapsed(),
         operations,
     })
+}
+
+#[derive(Debug)]
+struct TempBenchmarkDatabase {
+    path: PathBuf,
+}
+
+impl TempBenchmarkDatabase {
+    fn new(label: &str) -> Self {
+        Self {
+            path: temp_db_path(label),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempBenchmarkDatabase {
+    fn drop(&mut self) {
+        cleanup_sqlite_database(&self.path);
+    }
+}
+
+fn cleanup_sqlite_database(path: &Path) {
+    for candidate in sqlite_database_paths(path) {
+        let _ = fs::remove_file(candidate);
+    }
+}
+
+fn sqlite_database_paths(path: &Path) -> [PathBuf; 4] {
+    [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+        sqlite_sidecar_path(path, "-journal"),
+    ]
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn seed_document(i: usize) -> Document {
@@ -550,5 +598,43 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
     BudgetThreshold {
         max_latency_ms: max_latency_ms * scale,
         min_ops_per_second,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_sqlite_database_removes_main_file_and_sidecars() {
+        let db_path = temp_db_path("cleanup-test");
+        let json_path = sqlite_sidecar_path(&db_path, ".json");
+        let paths = sqlite_database_paths(&db_path);
+
+        for path in &paths {
+            fs::write(path, b"test").expect("create sqlite cleanup test file");
+        }
+        fs::write(&json_path, b"{}").expect("create json output test file");
+
+        cleanup_sqlite_database(&db_path);
+
+        for path in &paths {
+            assert!(!path.exists(), "{} should be removed", path.display());
+        }
+        assert!(
+            json_path.exists(),
+            "{} should not be treated as a sqlite sidecar",
+            json_path.display()
+        );
+
+        fs::remove_file(json_path).expect("remove json output test file");
+    }
+
+    #[test]
+    fn cleanup_sqlite_database_ignores_missing_files() {
+        let db_path = temp_db_path("cleanup-missing-test");
+
+        cleanup_sqlite_database(&db_path);
+        cleanup_sqlite_database(&db_path);
     }
 }

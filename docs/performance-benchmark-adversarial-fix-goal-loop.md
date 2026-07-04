@@ -65,8 +65,8 @@ The fix is complete only when:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Add cleanup helper and regression coverage
-- [ ] Milestone 1: Wire cleanup into benchmark harness
+- [x] Milestone 0: Add cleanup helper and regression coverage
+- [x] Milestone 1: Wire cleanup into benchmark harness
 - [ ] Milestone 2: Final verification and commit
 
 ## Milestone 0: Add Cleanup Helper And Regression Coverage
@@ -100,6 +100,14 @@ cargo fmt -- --check
 cargo test --bin mongolino-bench
 ```
 
+Status:
+
+- 2026-07-04: Added `TempBenchmarkDatabase` and `cleanup_sqlite_database`
+  helpers in `src/bin/mongolino-bench.rs`. Added unit tests covering removal
+  of the main `.sqlite3` file, `-wal`, `-shm`, `-journal`, missing-file
+  tolerance, and preservation of a non-sidecar `.json` output file. Verified
+  with `cargo fmt -- --check` and `cargo test --bin mongolino-bench`.
+
 ## Milestone 1: Wire Cleanup Into Benchmark Harness
 
 Problem:
@@ -122,6 +130,17 @@ cargo test --bin mongolino-bench
 cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-smoke.json
 cargo run --bin mongolino-bench -- --profile ci --check-budget
 ```
+
+Status:
+
+- 2026-07-04: Wired workload and insert benchmark databases through
+  `TempBenchmarkDatabase`, preserving file-backed SQLite benchmark semantics
+  while removing the main DB and sidecars on drop. Verified no leaked
+  benchmark SQLite files with
+  `TMPDIR=/private/tmp/mongolino-bench-cleanup.diNDc0 cargo run --bin mongolino-bench -- --profile smoke --json /private/tmp/mongolino-bench-cleanup.diNDc0/mongolino-bench-smoke.json`
+  followed by
+  `find /private/tmp/mongolino-bench-cleanup.diNDc0 -maxdepth 1 -name 'mongolino-bench-*.sqlite3*' -print`;
+  the JSON file remained present and the find command printed no SQLite files.
 
 ## Milestone 2: Final Verification And Commit
 
