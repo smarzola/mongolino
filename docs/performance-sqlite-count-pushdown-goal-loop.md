@@ -97,7 +97,7 @@ When a milestone is complete:
 - [x] Milestone 1: Empty and `_id` count pushdown
 - [x] Milestone 2: Indexed scalar equality count pushdown
 - [x] Milestone 3: Aggregation `$match` + `$count` pushdown
-- [ ] Milestone 4: Benchmarks, docs, and final verification
+- [x] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Count Planner Design And Safety Tests
 
@@ -252,7 +252,7 @@ Status 2026-07-04:
 - Added an aggregation fast path for exact `[{"$match": <filter>}, {"$count": <field>}]` pipelines that reuses the SQLite count planner and preserves empty-result `$count` shape.
 - Unsupported filters, malformed stages, and non-exact pipelines continue through the existing Rust aggregation executor and existing error behavior.
 - Verification: `cargo fmt -- --check`; `cargo test aggregate`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py tests/e2e/test_spec_corpus.py`; `cargo test`.
-- Commit: pending.
+- Commit: `4402545`.
 
 Problem:
 
@@ -293,6 +293,15 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: Benchmarks, Docs, And Final Verification
+
+Status 2026-07-04:
+
+- Ran smoke, CI, and local benchmarks after count pushdown; JSON outputs were written to `/tmp/mongolino-bench-count-smoke.json` and `/tmp/mongolino-bench-count-local.json`.
+- Updated `docs/performance-baseline.md` with before/after count-pushdown evidence and remaining fallback cases.
+- Local headline changes: `count_empty_filter` 29.298 -> 0.116 ms/op; `count_simple_equality` 30.109 -> 0.066 ms/op; `aggregation_match_count` 30.032 -> 0.071 ms/op.
+- Verification: `cargo fmt -- --check`; `cargo test`; `cargo build`; `cargo run --bin mongolino-bench -- --profile smoke --json /tmp/mongolino-bench-count-smoke.json`; `cargo run --bin mongolino-bench -- --profile local --json /tmp/mongolino-bench-count-local.json`; `cargo run --bin mongolino-bench -- --profile ci --check-budget`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`.
+- Sandbox note: PyMongo e2e cannot bind localhost inside the sandbox; the exact sandbox error observed earlier was `PermissionError: [Errno 1] Operation not permitted` at `socket.bind(("127.0.0.1", 0))`.
+- Commit: pending.
 
 Problem:
 

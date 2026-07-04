@@ -54,22 +54,68 @@ Profile: `local`; seeded query dataset: 3000 documents; git commit: `ab487d3`.
 | aggregation_match_count | 100 | 3003.17 | 33.30 | 30.032 |
 | aggregation_unwind_group | 100 | 5733.27 | 17.44 | 57.333 |
 
+## Count Pushdown Results
+
+Recorded on 2026-07-04 for commit `4402545` after SQLite count pushdown.
+
+Smoke profile: seeded query dataset 400 documents.
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 25 | 39.03 | 32022.65 | 1.561 |
+| find_id_equality | 25 | 0.70 | 35739.81 | 0.028 |
+| find_collection_scan | 25 | 131.80 | 189.68 | 5.272 |
+| find_indexed_scalar_equality | 25 | 7.04 | 3549.18 | 0.282 |
+| count_empty_filter | 25 | 0.67 | 37059.88 | 0.027 |
+| count_simple_equality | 25 | 0.90 | 27700.83 | 0.036 |
+| update_index_refresh | 25 | 127.36 | 196.30 | 5.094 |
+| aggregation_match_count | 25 | 0.95 | 26204.30 | 0.038 |
+| aggregation_unwind_group | 25 | 195.90 | 127.62 | 7.836 |
+
+Local profile: seeded query dataset 3000 documents.
+
+| Benchmark | Before ms/op | After ms/op | Change |
+| --- | ---: | ---: | ---: |
+| count_empty_filter | 29.298 | 0.116 | 252.6x faster |
+| count_simple_equality | 30.109 | 0.066 | 456.2x faster |
+| aggregation_match_count | 30.032 | 0.071 | 423.0x faster |
+
+Full local profile after count pushdown:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 100 | 260.60 | 38372.56 | 2.606 |
+| find_id_equality | 100 | 2.25 | 44524.43 | 0.022 |
+| find_collection_scan | 100 | 3091.26 | 32.35 | 30.913 |
+| find_indexed_scalar_equality | 100 | 211.13 | 473.63 | 2.111 |
+| count_empty_filter | 100 | 11.61 | 8609.68 | 0.116 |
+| count_simple_equality | 100 | 6.65 | 15046.45 | 0.066 |
+| update_index_refresh | 100 | 3078.52 | 32.48 | 30.785 |
+| aggregation_match_count | 100 | 7.10 | 14084.18 | 0.071 |
+| aggregation_unwind_group | 100 | 5761.48 | 17.36 | 57.615 |
+
 ## Interpretation
 
-Current behavior already has two important fast paths:
+Current behavior has these SQLite-backed fast paths:
 
 - `_id` equality `find` uses the SQLite primary key `(namespace, id_key)` and
   avoids decoding the namespace.
 - Simple scalar equality `find` can use maintained `index_entries`, then still
   decodes matching BSON documents for final matcher compatibility.
+- `count` uses SQLite for empty filters, exact `_id` equality, and exact
+  indexed scalar equality with maintained single-field index entries.
+- Aggregation pipelines exactly shaped as `$match` followed by `$count` reuse
+  the same safe count planner and avoid BSON namespace decode when the filter
+  is pushdown-safe.
 
-The slow local results cluster around full namespace decode:
+The remaining slow local results cluster around full namespace decode:
 
 - collection-scan `find` decodes every document before filtering;
-- `count` always loads namespace documents and counts in Rust, including empty
-  filters and equality filters;
-- aggregation starts by loading the full namespace into memory, then applies
-  `$match`, `$count`, `$unwind`, and `$group` in Rust;
+- unsupported count filters fall back to Rust matcher semantics, including
+  arrays, logical operators, unsupported operators, multi-predicate filters,
+  unindexed fields, null equality, and document equality;
+- general aggregation still starts by loading the full namespace into memory,
+  then applies `$match`, `$count`, `$unwind`, and `$group` in Rust;
 - update target selection still pays scan-like cost when the selected filter is
   not narrowed enough before applying modifiers and refreshing index entries.
 
@@ -89,19 +135,18 @@ the Rust BSON matcher as a compatibility fallback.
    `count_simple_equality` is 30.109 ms/op on the local profile. Both are close
    to collection-scan cost because they decode full namespaces.
 
-   Proposed implementation: use `SELECT COUNT(*) FROM documents WHERE
-   namespace = ?` for empty filters, and count through `index_entries` for
-   supported simple scalar equality filters. Fall back to Rust for unsupported
-   operators, arrays, dotted traversal requiring array semantics, skip, or
-   limit semantics that cannot be expressed safely.
+   Completed: empty-filter count uses `SELECT COUNT(*) FROM documents WHERE
+   namespace = ?`; `_id` equality count uses the `(namespace, id_key)` primary
+   key; exact scalar equality count uses `index_entries` when a matching
+   maintained single-field index exists. Skip and positive limit are applied to
+   the SQL count result with the same count-command semantics.
 
-   Correctness risks: MongoDB matcher semantics for arrays, numeric equality,
-   dotted paths, `skip`, and `limit` must remain unchanged. Empty-filter count
-   is lowest risk; indexed scalar equality count should only use maintained
-   entries for fields already accepted by the conservative planner.
+   Fallbacks: unsupported operators, arrays, logical operators, multi-predicate
+   filters, unindexed fields, null equality, document equality, and any other
+   filter shape outside the conservative planner still use the Rust matcher.
 
-   Measurement: compare `count_empty_filter`, `count_simple_equality`, and the
-   existing Rust/e2e count tests before and after.
+   Measurement: local `count_empty_filter` improved from 29.298 to 0.116 ms/op;
+   local `count_simple_equality` improved from 30.109 to 0.066 ms/op.
 
 2. Broaden SQLite candidate narrowing for simple `find`.
 
@@ -128,17 +173,16 @@ the Rust BSON matcher as a compatibility fallback.
    Baseline: `aggregation_match_count` is 30.032 ms/op on the local profile,
    matching the count and collection-scan cluster.
 
-   Proposed implementation: detect pipelines shaped as safe `$match` followed
-   by `$count`, reuse the same SQLite count planner as command `count`, and
-   return the documented cursor response shape.
+   Completed: pipelines exactly shaped as safe `$match` followed by `$count`
+   reuse the same SQLite count planner as command `count`, and return the
+   documented cursor response shape, including empty first batches for zero
+   matched documents.
 
-   Correctness risks: aggregation command errors, cursor batch behavior, and
-   PyMongo `count_documents()` compatibility shape must stay intact. Unsupported
-   filters must fall back to the existing Rust pipeline rather than returning a
-   silently different count.
+   Fallbacks: unsupported filters, malformed stages, and non-exact pipeline
+   shapes continue through the existing Rust aggregation executor.
 
-   Measurement: compare `aggregation_match_count`, count-related e2e tests,
-   and aggregation cursor tests.
+   Measurement: local `aggregation_match_count` improved from 30.032 to
+   0.071 ms/op.
 
 4. Explore SQLite grouping for bounded scalar `$unwind`/`$group` workloads.
 
