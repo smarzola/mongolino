@@ -111,13 +111,15 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Baseline and shared query-shaping preparation
+- [x] Milestone 0: Baseline and shared query-shaping preparation
 - [ ] Milestone 1: `findAndModify` command compatibility
 - [ ] Milestone 2: Aggregation read pipeline subset
 - [ ] Milestone 3: Aggregation cursor batching and adversarial command coverage
 - [ ] Milestone 4: Spec corpus, README, and final verification hardening
 
 ## Milestone 0: Baseline and Shared Query-Shaping Preparation
+
+Status 2026-07-04: Complete. Introduced shared candidate loading, document shaping, and cursor response helpers while preserving existing `find` behavior. Verification: `cargo fmt -- --check` passed after applying `cargo fmt`; `cargo test find` passed; `cargo test aggregate` passed; `cargo test planner` passed; `cargo test` passed; `cargo build` passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` failed in the sandbox at `tests/e2e/conftest.py:103` with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`.
 
 Problem:
 

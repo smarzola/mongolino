@@ -2447,48 +2447,27 @@ fn find_documents_with_state(
         return Ok(cursor_response(db, collection, 0, "firstBatch", vec![]));
     }
 
-    let source_documents = match indexed_candidate_documents(conn, &ns, &filter)? {
-        Some(documents) => documents,
-        None => documents_for_namespace(conn, &ns)?,
-    };
-    let mut docs = Vec::new();
-    for document in source_documents {
-        match matches_filter(&document, &filter) {
-            Ok(true) => docs.push(document),
-            Ok(false) => {}
-            Err(err) => return Ok(command_error(err.code, &err.errmsg)),
-        }
-    }
-
-    if let Some(sort) = sort {
-        sort_documents(&mut docs, &sort);
-    }
-    if skip > 0 {
-        docs = docs.into_iter().skip(skip).collect();
-    }
-    if let Some(limit) = limit {
-        docs.truncate(limit);
-    }
-    if let Some(projection) = &projection {
-        docs = docs
-            .into_iter()
-            .map(|document| apply_projection(&document, projection))
-            .collect();
-    }
-
-    let (first_batch, remaining) = split_batch(docs, batch_size);
-    let cursor_id = if !single_batch && !remaining.is_empty() {
-        client_state.insert_cursor(ns, remaining)
-    } else {
-        0
+    let docs = match query_documents(
+        conn,
+        &ns,
+        &filter,
+        sort.as_deref(),
+        skip,
+        limit,
+        projection.as_ref(),
+    ) {
+        Ok(docs) => docs,
+        Err(err) => return Ok(command_error(err.code, &err.errmsg)),
     };
 
-    Ok(cursor_response(
+    Ok(cursor_response_for_documents(
+        client_state,
         db,
         collection,
-        cursor_id,
-        "firstBatch",
-        first_batch,
+        &ns,
+        docs,
+        batch_size,
+        single_batch,
     ))
 }
 
@@ -2617,6 +2596,25 @@ fn split_batch(documents: Vec<Document>, batch_size: usize) -> (Vec<Document>, V
         }
     }
     (first_batch, remaining)
+}
+
+fn cursor_response_for_documents(
+    client_state: &mut ClientState,
+    db: &str,
+    collection: &str,
+    namespace: &str,
+    documents: Vec<Document>,
+    batch_size: usize,
+    single_batch: bool,
+) -> Document {
+    let (first_batch, remaining) = split_batch(documents, batch_size);
+    let cursor_id = if !single_batch && !remaining.is_empty() {
+        client_state.insert_cursor(namespace.to_string(), remaining)
+    } else {
+        0
+    };
+
+    cursor_response(db, collection, cursor_id, "firstBatch", first_batch)
 }
 
 fn optional_i64(command: &Document, key: &str) -> std::result::Result<Option<i64>, String> {
@@ -2930,6 +2928,65 @@ fn indexed_candidate_documents(
         .map(|row| decode_document(row?))
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(documents))
+}
+
+fn candidate_documents(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+) -> Result<Vec<Document>> {
+    match indexed_candidate_documents(conn, namespace, filter)? {
+        Some(documents) => Ok(documents),
+        None => documents_for_namespace(conn, namespace),
+    }
+}
+
+fn query_documents(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    sort: Option<&[(String, i32)]>,
+    skip: usize,
+    limit: Option<usize>,
+    projection: Option<&ProjectionSpec>,
+) -> std::result::Result<Vec<Document>, MatchError> {
+    let source_documents = candidate_documents(conn, namespace, filter)
+        .map_err(|err| match_error(8, err.to_string()))?;
+    shape_documents(source_documents, filter, sort, skip, limit, projection)
+}
+
+fn shape_documents(
+    source_documents: Vec<Document>,
+    filter: &Document,
+    sort: Option<&[(String, i32)]>,
+    skip: usize,
+    limit: Option<usize>,
+    projection: Option<&ProjectionSpec>,
+) -> MatchResult<Vec<Document>> {
+    let mut docs = Vec::new();
+    for document in source_documents {
+        if matches_filter(&document, filter)? {
+            docs.push(document);
+        }
+    }
+
+    if let Some(sort) = sort {
+        sort_documents(&mut docs, sort);
+    }
+    if skip > 0 {
+        docs = docs.into_iter().skip(skip).collect();
+    }
+    if let Some(limit) = limit {
+        docs.truncate(limit);
+    }
+    if let Some(projection) = projection {
+        docs = docs
+            .into_iter()
+            .map(|document| apply_projection(&document, projection))
+            .collect();
+    }
+
+    Ok(docs)
 }
 
 fn simple_equality_filter_field(filter: &Document) -> Option<(&str, &Bson)> {
