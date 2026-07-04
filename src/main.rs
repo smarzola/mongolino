@@ -465,6 +465,7 @@ fn read_document_at(bytes: &[u8]) -> Result<(Document, usize)> {
     Ok((doc, len))
 }
 
+#[cfg(test)]
 fn handle_command(conn: &Connection, command: &Document) -> Result<Document> {
     let mut client_state = ClientState::default();
     handle_command_with_state(conn, &mut client_state, command)
@@ -2345,6 +2346,7 @@ fn apply_delete_entry(
     Ok(removed)
 }
 
+#[cfg(test)]
 fn find_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let mut client_state = ClientState::default();
     find_documents_with_state(conn, &mut client_state, command)

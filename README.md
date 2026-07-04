@@ -114,6 +114,15 @@ uv sync --locked --dev
 uv run --locked pytest tests/e2e
 ```
 
+Useful targeted subsets while developing:
+
+```sh
+uv run --locked pytest tests/e2e/test_cursors.py
+uv run --locked pytest tests/e2e/test_lifecycle.py
+uv run --locked pytest tests/e2e/test_indexes.py
+uv run --locked pytest tests/e2e/test_metadata.py
+```
+
 The e2e suite builds or locates `target/debug/mongolino`, starts it on a
 temporary localhost port with a temporary SQLite file, connects with PyMongo,
 and tears it down after each test. It does not require Docker or an external
