@@ -167,7 +167,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Planner v2 architecture and diagnostics model
-- [ ] Milestone 1: Equality-prefix candidate narrowing
+- [x] Milestone 1: Equality-prefix candidate narrowing
 - [ ] Milestone 2: Safe range scans and count pushdown
 - [ ] Milestone 3: Hint command semantics
 - [ ] Milestone 4: Explain diagnostics
@@ -269,6 +269,16 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/te
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
+
+Status 2026-07-04: Added maintained `compound-prefix` index-entry keys for
+leading compound equality prefixes and used them for `find`, update/delete
+target selection, and findAndModify, with matcher validation still applied.
+Verification passed with `cargo fmt -- --check`, `cargo test planner`,
+`cargo test index`, `cargo test update`, and unsandboxed
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e/test_indexes.py tests/e2e/test_crud.py
+tests/e2e/test_find_and_modify.py` after the sandboxed e2e run failed to bind
+localhost. Commit: reported in goal-loop status after commit creation.
 
 ## Milestone 2: Safe Range Scans And Count Pushdown
 

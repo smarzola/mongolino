@@ -3375,7 +3375,10 @@ fn index_entries_safe_for_planner_tx(
 
 #[cfg(test)]
 fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
-    planner_keys_for_document(spec, document).into_iter().next()
+    if single_field_index_name(spec).is_some() {
+        return planner_keys_for_document(spec, document).into_iter().next();
+    }
+    compound_key_from_document(spec, document, is_compound_planner_scalar)
 }
 
 fn planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<String> {
@@ -3391,9 +3394,26 @@ fn planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<Strin
             .map(|value| vec![id_key_from_bson(value)])
             .unwrap_or_default();
     }
-    compound_key_from_document(spec, document, is_compound_planner_scalar)
-        .into_iter()
-        .collect()
+    compound_planner_keys_for_document(spec, document)
+}
+
+fn compound_planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(full_key) = compound_key_from_document(spec, document, is_compound_planner_scalar) {
+        keys.push(full_key);
+    }
+    let mut prefix_parts = Vec::new();
+    for field in spec.key.keys().take(spec.key.len().saturating_sub(1)) {
+        let Some(value) = get_document_path(document, field) else {
+            break;
+        };
+        if !is_compound_planner_scalar(value) {
+            break;
+        }
+        prefix_parts.push(id_key_from_bson(value));
+        keys.push(encode_compound_prefix_planner_key(&prefix_parts));
+    }
+    keys
 }
 
 fn supported_single_field_multikey_values(document: &Document, field: &str) -> Option<Vec<Bson>> {
@@ -4668,6 +4688,10 @@ enum TransactionCandidatePlan {
         key_value: String,
         unique: bool,
     },
+    IndexedPrefix {
+        index_name: String,
+        key_value: String,
+    },
     Fallback,
 }
 
@@ -4697,6 +4721,21 @@ fn plan_transaction_candidates(
             unique: index.unique,
         });
     }
+    for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
+        let Some((_, key_value)) = prefix_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
+        if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
+            continue;
+        }
+        return Ok(TransactionCandidatePlan::IndexedPrefix {
+            index_name: index.name,
+            key_value,
+        });
+    }
     Ok(TransactionCandidatePlan::Fallback)
 }
 
@@ -4722,6 +4761,10 @@ fn transaction_candidate_documents(
                 indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value)
             }
         }
+        TransactionCandidatePlan::IndexedPrefix {
+            index_name,
+            key_value,
+        } => indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value),
         TransactionCandidatePlan::Fallback => stored_documents_for_namespace_tx(tx, namespace),
     }
 }
@@ -6343,6 +6386,18 @@ fn indexed_candidate_documents(
 ) -> Result<Option<Vec<Document>>> {
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+            continue;
+        }
+        return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
+    }
+    for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        let Some((_, key_value)) = prefix_planner_key_for_filter(&index, filter) else {
             continue;
         };
         if !filter_implies_index_membership(&index, filter) {
@@ -10706,7 +10761,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(entries, 2);
+        assert_eq!(entries, 4);
         let duplicate = insert_documents(
             &conn,
             &doc! {
@@ -11565,10 +11620,16 @@ mod tests {
             find_ids(&conn, doc! { "profile.city": "Rome", "active": true }),
             vec!["u1", "u3"]
         );
-        assert!(
-            indexed_candidate_documents(&conn, "app.users", &doc! { "profile.city": "Rome" },)
+        let prefix_candidates =
+            indexed_candidate_documents(&conn, "app.users", &doc! { "profile.city": "Rome" })
                 .unwrap()
-                .is_none()
+                .unwrap();
+        assert_eq!(
+            prefix_candidates
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u3"]
         );
         assert!(
             indexed_candidate_documents(
@@ -11579,6 +11640,110 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn planner_uses_compound_prefix_entries_for_reads_and_write_targeting() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_transaction_candidates(
+                &conn.unchecked_transaction().unwrap(),
+                "app.users",
+                &doc! { "profile.city": "Rome" }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::IndexedPrefix {
+                index_name: "city_active_1".to_string(),
+                key_value: "compound-prefix:1:8:str:Rome".to_string(),
+            }
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            vec!["u1", "u3"]
+        );
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u4", "profile": { "city": "Rome" }, "active": false }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            vec!["u1", "u3", "u4"]
+        );
+
+        let updated = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "profile.city": "Rome" }, "u": { "$set": { "profile.city": "Milan" } }, "multi": true }],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_i32("n").unwrap(), 3);
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Milan" }),
+            vec!["u1", "u3", "u4"]
+        );
+
+        let deleted = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "profile.city": "Milan" }, "limit": 0_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted.get_i32("n").unwrap(), 3);
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Milan" }),
+            Vec::<String>::new()
+        );
+
+        let moved = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "profile.city": "London" },
+                "update": { "$set": { "profile.city": "Rome", "active": true } },
+                "new": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            moved
+                .get_document("value")
+                .unwrap()
+                .get_document("profile")
+                .unwrap()
+                .get_str("city")
+                .unwrap(),
+            "Rome"
+        );
+        assert_eq!(find_ids(&conn, doc! { "profile.city": "Rome" }), vec!["u2"]);
     }
 
     #[test]
@@ -11892,7 +12057,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 10);
         let omissions: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users' AND index_name = 'city_active_1'",

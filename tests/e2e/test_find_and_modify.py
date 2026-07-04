@@ -234,6 +234,21 @@ def test_find_and_modify_refreshes_compound_index_entries(collection):
     assert collection.find_one({"state": "queued", "email": "b@example.test"}) is None
 
 
+def test_find_and_modify_targets_compound_prefix_filter(collection):
+    seed_jobs(collection)
+    collection.create_index([("state", ASCENDING), ("email", ASCENDING)], name="state_email_1")
+
+    updated = collection.find_one_and_update(
+        {"state": "queued"},
+        {"$set": {"state": "running"}},
+        sort=[("priority", DESCENDING)],
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j2"
+    assert collection.find_one({"state": "queued", "email": "b@example.test"}) is None
+    assert collection.find_one({"state": "running"})["_id"] == "j2"
+
+
 def test_find_and_modify_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
     collection.insert_many(
         [

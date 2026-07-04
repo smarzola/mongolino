@@ -339,6 +339,19 @@ def test_update_targets_compound_indexed_filters(collection):
     assert fallback_numeric.matched_count == 0
 
 
+def test_update_targets_compound_prefix_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    many = collection.update_many(
+        {"profile.city": "Rome"},
+        {"$set": {"team": "compound-prefix"}},
+    )
+    assert many.matched_count == 2
+    assert many.modified_count == 2
+    assert ids(collection.find({"team": "compound-prefix"}).sort("_id", ASCENDING)) == ["u1", "u3"]
+
+
 def test_update_preserves_partial_unique_membership(collection):
     collection.insert_many(
         [
@@ -475,6 +488,15 @@ def test_delete_targets_compound_indexed_filters(collection):
     many = collection.delete_many({"profile.city": "Rome", "active": True})
     assert many.deleted_count == 1
     assert ids(collection.find({})) == ["u2"]
+
+
+def test_delete_targets_compound_prefix_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    many = collection.delete_many({"profile.city": "Rome"})
+    assert many.deleted_count == 2
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u2"]
 
 
 def test_delete_targets_scalar_multikey_indexed_matches(collection):

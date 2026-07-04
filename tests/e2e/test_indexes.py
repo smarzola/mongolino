@@ -615,6 +615,29 @@ def test_compound_indexed_query_results_stay_correct_after_mutations(collection)
     ]
 
 
+def test_compound_prefix_find_uses_fresh_index_entries(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "profile": {"city": "Rome"}, "active": True},
+            {"_id": "u2", "profile": {"city": "London"}, "active": True},
+            {"_id": "u3", "profile": {"city": "Rome"}, "active": False},
+        ]
+    )
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    assert ids(collection.find({"profile.city": "Rome"}).sort("_id", ASCENDING)) == ["u1", "u3"]
+
+    collection.insert_one({"_id": "u4", "profile": {"city": "Rome"}, "active": True})
+    assert ids(collection.find({"profile.city": "Rome"}).sort("_id", ASCENDING)) == ["u1", "u3", "u4"]
+
+    collection.update_one({"_id": "u3"}, {"$set": {"profile.city": "Milan"}})
+    assert ids(collection.find({"profile.city": "Rome"}).sort("_id", ASCENDING)) == ["u1", "u4"]
+    assert ids(collection.find({"profile.city": "Milan"}).sort("_id", ASCENDING)) == ["u3"]
+
+    collection.delete_one({"_id": "u1"})
+    assert ids(collection.find({"profile.city": "Rome"}).sort("_id", ASCENDING)) == ["u4"]
+
+
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):
     collection.insert_many(
         [
