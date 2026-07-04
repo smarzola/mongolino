@@ -951,6 +951,7 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
             Err(errmsg) => Ok(command_error(2, &errmsg)),
         };
     }
+    sweep_ttl_namespace(conn, &ns)?;
     let count = if let Some(hint) = hint.as_ref() {
         let documents = match candidate_documents_with_hint(conn, &ns, &filter, Some(hint)) {
             Ok(documents) => documents,
@@ -1002,7 +1003,9 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
     };
 
     let mut values = Vec::<Bson>::new();
-    for document in documents_for_namespace(conn, &namespace(db, collection))? {
+    let ns = namespace(db, collection);
+    sweep_ttl_namespace(conn, &ns)?;
+    for document in documents_for_namespace(conn, &ns)? {
         match matches_filter(&document, &filter) {
             Ok(true) => {
                 for value in distinct_values_at_path(&document, key) {
@@ -1058,6 +1061,7 @@ fn aggregate_command_with_state(
         Err(_) => return Ok(command_error(9, "aggregate requires a pipeline array")),
     };
     let ns = namespace(db, collection);
+    sweep_ttl_namespace(conn, &ns)?;
     if let Some(documents) = aggregate_match_count_pushdown(conn, &ns, pipeline)? {
         let documents = match documents {
             Ok(documents) => documents,
@@ -1841,6 +1845,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     } else {
         collection_options_tx(&tx, &namespace)?
     };
+    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
     let outcome = if remove {
         apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref(), hint.as_ref())?
     } else {
@@ -5053,6 +5058,7 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
     } else {
         collection_options_tx(&tx, &namespace)?
     };
+    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
 
     {
         let mut stmt = tx.prepare(
@@ -5215,6 +5221,7 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
     } else {
         collection_options_tx(&tx, &namespace)?
     };
+    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
 
     for (index, entry) in updates.iter().enumerate() {
         let result = apply_update_entry(&tx, &namespace, entry, &options);
@@ -6566,6 +6573,7 @@ fn delete_documents(conn: &Connection, command: &Document) -> Result<Document> {
 
     let namespace = namespace(db, collection);
     let tx = conn.unchecked_transaction()?;
+    sweep_ttl_namespace_at_tx(&tx, &namespace, bson::DateTime::now())?;
     let mut removed = 0_i32;
     let mut write_errors = Vec::new();
 
@@ -6741,6 +6749,7 @@ fn find_documents_with_state(
             Err(errmsg) => Ok(command_error(2, &errmsg)),
         };
     }
+    sweep_ttl_namespace(conn, &ns)?;
 
     if hint.is_none()
         && sort.is_none()
@@ -12036,6 +12045,217 @@ mod tests {
         assert_eq!(removed, 2);
         let remaining = documents_for_namespace(&conn, "app.events").unwrap();
         assert_eq!(remaining[0].get_str("_id").unwrap(), "kept");
+    }
+
+    fn seed_ttl_command_fixture(conn: &Connection, collection: &str) {
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        let future =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() + 86_400_000);
+        create_indexes(
+            conn,
+            &doc! {
+                "createIndexes": collection,
+                "$db": "app",
+                "indexes": [
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                    { "key": { "category": 1_i32 }, "name": "category_1" },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            conn,
+            &doc! {
+                "insert": collection,
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "category": "old", "expiresAt": past },
+                    { "_id": "future", "category": "new", "expiresAt": future },
+                ],
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ttl_sweeps_before_observable_read_paths() {
+        let conn = test_conn();
+
+        seed_ttl_command_fixture(&conn, "finds");
+        let find = find_documents(
+            &conn,
+            &doc! {
+                "find": "finds",
+                "$db": "app",
+                "filter": { "category": "old" },
+                "hint": "category_1",
+            },
+        )
+        .unwrap();
+        assert!(first_batch(&find).is_empty());
+        assert_eq!(
+            documents_for_namespace(&conn, "app.finds").unwrap().len(),
+            1
+        );
+
+        seed_ttl_command_fixture(&conn, "counts");
+        let count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "counts",
+                "$db": "app",
+                "query": { "category": "old" },
+                "hint": "category_1",
+            },
+        )
+        .unwrap();
+        assert_eq!(count.get_i64("n").unwrap(), 0);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.counts").unwrap().len(),
+            1
+        );
+
+        seed_ttl_command_fixture(&conn, "aggregates");
+        let aggregate = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "aggregates",
+                "$db": "app",
+                "pipeline": [{ "$match": {} }, { "$count": "n" }],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        let batch = first_batch(&aggregate);
+        assert_eq!(batch[0].get_i64("n").unwrap(), 1);
+
+        seed_ttl_command_fixture(&conn, "distincts");
+        let distinct = distinct_command(
+            &conn,
+            &doc! { "distinct": "distincts", "$db": "app", "key": "category" },
+        )
+        .unwrap();
+        assert_eq!(
+            distinct.get_array("values").unwrap(),
+            &vec![Bson::String("new".to_string())]
+        );
+    }
+
+    #[test]
+    fn ttl_sweeps_before_writes_and_releases_unique_conflicts() {
+        let conn = test_conn();
+        let past =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 86_400_000);
+        let future =
+            bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() + 86_400_000);
+
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                    { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "expired", "email": "same@example.test", "expiresAt": past }],
+            },
+        )
+        .unwrap();
+        let insert = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "replacement", "email": "same@example.test", "expiresAt": future }],
+            },
+        )
+        .unwrap();
+        assert!(!insert.contains_key("writeErrors"));
+        assert_eq!(
+            documents_for_namespace(&conn, "app.users").unwrap().len(),
+            1
+        );
+
+        seed_ttl_command_fixture(&conn, "updates");
+        let update = update_documents(
+            &conn,
+            &doc! {
+                "update": "updates",
+                "$db": "app",
+                "updates": [{ "q": { "category": "old" }, "u": { "$set": { "seen": true } }, "multi": true }],
+            },
+        )
+        .unwrap();
+        assert_eq!(update.get_i32("n").unwrap(), 0);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.updates").unwrap().len(),
+            1
+        );
+
+        seed_ttl_command_fixture(&conn, "deletes");
+        let delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "deletes",
+                "$db": "app",
+                "deletes": [{ "q": { "category": "old" }, "limit": 0_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(delete.get_i32("n").unwrap(), 0);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.deletes").unwrap().len(),
+            1
+        );
+
+        seed_ttl_command_fixture(&conn, "fam");
+        let fam = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "fam",
+                "$db": "app",
+                "query": { "category": "old" },
+                "update": { "$set": { "seen": true } },
+                "new": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(fam.get("value").unwrap(), &Bson::Null);
+        assert_eq!(documents_for_namespace(&conn, "app.fam").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ttl_does_not_sweep_when_read_hint_validation_fails() {
+        let conn = test_conn();
+        seed_ttl_command_fixture(&conn, "hints");
+
+        let response = find_documents(
+            &conn,
+            &doc! {
+                "find": "hints",
+                "$db": "app",
+                "filter": { "category": "old" },
+                "hint": "missing_1",
+            },
+        )
+        .unwrap();
+
+        assert_command_error(&response);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.hints").unwrap().len(),
+            2
+        );
     }
 
     #[test]

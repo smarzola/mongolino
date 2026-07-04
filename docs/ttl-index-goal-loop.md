@@ -179,7 +179,7 @@ When a milestone is complete:
 - [x] Milestone 0: TTL metadata model and migration-safe persistence
 - [x] Milestone 1: `createIndexes` TTL validation and listing
 - [x] Milestone 2: Deterministic TTL sweeper core
-- [ ] Milestone 3: Wire-visible read/write sweep integration
+- [x] Milestone 3: Wire-visible read/write sweep integration
 - [ ] Milestone 4: `collMod` TTL update subset
 - [ ] Milestone 5: Adversarial PyMongo/spec-corpus coverage
 - [ ] Milestone 6: Benchmarks, docs, scorecard, final verification
@@ -319,7 +319,7 @@ Status:
   testable clock, atomic document/index-entry deletion, repeated-sweep
   idempotency, multiple TTL index handling, and non-date/non-expiring safety.
   Verification passed: `cargo fmt -- --check`; `cargo test ttl`;
-  `cargo test index_entries`. Commit: pending.
+  `cargo test index_entries`. Commit: `f750870`.
 
 Likely files:
 
@@ -369,6 +369,16 @@ Acceptance criteria:
 - Tests prove hint errors and malformed commands do not run unintended
   unrelated sweeps.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed read/write command-boundary TTL sweep integration for
+  find, count, aggregate, distinct, insert, update, delete, and findAndModify,
+  including planner/count paths, unique-index reuse after expiration, and no
+  sweep on invalid read hints. Verification passed: `cargo fmt -- --check`;
+  `cargo test ttl`; `cargo test count`; `cargo test hint`;
+  `cargo test find_and_modify`; `cargo test update`; `cargo test delete`.
+  Commit: pending.
 
 Likely files:
 
