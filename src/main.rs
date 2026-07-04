@@ -815,6 +815,10 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
         "DELETE FROM index_entries WHERE namespace = ?1",
         params![ns],
     )?;
+    tx.execute(
+        "DELETE FROM index_multikey_omissions WHERE namespace = ?1",
+        params![ns],
+    )?;
     tx.commit()?;
 
     Ok(doc! {
@@ -845,6 +849,10 @@ fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
     )?;
     tx.execute(
         "DELETE FROM index_entries WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
+    tx.execute(
+        "DELETE FROM index_multikey_omissions WHERE namespace LIKE ?1",
         params![prefix],
     )?;
     tx.commit()?;
@@ -6895,7 +6903,7 @@ mod tests {
         let conn = test_conn();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "name": "Ada" }] },
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "name": "Ada", "tags": ["math"] }] },
         )
         .unwrap();
         create_indexes(
@@ -6903,7 +6911,10 @@ mod tests {
             &doc! {
                 "createIndexes": "users",
                 "$db": "app",
-                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_1" }],
+                "indexes": [
+                    { "key": { "name": 1_i32 }, "name": "name_1" },
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                ],
             },
         )
         .unwrap();
@@ -6915,6 +6926,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entries_before_drop, 1);
+        let omissions_before_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omissions_before_drop, 1);
 
         let response = drop_collection(&conn, &doc! { "drop": "users", "$db": "app" }).unwrap();
         assert_eq!(response.get_f64("ok").unwrap(), 1.0);
@@ -6943,8 +6962,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let omissions_after_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(indexes_after_drop, 0);
         assert_eq!(entries_after_drop, 0);
+        assert_eq!(omissions_after_drop, 0);
     }
 
     #[test]
@@ -6952,12 +6979,30 @@ mod tests {
         let conn = test_conn();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1" }] },
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "tags": ["math"] }] },
         )
         .unwrap();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "other", "documents": [{ "_id": "u2" }] },
+            &doc! { "insert": "users", "$db": "other", "documents": [{ "_id": "u2", "tags": ["math"] }] },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "other",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
         )
         .unwrap();
 
@@ -6972,6 +7017,22 @@ mod tests {
             documents_for_namespace(&conn, "other.users").unwrap().len(),
             1
         );
+        let app_omissions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace LIKE 'app.%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let other_omissions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'other.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(app_omissions, 0);
+        assert_eq!(other_omissions, 1);
     }
 
     #[test]
@@ -9042,6 +9103,52 @@ mod tests {
         .map(|index| index.get_str("name").unwrap().to_string())
         .collect::<Vec<_>>();
         assert_eq!(names, vec!["_id_", "profile.city_-1"]);
+    }
+
+    #[test]
+    fn drop_indexes_all_removes_multikey_omission_sentinels() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "tags": ["math"] }],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        let omissions_before_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omissions_before_drop, 1);
+
+        let response = drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "*" },
+        )
+        .unwrap();
+        assert_eq!(response.get_i32("numIndexesAfter").unwrap(), 1);
+        let omissions_after_drop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(omissions_after_drop, 0);
     }
 
     #[test]

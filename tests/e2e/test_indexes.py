@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING
@@ -9,6 +11,14 @@ pytestmark = pytest.mark.e2e
 
 def index_names(collection):
     return [index["name"] for index in collection.list_indexes()]
+
+
+def multikey_omission_count(db_path, namespace):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = ?",
+            (namespace,),
+        ).fetchone()[0]
 
 
 def test_create_list_and_drop_indexes(collection):
@@ -47,9 +57,16 @@ def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
     assert excinfo.value.code == 85
 
 
-def test_drop_indexes_all_preserves_id_index(collection):
+def test_drop_indexes_all_preserves_id_index(collection, mongolino_server):
+    collection.insert_one({"_id": "u1", "tags": ["math"]})
     collection.create_index([("email", ASCENDING)], name="email_1")
     collection.create_index([("name", ASCENDING)], name="name_1")
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+
+    assert multikey_omission_count(
+        mongolino_server.db_path,
+        f"{collection.database.name}.{collection.name}",
+    ) == 1
 
     response = collection.database.command(
         {"dropIndexes": collection.name, "index": "*"}
@@ -57,6 +74,10 @@ def test_drop_indexes_all_preserves_id_index(collection):
 
     assert response["ok"] == 1.0
     assert index_names(collection) == ["_id_"]
+    assert multikey_omission_count(
+        mongolino_server.db_path,
+        f"{collection.database.name}.{collection.name}",
+    ) == 0
 
 
 def test_unsupported_index_options_are_explicit(collection):

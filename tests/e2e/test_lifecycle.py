@@ -1,3 +1,4 @@
+import sqlite3
 import uuid
 
 import pytest
@@ -9,6 +10,14 @@ pytestmark = pytest.mark.e2e
 
 def unique_name(prefix):
     return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def multikey_omission_count(db_path, namespace):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = ?",
+            (namespace,),
+        ).fetchone()[0]
 
 
 def test_create_collection_and_list_empty_collection(mongo_client):
@@ -42,6 +51,19 @@ def test_inserted_collection_is_listed_and_drop_removes_catalog_and_documents(co
     assert collection.find_one({"_id": "u1"}) is None
 
 
+def test_drop_removes_index_multikey_omission_sentinels(mongo_client, mongolino_server):
+    db_name = unique_name("life")
+    collection = mongo_client[db_name].users
+    collection.insert_one({"_id": "u1", "tags": ["math"]})
+    collection.create_index("tags", name="tags_1")
+
+    assert multikey_omission_count(mongolino_server.db_path, f"{db_name}.users") == 1
+
+    collection.drop()
+
+    assert multikey_omission_count(mongolino_server.db_path, f"{db_name}.users") == 0
+
+
 def test_database_drop_collection_helper(mongo_client):
     db = mongo_client[unique_name("life")]
     db.create_collection("empty")
@@ -62,6 +84,23 @@ def test_drop_database_removes_only_target_database(mongo_client):
     assert target_name not in mongo_client.list_database_names()
     assert mongo_client[target_name].users.find_one({"_id": "u1"}) is None
     assert mongo_client[other_name].users.find_one({"_id": "u2"})["_id"] == "u2"
+
+
+def test_drop_database_removes_index_multikey_omission_sentinels(mongo_client, mongolino_server):
+    target_name = unique_name("life")
+    other_name = unique_name("life")
+    mongo_client[target_name].users.insert_one({"_id": "u1", "tags": ["math"]})
+    mongo_client[other_name].users.insert_one({"_id": "u2", "tags": ["math"]})
+    mongo_client[target_name].users.create_index("tags", name="tags_1")
+    mongo_client[other_name].users.create_index("tags", name="tags_1")
+
+    assert multikey_omission_count(mongolino_server.db_path, f"{target_name}.users") == 1
+    assert multikey_omission_count(mongolino_server.db_path, f"{other_name}.users") == 1
+
+    mongo_client.drop_database(target_name)
+
+    assert multikey_omission_count(mongolino_server.db_path, f"{target_name}.users") == 0
+    assert multikey_omission_count(mongolino_server.db_path, f"{other_name}.users") == 1
 
 
 def test_create_collection_rejects_unsupported_options(mongo_client):
