@@ -325,7 +325,7 @@ Status 2026-07-05:
   - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`
   - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
   - Result: 206 passed in 107.16s unsandboxed.
-- Commit: pending final verification commit.
+- Commit: `ffa583d` (`Record aggregation adversarial final verification`).
 
 ## Final Response Requirements
 
