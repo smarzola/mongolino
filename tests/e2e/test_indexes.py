@@ -21,6 +21,14 @@ def multikey_omission_count(db_path, namespace):
         ).fetchone()[0]
 
 
+def index_entry_count(db_path, namespace, index_name):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM index_entries WHERE namespace = ? AND index_name = ?",
+            (namespace, index_name),
+        ).fetchone()[0]
+
+
 def test_create_list_and_drop_indexes(collection):
     assert index_names(collection) == ["_id_"]
 
@@ -240,6 +248,60 @@ def test_unique_index_missing_and_null_fallback_semantics(collection):
 
     with pytest.raises(DuplicateKeyError):
         collection.update_one({"_id": "u4"}, {"$set": {"email": None}}, upsert=True)
+
+
+def test_unique_sparse_index_membership_and_null_semantics(collection, mongolino_server):
+    collection.insert_many(
+        [
+            {"_id": "u1", "name": "missing-a"},
+            {"_id": "u2", "name": "missing-b"},
+            {"_id": "u3", "email": None},
+            {"_id": "u4", "email": "ada@example.test"},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_sparse", unique=True, sparse=True)
+
+    namespace = f"{collection.database.name}.{collection.name}"
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 2
+
+    collection.insert_one({"_id": "u5", "name": "missing-c"})
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u6", "email": None})
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u7", "email": "ada@example.test"})
+
+    collection.update_one({"_id": "u5"}, {"$set": {"email": "grace@example.test"}})
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 3
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one({"_id": "u2"}, {"$set": {"email": "grace@example.test"}})
+
+    collection.update_one({"_id": "u5"}, {"$unset": {"email": ""}})
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 2
+
+
+def test_unique_compound_sparse_requires_all_fields(collection, mongolino_server):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test"},
+            {"_id": "u2", "role": "admin"},
+            {"_id": "u3", "email": "ada@example.test", "role": "admin"},
+            {"_id": "u4", "email": "grace@example.test", "role": "admin"},
+        ]
+    )
+    collection.create_index(
+        [("email", ASCENDING), ("role", ASCENDING)],
+        name="email_role_sparse",
+        unique=True,
+        sparse=True,
+    )
+
+    namespace = f"{collection.database.name}.{collection.name}"
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_role_sparse") == 2
+
+    collection.insert_one({"_id": "u5", "email": "ada@example.test"})
+    collection.insert_one({"_id": "u6", "role": "admin"})
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u7", "email": "ada@example.test", "role": "admin"})
 
 
 def test_unique_unordered_bulk_partial_success_and_drop_index(collection):

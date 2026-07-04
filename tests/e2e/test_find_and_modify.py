@@ -82,6 +82,37 @@ def test_find_one_and_update_rejects_numeric_unique_conflict(collection):
     assert collection.find_one({"_id": "n2"})["n"] == 2
 
 
+def test_find_and_modify_refreshes_sparse_unique_membership(collection):
+    collection.insert_many(
+        [
+            {"_id": "j1", "state": "queued"},
+            {"_id": "j2", "state": "queued", "email": "taken@example.test"},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_sparse", unique=True, sparse=True)
+
+    updated = collection.find_one_and_update(
+        {"_id": "j1"},
+        {"$set": {"email": "new@example.test"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["email"] == "new@example.test"
+
+    with pytest.raises(DuplicateKeyError):
+        collection.find_one_and_update(
+            {"_id": "j1"},
+            {"$set": {"email": "taken@example.test"}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    removed = collection.find_one_and_update(
+        {"_id": "j1"},
+        {"$unset": {"email": ""}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert "email" not in removed
+
+
 def test_find_one_and_delete_removes_and_returns_sorted_document(collection):
     seed_jobs(collection)
 

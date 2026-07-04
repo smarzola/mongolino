@@ -454,6 +454,21 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
             upsert=True,
         )
 
+    sparse = mongo_client["update_operator_sparse_unique"].users
+    sparse.create_index([("email", ASCENDING)], unique=True, sparse=True)
+    sparse.insert_many(
+        [
+            {"_id": "s1", "name": "missing"},
+            {"_id": "s2", "altEmail": "ada@example.test"},
+            {"_id": "s3", "email": "taken@example.test"},
+        ]
+    )
+    sparse.update_one({"_id": "s2"}, {"$rename": {"altEmail": "email"}})
+    with pytest.raises(DuplicateKeyError):
+        sparse.update_one({"_id": "s1"}, {"$set": {"email": "ada@example.test"}})
+    sparse.update_one({"_id": "s2"}, {"$unset": {"email": ""}})
+    sparse.update_one({"_id": "s1"}, {"$set": {"email": "ada@example.test"}})
+
     numeric = mongo_client["update_operator_numeric_unique"].users
     numeric.create_index([("n", ASCENDING)], unique=True)
     numeric.insert_many([{"_id": "n1", "n": 1}, {"_id": "n2", "n": 2}])

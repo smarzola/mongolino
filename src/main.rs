@@ -2261,7 +2261,7 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
     if let Some(value) = exact_equality_filter_value(filter, "_id") {
         return Ok(CountPlan::IdEquality(id_key_from_bson(value)));
     }
-    for index in indexes_for_namespace(conn, namespace)? {
+    for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -3225,6 +3225,17 @@ fn single_field_index_name(spec: &IndexSpec) -> Option<&str> {
 
 fn is_compound_index(spec: &IndexSpec) -> bool {
     spec.key.len() > 1
+}
+
+fn planner_indexes(mut indexes: Vec<IndexSpec>) -> Vec<IndexSpec> {
+    indexes.sort_by(|left, right| {
+        right
+            .key
+            .len()
+            .cmp(&left.key.len())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    indexes
 }
 
 fn compound_key_from_document(
@@ -4308,7 +4319,7 @@ fn plan_transaction_candidates(
             value,
         )));
     }
-    for index in indexes_for_namespace_tx(tx, namespace)? {
+    for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -5964,7 +5975,7 @@ fn indexed_candidate_documents(
     namespace: &str,
     filter: &Document,
 ) -> Result<Option<Vec<Document>>> {
-    for index in indexes_for_namespace(conn, namespace)? {
+    for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
         let Some(key_value) = planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -8146,10 +8157,16 @@ mod tests {
             ),
             Some("compound:2:8:str:Rome:9:bool:true".to_string())
         );
+        assert_eq!(
+            compound_planner_key_for_filter(
+                &spec,
+                &doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
+            ),
+            Some("compound:2:8:str:Rome:9:bool:true".to_string())
+        );
 
         for filter in [
             doc! { "profile.city": "Rome" },
-            doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
             doc! { "$or": [{ "profile.city": "Rome", "active": true }] },
             doc! { "profile.city": "Rome", "active": { "$in": [true] } },
             doc! { "profile.city": "Rome", "active": { "$ne": false } },
@@ -8226,6 +8243,41 @@ mod tests {
                 unique: false,
             }
         );
+        assert_eq!(
+            plan_transaction_candidates(&tx, "app.users", &doc! { "active": true, "name": "Ada" })
+                .unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "active_1".to_string(),
+                key_value: "bool:true".to_string(),
+                unique: false,
+            }
+        );
+        assert_eq!(
+            plan_transaction_candidates(
+                &tx,
+                "app.users",
+                &doc! { "profile.city": "Rome", "active": true, "name": "Ada" }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "city_active_1".to_string(),
+                key_value: "compound:2:8:str:Rome:9:bool:true".to_string(),
+                unique: false,
+            }
+        );
+        assert_eq!(
+            plan_transaction_candidates(
+                &tx,
+                "app.users",
+                &doc! { "profile.city": "Rome", "active": 1_i32 }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "city_1".to_string(),
+                key_value: "str:Rome".to_string(),
+                unique: false,
+            }
+        );
 
         for filter in [
             doc! {},
@@ -8233,15 +8285,12 @@ mod tests {
             doc! { "$or": [{ "active": true }] },
             doc! { "active": { "$in": [true] } },
             doc! { "active": { "$ne": false } },
-            doc! { "active": true, "name": "Ada" },
             doc! { "name": "Ada" },
             doc! { "active": null },
             doc! { "active": { "nested": true } },
             doc! { "age": 37_i32 },
             doc! { "age": 37_i64 },
             doc! { "age": 37.0 },
-            doc! { "profile.city": "Rome", "active": 1_i32 },
-            doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
         ] {
             assert_eq!(
                 plan_transaction_candidates(&tx, "app.users", &filter).unwrap(),
@@ -9717,6 +9766,131 @@ mod tests {
             write_errors(&duplicate_upsert)[0].get_i32("code").unwrap(),
             11000
         );
+    }
+
+    #[test]
+    fn sparse_unique_index_enforces_only_present_members() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "missing-a" },
+                    { "_id": "u2", "name": "missing-b" },
+                    { "_id": "u3", "email": null },
+                    { "_id": "u4", "email": "ada@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_sparse", "unique": true, "sparse": true }],
+            },
+        )
+        .unwrap();
+
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'email_sparse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries, 2);
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u5", "name": "missing-c" }],
+            },
+        )
+        .unwrap();
+        let duplicate_null = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u6", "email": null }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_null)[0].get_i32("code").unwrap(),
+            11000
+        );
+        let duplicate_email = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u7", "email": "ada@example.test" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&duplicate_email)[0].get_i32("code").unwrap(),
+            11000
+        );
+    }
+
+    #[test]
+    fn compound_sparse_index_requires_every_key_field_present() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "ada@example.test" },
+                    { "_id": "u2", "role": "admin" },
+                    { "_id": "u3", "email": "ada@example.test", "role": "admin" },
+                    { "_id": "u4", "email": "grace@example.test", "role": "admin" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{
+                    "key": { "email": 1_i32, "role": 1_i32 },
+                    "name": "email_role_sparse",
+                    "unique": true,
+                    "sparse": true,
+                }],
+            },
+        )
+        .unwrap();
+
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users' AND index_name = 'email_role_sparse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entries, 2);
+        let duplicate = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u5", "email": "ada@example.test", "role": "admin" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&duplicate)[0].get_i32("code").unwrap(), 11000);
     }
 
     #[test]
