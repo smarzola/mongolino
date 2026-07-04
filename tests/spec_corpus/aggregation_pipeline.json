@@ -220,6 +220,48 @@
       "name": "aggregate",
       "pipeline": [
         {
+          "$match": {
+            "team": "none"
+          }
+        },
+        {
+          "$group": {
+            "_id": "$team",
+            "n": {
+              "$sum": 1
+            }
+          }
+        }
+      ],
+      "expect_documents": []
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$group": {
+            "_id": {
+              "$add": [
+                "$team",
+                1
+              ]
+            },
+            "n": {
+              "$sum": 1
+            }
+          }
+        }
+      ],
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "$group"
+      }
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
           "$unwind": {
             "path": "$team",
             "unknown": true

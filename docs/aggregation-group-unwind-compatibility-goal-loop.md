@@ -106,7 +106,7 @@ When a milestone is complete:
 - [x] Milestone 1: `$unwind` stage
 - [x] Milestone 2: `$group` keys and scalar accumulators
 - [x] Milestone 3: Array-style accumulators and pipeline composition
-- [ ] Milestone 4: Adversarial coverage, README, spec corpus, and final verification
+- [x] Milestone 4: Adversarial coverage, README, spec corpus, and final verification
 
 ## Milestone 0: Aggregation Expression And Grouping Design
 
@@ -260,7 +260,7 @@ Status 2026-07-04:
 
 - Added `$push` and `$addToSet`, including missing field-path values as `null`, deterministic insertion order, composed `$match`/`$unwind`/`$group`/`$sort`/`$project` pipelines, and aggregate cursor `getMore` coverage with `batchSize=1`.
 - Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`; `cargo build`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` outside the sandbox.
-- Commit: pending at status-update time; final hash reported in handoff.
+- Commit: `9987467`.
 
 Problem:
 
@@ -301,6 +301,13 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: Adversarial Coverage, README, Spec Corpus, And Final Verification
+
+Status 2026-07-04:
+
+- Added adversarial PyMongo and corpus coverage for empty input groups, unsupported group expression documents and arrays, malformed accumulator operands, unsupported `$unwind` paths, and successful reuse after command errors.
+- Updated README aggregation compatibility text to describe `$unwind`, bounded `$group`, supported accumulators, cursor behavior, and remaining unsupported stages/options.
+- Verification passed: `cargo fmt -- --check`; `cargo test`; `cargo build`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` outside the sandbox (`118 passed, 1 skipped`).
+- Commit: pending at status-update time; final hash reported in handoff.
 
 Problem:
 

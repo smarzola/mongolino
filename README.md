@@ -57,7 +57,7 @@ Compatibility flags:
 | `drop` | Partial | Drops a collection by removing its documents, catalog entry, user index metadata, and maintained index entries. | No view, change-stream, or storage-stat side effects. |
 | `dropDatabase` | Partial | Drops catalog entries and documents for the selected database only. | No users, roles, profiling collections, or storage statistics. |
 | `count` | Partial | Counts documents matching the supported filter subset, with `skip` and `limit`. PyMongo `estimated_document_count()` uses this path. | No hint, collation, read concern, maxTimeMS, or storage-stat semantics. |
-| `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`; preserves the PyMongo `count_documents()` `$group` shape; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`. | No expression language, `$lookup`, `$unwind`, `$facet`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$out`, `$merge`, `$geoNear`, general `$group`, allowDiskUse, collation, hint, read concern, write concern, explain, or maxTimeMS. |
+| `aggregate` | Partial | Runs a sequential read pipeline subset: `$match`, `$unwind`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, and `$count`; supports bounded group keys and `$sum`, `$avg`, `$min`, `$max`, `$first`, `$last`, `$push`, and `$addToSet`; preserves the PyMongo `count_documents()` `$group` shape; returns cursor documents and supports per-client `cursor.batchSize` with `getMore`. | No general expression language, `$lookup`, `$facet`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$out`, `$merge`, `$geoNear`, window stages, allowDiskUse, collation, hint, read concern, write concern, explain, maxTimeMS, or `let`. Unsupported shapes return command errors. |
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order. | No collation, hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key and validation `writeErrors`, supports ordered/unordered batches, and honors `bypassDocumentValidation: true`. | No write concern, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, and conservative scalar equality lookup through supported indexes. | No regex, `$where`, `$elemMatch`, geospatial/text search, collation, read concern, or tailable cursors. Unsupported operators return command errors. |
@@ -134,7 +134,12 @@ is present; bypass does not disable `_id` immutability or unique indexes.
 Aggregation is a document-stream subset. Each supported stage runs in order over
 the current stream, so `$limit` before `$skip` is intentionally different from
 `$skip` before `$limit`. Unsupported stages and projection expressions return
-command errors instead of being ignored.
+command errors instead of being ignored. `$unwind` supports field-path strings
+and document form with `path`, `preserveNullAndEmptyArrays`, and
+`includeArrayIndex`. `$group` supports `_id` values of `null`, scalar literals,
+field paths, and simple document key specs. Accumulator operands are field paths
+or scalar literals where documented by tests; object, array, and operator
+expressions remain unsupported.
 
 ## Development
 

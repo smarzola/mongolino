@@ -246,6 +246,38 @@ def test_aggregate_unwind_group_array_accumulators_and_cursor(collection):
     ]
 
 
+def test_aggregate_adversarial_errors_and_empty_groups_do_not_leak_state(collection):
+    seed_scores(collection)
+
+    assert (
+        list(
+            collection.aggregate(
+                [
+                    {"$match": {"team": "none"}},
+                    {"$group": {"_id": "$team", "n": {"$sum": 1}}},
+                ]
+            )
+        )
+        == []
+    )
+
+    for pipeline, contains in [
+        ([{"$group": {"_id": {"$add": ["$team", 1]}, "n": {"$sum": 1}}}], "$group"),
+        ([{"$group": {"_id": ["$team"], "n": {"$sum": 1}}}], "$group"),
+        ([{"$group": {"_id": "$team", "values": {"$push": ["$score"]}}}], "$group"),
+        ([{"$group": {"_id": "$team", "values": {"$addToSet": {"score": "$score"}}}}], "$group"),
+        ([{"$group": {"_id": {"$sum": 1}, "n": {"$sum": 1}}}], "$group"),
+        ([{"$unwind": {"path": "$team", "includeArrayIndex": "team.idx"}}], "$unwind"),
+    ]:
+        with pytest.raises(OperationFailure) as excinfo:
+            list(collection.aggregate(pipeline))
+        assert contains in str(excinfo.value)
+
+        assert list(collection.aggregate([{"$match": {"active": True}}, {"$count": "total"}])) == [
+            {"total": 2}
+        ]
+
+
 def test_aggregate_unsupported_stage_is_explicit_error(collection):
     seed_scores(collection)
 
