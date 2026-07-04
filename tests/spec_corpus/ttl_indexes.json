@@ -1,0 +1,127 @@
+{
+  "name": "ttl index metadata and unsupported shapes",
+  "source": "repo-local-ttl-indexes",
+  "status": "supported",
+  "setup": [],
+  "operations": [
+    {
+      "name": "create_index",
+      "keys": { "expiresAt": 1 },
+      "index_name": "expires_ttl",
+      "expireAfterSeconds": 60,
+      "expect_result": { "name": "expires_ttl" }
+    },
+    {
+      "name": "command",
+      "command": { "listIndexes": "$$collection", "cursor": {} },
+      "expect_path_values": [
+        {
+          "path": ["cursor", "firstBatch", 1, "expireAfterSeconds"],
+          "value": 60
+        }
+      ]
+    },
+    {
+      "name": "command",
+      "command": {
+        "collMod": "$$collection",
+        "index": { "name": "expires_ttl", "expireAfterSeconds": 30 }
+      },
+      "expect_result": {
+        "ok": 1.0,
+        "expireAfterSeconds_old": 60,
+        "expireAfterSeconds_new": 30
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "createIndexes": "$$collection",
+        "indexes": [
+          {
+            "key": { "expiresAt": 1, "tenant": 1 },
+            "name": "compound_ttl",
+            "expireAfterSeconds": 60
+          }
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "TTL indexes require a single-field key"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "createIndexes": "$$collection",
+        "indexes": [
+          {
+            "key": { "expiresAt": "text" },
+            "name": "text_ttl",
+            "expireAfterSeconds": 60
+          }
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "text indexes are not supported"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "createIndexes": "$$collection",
+        "indexes": [
+          {
+            "key": { "expiresAt": "2dsphere" },
+            "name": "geo_ttl",
+            "expireAfterSeconds": 60
+          }
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "2dsphere indexes are not supported"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "createIndexes": "$$collection",
+        "indexes": [
+          {
+            "key": { "expiresAt": "hashed" },
+            "name": "hashed_ttl",
+            "expireAfterSeconds": 60
+          }
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "hashed indexes are not supported"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "createIndexes": "$$collection",
+        "indexes": [
+          {
+            "key": { "$**": 1 },
+            "name": "wildcard_ttl",
+            "expireAfterSeconds": 60
+          }
+        ]
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 9,
+        "contains": "index field names must be non-empty paths"
+      }
+    }
+  ]
+}

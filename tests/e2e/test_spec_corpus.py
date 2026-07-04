@@ -190,10 +190,15 @@ def execute_operation(operation, collection):
     if name == "distinct":
         return collection.distinct(operation["key"], operation.get("filter"))
     if name == "create_index":
+        kwargs = {
+            "name": operation.get("index_name"),
+            "unique": operation.get("unique", False),
+        }
+        if "expireAfterSeconds" in operation:
+            kwargs["expireAfterSeconds"] = operation["expireAfterSeconds"]
         return collection.create_index(
             list(operation["keys"].items()),
-            name=operation.get("index_name"),
-            unique=operation.get("unique", False),
+            **kwargs,
         )
     if name == "list_index_names":
         return [index["name"] for index in collection.list_indexes()]

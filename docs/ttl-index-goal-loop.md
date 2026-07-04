@@ -181,7 +181,7 @@ When a milestone is complete:
 - [x] Milestone 2: Deterministic TTL sweeper core
 - [x] Milestone 3: Wire-visible read/write sweep integration
 - [x] Milestone 4: `collMod` TTL update subset
-- [ ] Milestone 5: Adversarial PyMongo/spec-corpus coverage
+- [x] Milestone 5: Adversarial PyMongo/spec-corpus coverage
 - [ ] Milestone 6: Benchmarks, docs, scorecard, final verification
 
 ## Milestone 0: TTL Metadata Model And Migration-Safe Persistence
@@ -445,7 +445,7 @@ Status:
   `cargo fmt -- --check`; `cargo test coll_mod`; `cargo test ttl`;
   `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
   tests/e2e/test_validation.py tests/e2e/test_indexes.py` (42 passed,
-  outside sandbox due localhost bind). Commit: pending.
+  outside sandbox due localhost bind). Commit: `55c110b`.
 
 Likely files:
 
@@ -495,6 +495,18 @@ Acceptance criteria:
 - Spec-corpus or Rust table tests cover unsupported text/geospatial/hashed/
   wildcard TTL combinations as explicit errors.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed adversarial PyMongo and spec-corpus TTL coverage for
+  driver-created TTL indexes, listed TTL metadata, deterministic expiration
+  through reads/writes, zero-second TTL behavior, malformed TTL options,
+  compound TTL rejection, `collMod` TTL update errors, and unsupported text,
+  geospatial, hashed, and wildcard TTL shapes. Verification passed:
+  `cargo fmt -- --check`; `cargo test ttl`;
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py` (61 passed,
+  outside sandbox due localhost bind). Commit: pending.
 
 Likely files:
 

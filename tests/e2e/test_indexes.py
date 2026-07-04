@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from bson.int64 import Int64
@@ -207,6 +207,63 @@ def test_coll_mod_updates_ttl_index_by_name(collection):
 
     indexes = {index["name"]: index for index in collection.list_indexes()}
     assert indexes["expires_ttl"]["expireAfterSeconds"] == 120
+
+
+def test_ttl_expiration_is_visible_through_reads_and_writes(collection):
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(days=1)
+    future = now + timedelta(days=1)
+    collection.create_index(
+        [("expiresAt", ASCENDING)],
+        name="expires_ttl",
+        expireAfterSeconds=60,
+    )
+    collection.insert_many(
+        [
+            {"_id": "expired", "email": "same@example.test", "expiresAt": past},
+            {"_id": "future", "expiresAt": future},
+            {"_id": "missing"},
+            {"_id": "null", "expiresAt": None},
+            {"_id": "string", "expiresAt": "2025-01-01"},
+            {"_id": "number", "expiresAt": 1},
+            {"_id": "array", "expiresAt": [past]},
+            {"_id": "document", "expiresAt": {"nested": past}},
+        ]
+    )
+    collection.create_index([("email", ASCENDING)], name="email_1", unique=True, sparse=True)
+
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == [
+        "array",
+        "document",
+        "future",
+        "missing",
+        "null",
+        "number",
+        "string",
+    ]
+    collection.insert_one(
+        {
+            "_id": "replacement",
+            "email": "same@example.test",
+            "expiresAt": future,
+        }
+    )
+    assert collection.find_one({"_id": "replacement"})["email"] == "same@example.test"
+
+    collection.create_index(
+        [("deletedAt", ASCENDING)],
+        name="deleted_ttl",
+        expireAfterSeconds=0,
+    )
+    collection.insert_many(
+        [
+            {"_id": "delete-now", "deletedAt": past},
+            {"_id": "delete-future", "deletedAt": future},
+        ]
+    )
+
+    assert collection.find_one({"_id": "delete-now"}) is None
+    assert collection.find_one({"_id": "delete-future"}) is not None
 
 
 def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
