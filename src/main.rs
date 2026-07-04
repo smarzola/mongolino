@@ -1147,6 +1147,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "update",
             "new",
             "upsert",
+            "bypassDocumentValidation",
             "fields",
             "projection",
             "$db",
@@ -1178,6 +1179,10 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
     let upsert = match optional_bool(command, "upsert") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    let bypass_validation = match optional_bool(command, "bypassDocumentValidation") {
         Ok(value) => value.unwrap_or(false),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
@@ -1220,6 +1225,11 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     let namespace = namespace(db, collection);
     let tx = conn.unchecked_transaction()?;
     ensure_collection_catalog_tx(&tx, &namespace)?;
+    let options = if bypass_validation {
+        CollectionOptions::empty()
+    } else {
+        collection_options_tx(&tx, &namespace)?
+    };
     let outcome = if remove {
         apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref())?
     } else {
@@ -1231,6 +1241,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             update.as_ref().expect("update parsed above"),
             upsert,
             return_new,
+            &options,
         )?
     };
     let outcome = match outcome {
@@ -1312,6 +1323,7 @@ fn apply_find_and_modify_update(
     update: &UpdateSpec,
     upsert: bool,
     return_new: bool,
+    options: &CollectionOptions,
 ) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
     let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort)? {
         Ok(target) => target,
@@ -1334,6 +1346,9 @@ fn apply_find_and_modify_update(
         let upserted_id = new_document.get("_id").cloned().ok_or_else(|| {
             MongolinoError::Protocol("upsert document is missing _id".to_string())
         })?;
+        if let Err(errmsg) = validate_document_with_options(options, &new_document) {
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
         if let Err(errmsg) = ensure_unique_constraints_tx(tx, namespace, &new_document, None) {
             return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
         }
@@ -1370,6 +1385,9 @@ fn apply_find_and_modify_update(
         return Ok(Err(command_error(update_error_code(errmsg), errmsg)));
     }
     if new_document != target.document {
+        if let Err(errmsg) = validate_document_with_options(options, &new_document) {
+            return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
+        }
         if let Err(errmsg) =
             ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&target.id_key))
         {
@@ -2340,14 +2358,6 @@ fn parse_required(value: &Bson, path: &str) -> std::result::Result<Vec<String>, 
     Ok(required)
 }
 
-fn insert_collection_catalog(
-    conn: &Connection,
-    db: &str,
-    collection: &str,
-) -> std::result::Result<(), rusqlite::Error> {
-    insert_collection_catalog_with_options(conn, db, collection, &Document::new())
-}
-
 fn insert_collection_catalog_with_options(
     conn: &Connection,
     db: &str,
@@ -2453,9 +2463,21 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(value) => value.unwrap_or(true),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["insert", "documents", "ordered", "$db", "lsid"])
-    {
+    let bypass_validation = match optional_bool(command, "bypassDocumentValidation") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "insert",
+            "documents",
+            "ordered",
+            "bypassDocumentValidation",
+            "$db",
+            "lsid",
+        ],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
     let namespace = namespace(db, collection);
@@ -2477,6 +2499,11 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let mut inserted = 0_i32;
     let mut write_errors = Vec::new();
     ensure_collection_catalog_tx(&tx, &namespace)?;
+    let options = if bypass_validation {
+        CollectionOptions::empty()
+    } else {
+        collection_options_tx(&tx, &namespace)?
+    };
 
     {
         let mut stmt = tx.prepare(
@@ -2485,6 +2512,17 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
         )?;
 
         for (index, (id_key, encoded, document)) in prepared.iter().enumerate() {
+            if let Err(errmsg) = validate_document_with_options(&options, document) {
+                write_errors.push(write_error(
+                    index as i32,
+                    update_error_code(&errmsg),
+                    &errmsg,
+                ));
+                if ordered {
+                    break;
+                }
+                continue;
+            }
             if let Err(errmsg) = ensure_unique_constraints_tx(&tx, &namespace, document, None) {
                 write_errors.push(write_error(
                     index as i32,
@@ -2583,9 +2621,21 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(value) => value.unwrap_or(true),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["update", "updates", "ordered", "$db", "lsid"])
-    {
+    let bypass_validation = match optional_bool(command, "bypassDocumentValidation") {
+        Ok(value) => value.unwrap_or(false),
+        Err(errmsg) => return Ok(command_error(9, &errmsg)),
+    };
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "update",
+            "updates",
+            "ordered",
+            "bypassDocumentValidation",
+            "$db",
+            "lsid",
+        ],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -2597,9 +2647,14 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
     let mut upserted = Vec::new();
     let mut write_errors = Vec::new();
     ensure_collection_catalog_tx(&tx, &namespace)?;
+    let options = if bypass_validation {
+        CollectionOptions::empty()
+    } else {
+        collection_options_tx(&tx, &namespace)?
+    };
 
     for (index, entry) in updates.iter().enumerate() {
-        let result = apply_update_entry(&tx, &namespace, entry);
+        let result = apply_update_entry(&tx, &namespace, entry, &options);
         match result {
             Ok(outcome) => {
                 matched_count += outcome.matched;
@@ -2653,6 +2708,7 @@ fn apply_update_entry(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
     entry: &Bson,
+    options: &CollectionOptions,
 ) -> std::result::Result<UpdateOutcome, String> {
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
@@ -2695,6 +2751,7 @@ fn apply_update_entry(
             .get("_id")
             .cloned()
             .ok_or_else(|| "upsert document is missing _id".to_string())?;
+        validate_document_with_options(options, &new_document)?;
         ensure_unique_constraints_tx(tx, namespace, &new_document, None)?;
         insert_stored_document_tx(tx, namespace, &new_document)
             .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
@@ -2721,6 +2778,7 @@ fn apply_update_entry(
             return Err("update cannot change _id".to_string());
         }
         if new_document != stored.document {
+            validate_document_with_options(options, &new_document)?;
             ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&stored.id_key))?;
             update_stored_document_tx(tx, namespace, &stored.id_key, &new_document)
                 .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
@@ -2812,6 +2870,8 @@ fn duplicate_or_sql_error(namespace: &str, document: &Document, err: rusqlite::E
 fn update_error_code(errmsg: &str) -> i32 {
     if errmsg.starts_with("duplicate key error") {
         11000
+    } else if errmsg.starts_with("Document failed validation") {
+        DOCUMENT_VALIDATION_ERROR_CODE
     } else {
         2
     }
@@ -2820,9 +2880,21 @@ fn update_error_code(errmsg: &str) -> i32 {
 fn unique_write_error_code(errmsg: &str) -> i32 {
     if errmsg.starts_with("duplicate key error") {
         11000
+    } else if errmsg.starts_with("Document failed validation") {
+        DOCUMENT_VALIDATION_ERROR_CODE
     } else {
         2
     }
+}
+
+fn validate_document_with_options(
+    options: &CollectionOptions,
+    document: &Document,
+) -> std::result::Result<(), String> {
+    if let Some(validator) = &options.validator {
+        validator.validate(document)?;
+    }
+    Ok(())
 }
 
 fn reject_unsupported_entry_keys(
@@ -4833,7 +4905,7 @@ mod tests {
     fn validator_collection_options_roundtrip_from_connection_and_transaction() {
         let conn = test_conn();
         let ns = namespace("app", "users");
-        insert_collection_catalog(&conn, "app", "users").unwrap();
+        insert_collection_catalog_with_options(&conn, "app", "users", &Document::new()).unwrap();
         let options = doc! {
             "validator": {
                 "$jsonSchema": {
@@ -5177,6 +5249,331 @@ mod tests {
         ] {
             assert_command_error(&response);
         }
+    }
+
+    fn validation_test_validator() -> Document {
+        doc! {
+            "$jsonSchema": {
+                "bsonType": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "bsonType": "string" },
+                    "age": { "bsonType": "number" },
+                    "profile": {
+                        "bsonType": "object",
+                        "required": ["city"],
+                        "properties": { "city": { "bsonType": "string" } }
+                    }
+                }
+            }
+        }
+    }
+
+    fn create_validation_test_collection(conn: &Connection) {
+        create_collection(
+            conn,
+            &doc! {
+                "create": "users",
+                "$db": "app",
+                "validator": validation_test_validator(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_insert_ordered_unordered_and_bypass_behave_as_expected() {
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+
+        let ordered = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada" },
+                    { "_id": "bad", "age": 1_i32 },
+                    { "_id": "u2", "name": "Grace" },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(ordered.get_i32("n").unwrap(), 1);
+        assert_eq!(write_errors(&ordered)[0].get_i32("code").unwrap(), 121);
+        assert!(
+            documents_for_namespace(&conn, "app.users")
+                .unwrap()
+                .iter()
+                .all(|document| document.get_str("_id").unwrap() != "u2")
+        );
+
+        let unordered = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "ordered": false,
+                "documents": [
+                    { "_id": "bad2", "age": 2_i32 },
+                    { "_id": "u2", "name": "Grace" },
+                    { "_id": "bad3", "profile": {} },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(unordered.get_i32("n").unwrap(), 1);
+        let errors = write_errors(&unordered);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].get_i32("index").unwrap(), 0);
+        assert_eq!(errors[1].get_i32("index").unwrap(), 2);
+
+        let bypassed = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "documents": [{ "_id": "bad4", "age": "old" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(bypassed.get_i32("n").unwrap(), 1);
+
+        let malformed = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "bypassDocumentValidation": "yes",
+                "documents": [{ "_id": "x" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed);
+    }
+
+    #[test]
+    fn validation_update_replacement_modifier_upsert_and_noop_paths_are_enforced() {
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada", "age": 37_i32 }],
+            },
+        )
+        .unwrap();
+
+        let bad_replacement = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "_id": "u1", "age": 38_i32 } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&bad_replacement)[0].get_i32("code").unwrap(),
+            121
+        );
+
+        let bad_modifier = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "name": 5_i32 } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_modifier)[0].get_i32("code").unwrap(), 121);
+
+        let bad_upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u2" }, "u": { "$set": { "age": 39_i32 } }, "upsert": true }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_upsert)[0].get_i32("code").unwrap(), 121);
+
+        let bypassed = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "name": 5_i32 } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(bypassed.get_i32("nModified").unwrap(), 1);
+
+        let malformed = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "bypassDocumentValidation": "yes",
+                "updates": [{ "q": {}, "u": { "$set": { "name": "Ada" } } }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed);
+
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "legacy", "age": 1_i32 }] },
+        )
+        .unwrap();
+        coll_mod(
+            &conn,
+            &doc! { "collMod": "users", "$db": "app", "validator": validation_test_validator() },
+        )
+        .unwrap();
+        let noop = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "legacy" }, "u": { "$set": { "age": 1_i32 } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(noop.get_i32("nModified").unwrap(), 0);
+        let changed = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "legacy" }, "u": { "$set": { "age": 2_i32 } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&changed)[0].get_i32("code").unwrap(), 121);
+    }
+
+    #[test]
+    fn validation_find_and_modify_update_upsert_and_bypass_are_enforced() {
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada" }],
+            },
+        )
+        .unwrap();
+
+        let invalid_update = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": 5_i32 } },
+            },
+        )
+        .unwrap();
+        assert_command_error(&invalid_update);
+        assert_eq!(invalid_update.get_i32("code").unwrap(), 121);
+
+        let invalid_upsert = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u2" },
+                "update": { "$set": { "age": 39_i32 } },
+                "upsert": true,
+            },
+        )
+        .unwrap();
+        assert_command_error(&invalid_upsert);
+        assert_eq!(invalid_upsert.get_i32("code").unwrap(), 121);
+
+        let bypassed = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": 5_i32 } },
+                "new": true,
+                "bypassDocumentValidation": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bypassed
+                .get_document("value")
+                .unwrap()
+                .get_i32("name")
+                .unwrap(),
+            5
+        );
+
+        let malformed = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": "Ada" } },
+                "bypassDocumentValidation": "yes",
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed);
+    }
+
+    #[test]
+    fn validation_bypass_does_not_bypass_unique_indexes() {
+        let conn = test_conn();
+        create_validation_test_collection(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1", "unique": true }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{ "_id": "u1", "name": "Ada", "email": "a@example.test" }],
+            },
+        )
+        .unwrap();
+
+        let duplicate = insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "bypassDocumentValidation": true,
+                "documents": [{ "_id": "u2", "email": "a@example.test" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&duplicate)[0].get_i32("code").unwrap(), 11000);
     }
 
     #[test]
@@ -6057,7 +6454,6 @@ mod tests {
             doc! { "findAndModify": "users", "$db": "app", "collation": {}, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "hint": "_id_", "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "update": { "$set": { "name": "x" } } },
-            doc! { "findAndModify": "users", "$db": "app", "bypassDocumentValidation": true, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "maxTimeMS": 1_i32, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "let": {}, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "remove": true, "upsert": true },

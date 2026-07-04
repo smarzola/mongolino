@@ -142,7 +142,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Catalog metadata and validator parser
 - [x] Milestone 1: Create/listCollections/collMod validation metadata
-- [ ] Milestone 2: Insert/update/findAndModify enforcement and bypass
+- [x] Milestone 2: Insert/update/findAndModify enforcement and bypass
 - [ ] Milestone 3: PyMongo e2e, spec corpus, docs, and final hardening
 
 ## Milestone 0: Catalog Metadata and Validator Parser
@@ -290,6 +290,10 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test validation`, `cargo test unique`, `cargo test find_and_modify`, `cargo build`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py`, and `cargo test`. Formatter, targeted Rust tests, build, and full Rust tests passed. The PyMongo e2e command failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; parent unsandboxed rerun needed. Commit hash reported after commit.
 
 ## Milestone 3: PyMongo e2e, Spec Corpus, Docs, and Final Hardening
 

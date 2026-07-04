@@ -1,5 +1,6 @@
 import pytest
-from pymongo.errors import OperationFailure
+from pymongo import ReturnDocument
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, WriteError
 
 
 pytestmark = pytest.mark.e2e
@@ -130,3 +131,147 @@ def test_coll_mod_rejects_missing_collection_and_bad_shapes(mongo_client):
         )
     assert malformed.value.code == 72
     assert "decimal is not supported" in str(malformed.value)
+
+
+def test_insert_enforces_validator_ordered_unordered_and_bypass(mongo_client):
+    db = mongo_client["validation_writes_insert"]
+    collection = db.create_collection("users", validator=user_validator())
+
+    with pytest.raises(BulkWriteError) as ordered:
+        collection.insert_many(
+            [
+                {"_id": "u1", "name": "Ada"},
+                {"_id": "bad", "age": 1},
+                {"_id": "u2", "name": "Grace"},
+            ]
+        )
+    assert ordered.value.details["nInserted"] == 1
+    assert ordered.value.details["writeErrors"][0]["code"] == 121
+    assert collection.find_one({"_id": "u2"}) is None
+
+    with pytest.raises(BulkWriteError) as unordered:
+        collection.insert_many(
+            [
+                {"_id": "bad2", "age": 2},
+                {"_id": "u2", "name": "Grace"},
+                {"_id": "bad3", "profile": {}},
+            ],
+            ordered=False,
+        )
+    assert unordered.value.details["nInserted"] == 1
+    assert [err["index"] for err in unordered.value.details["writeErrors"]] == [0, 2]
+
+    collection.insert_one(
+        {"_id": "bypassed", "age": "old"}, bypass_document_validation=True
+    )
+    assert collection.find_one({"_id": "bypassed"})["age"] == "old"
+
+    with pytest.raises(OperationFailure) as malformed:
+        db.command(
+            {
+                "insert": "users",
+                "documents": [{"_id": "x"}],
+                "bypassDocumentValidation": "yes",
+            }
+        )
+    assert malformed.value.code == 9
+
+
+def test_update_enforces_validator_for_replacement_modifier_upsert_and_bypass(mongo_client):
+    db = mongo_client["validation_writes_update"]
+    collection = db.create_collection("users", validator=user_validator())
+    collection.insert_one({"_id": "u1", "name": "Ada", "age": 37})
+
+    with pytest.raises(WriteError) as replacement:
+        collection.replace_one({"_id": "u1"}, {"_id": "u1", "age": 38})
+    assert replacement.value.code == 121
+
+    with pytest.raises(WriteError) as modifier:
+        collection.update_one({"_id": "u1"}, {"$set": {"name": 5}})
+    assert modifier.value.code == 121
+
+    with pytest.raises(WriteError) as upsert:
+        collection.update_one({"_id": "u2"}, {"$set": {"age": 39}}, upsert=True)
+    assert upsert.value.code == 121
+
+    collection.update_one(
+        {"_id": "u1"},
+        {"$set": {"name": 5}},
+        bypass_document_validation=True,
+    )
+    assert collection.find_one({"_id": "u1"})["name"] == 5
+
+    with pytest.raises(OperationFailure) as malformed:
+        db.command(
+            {
+                "update": "users",
+                "updates": [{"q": {}, "u": {"$set": {"name": "Ada"}}}],
+                "bypassDocumentValidation": "yes",
+            }
+        )
+    assert malformed.value.code == 9
+
+
+def test_noop_update_of_invalid_existing_document_does_not_revalidate(mongo_client):
+    db = mongo_client["validation_writes_noop"]
+    collection = db.users
+    collection.insert_one({"_id": "legacy", "age": 1})
+    db.command({"collMod": "users", "validator": user_validator()})
+
+    result = collection.update_one({"_id": "legacy"}, {"$set": {"age": 1}})
+    assert result.modified_count == 0
+
+    with pytest.raises(WriteError) as changed:
+        collection.update_one({"_id": "legacy"}, {"$set": {"age": 2}})
+    assert changed.value.code == 121
+
+
+def test_find_and_modify_enforces_validator_and_bypass(mongo_client):
+    db = mongo_client["validation_writes_fam"]
+    collection = db.create_collection("users", validator=user_validator())
+    collection.insert_one({"_id": "u1", "name": "Ada"})
+
+    with pytest.raises(OperationFailure) as update:
+        collection.find_one_and_update({"_id": "u1"}, {"$set": {"name": 5}})
+    assert update.value.code == 121
+
+    with pytest.raises(OperationFailure) as upsert:
+        collection.find_one_and_update(
+            {"_id": "u2"},
+            {"$set": {"age": 39}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    assert upsert.value.code == 121
+
+    result = collection.find_one_and_update(
+        {"_id": "u1"},
+        {"$set": {"name": 5}},
+        return_document=ReturnDocument.AFTER,
+        bypass_document_validation=True,
+    )
+    assert result["name"] == 5
+
+    with pytest.raises(OperationFailure) as malformed:
+        db.command(
+            {
+                "findAndModify": "users",
+                "query": {"_id": "u1"},
+                "update": {"$set": {"name": "Ada"}},
+                "bypassDocumentValidation": "yes",
+            }
+        )
+    assert malformed.value.code == 9
+
+
+def test_bypass_document_validation_does_not_bypass_unique_indexes(mongo_client):
+    db = mongo_client["validation_writes_unique"]
+    collection = db.create_collection("users", validator=user_validator())
+    collection.create_index("email", unique=True)
+    collection.insert_one({"_id": "u1", "name": "Ada", "email": "a@example.test"})
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one(
+            {"_id": "u2", "email": "a@example.test"},
+            bypass_document_validation=True,
+        )
