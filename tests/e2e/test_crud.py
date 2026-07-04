@@ -2,7 +2,7 @@ import pytest
 from bson import ObjectId
 from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING
-from pymongo.errors import BulkWriteError, DuplicateKeyError, WriteError
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, WriteError
 
 
 pytestmark = pytest.mark.e2e
@@ -366,6 +366,26 @@ def test_update_targets_indexed_range_filters(collection):
     assert "team" not in collection.find_one({"_id": "u1"})
 
 
+def test_update_hint_errors_do_not_mutate(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    good = collection.update_many(
+        {"profile.city": "Rome"},
+        {"$set": {"team": "hinted"}},
+        hint="city_active_1",
+    )
+    assert good.matched_count == 2
+
+    with pytest.raises(OperationFailure):
+        collection.update_one(
+            {"name": "Grace"},
+            {"$set": {"team": "bad-hint"}},
+            hint="city_active_1",
+        )
+    assert "team" not in collection.find_one({"_id": "u2"})
+
+
 def test_update_preserves_partial_unique_membership(collection):
     collection.insert_many(
         [
@@ -520,6 +540,18 @@ def test_delete_targets_indexed_range_filters(collection):
     many = collection.delete_many({"profile.city": "Rome", "name": {"$gte": "K"}})
     assert many.deleted_count == 1
     assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u1", "u2"]
+
+
+def test_delete_hint_errors_do_not_mutate(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    good = collection.delete_one({"_id": "u2"}, hint=[("_id", ASCENDING)])
+    assert good.deleted_count == 1
+
+    with pytest.raises(OperationFailure):
+        collection.delete_one({"name": "Ada"}, hint="missing_1")
+    assert collection.find_one({"_id": "u1"}) is not None
 
 
 def test_delete_targets_scalar_multikey_indexed_matches(collection):

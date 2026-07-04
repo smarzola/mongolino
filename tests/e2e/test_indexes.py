@@ -690,6 +690,34 @@ def test_indexed_range_find_and_count_documents(collection):
     assert ids(collection.find({"created": {"$gte": 1}}).sort("_id", ASCENDING)) == []
 
 
+def test_hint_find_and_count_by_name_and_key_pattern(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "profile": {"city": "Rome"}, "active": True, "name": "Ada"},
+            {"_id": "u2", "profile": {"city": "London"}, "active": False, "name": "Grace"},
+            {"_id": "u3", "profile": {"city": "Rome"}, "active": True, "name": "Katherine"},
+        ]
+    )
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+    collection.create_index([("name", ASCENDING)], name="name_1")
+
+    assert ids(collection.find({"profile.city": "Rome"}).hint("city_active_1").sort("_id", ASCENDING)) == [
+        "u1",
+        "u3",
+    ]
+    count = collection.database.command(
+        {
+            "count": collection.name,
+            "query": {"name": {"$gte": "G"}},
+            "hint": {"name": ASCENDING},
+        }
+    )
+    assert count["n"] == 2
+
+    with pytest.raises(OperationFailure):
+        list(collection.find({"name": "Ada"}).hint("city_active_1"))
+
+
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):
     collection.insert_many(
         [

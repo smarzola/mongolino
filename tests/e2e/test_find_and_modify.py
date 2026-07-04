@@ -249,6 +249,28 @@ def test_find_and_modify_targets_compound_prefix_filter(collection):
     assert collection.find_one({"state": "running"})["_id"] == "j2"
 
 
+def test_find_and_modify_hint_errors_do_not_mutate(collection):
+    seed_jobs(collection)
+    collection.create_index([("state", ASCENDING), ("email", ASCENDING)], name="state_email_1")
+
+    updated = collection.find_one_and_update(
+        {"state": "queued"},
+        {"$set": {"owner": "hinted"}},
+        hint="state_email_1",
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["owner"] == "hinted"
+
+    with pytest.raises(OperationFailure):
+        collection.find_one_and_update(
+            {"owner": "c"},
+            {"$set": {"state": "bad-hint"}},
+            hint="state_email_1",
+            return_document=ReturnDocument.AFTER,
+        )
+    assert collection.find_one({"_id": "j3"})["state"] == "done"
+
+
 def test_find_and_modify_targets_array_backed_matches_when_index_entries_are_incomplete(collection):
     collection.insert_many(
         [

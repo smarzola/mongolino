@@ -169,7 +169,7 @@ When a milestone is complete:
 - [x] Milestone 0: Planner v2 architecture and diagnostics model
 - [x] Milestone 1: Equality-prefix candidate narrowing
 - [x] Milestone 2: Safe range scans and count pushdown
-- [ ] Milestone 3: Hint command semantics
+- [x] Milestone 3: Hint command semantics
 - [ ] Milestone 4: Explain diagnostics
 - [ ] Milestone 5: Sort-aware read planning
 - [ ] Milestone 6: Benchmarks, docs, final e2e verification
@@ -391,6 +391,17 @@ cargo test hint
 cargo test planner
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py tests/e2e/test_find_and_modify.py
 ```
+
+Status 2026-07-04: Added explicit hint parsing and resolution by index name or
+key-pattern document for `find`, `count`, update, delete, and findAndModify,
+with hinted reads/writes constrained to safe exact, prefix, and range plans and
+bad write hints rejected before mutation. Verification passed with `cargo fmt
+-- --check`, `cargo test hint`, `cargo test planner`, `cargo build`, and
+unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py
+tests/e2e/test_find_and_modify.py` after the sandboxed e2e path had previously
+failed to bind localhost. Commit: reported in goal-loop status after commit
+creation.
 
 ## Milestone 4: Explain Diagnostics
 

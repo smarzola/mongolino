@@ -893,7 +893,7 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     };
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
-        &["count", "query", "skip", "limit", "$db", "lsid"],
+        &["count", "query", "skip", "limit", "hint", "$db", "lsid"],
     ) {
         return Ok(command_error(72, &errmsg));
     }
@@ -916,13 +916,32 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
     };
 
     let ns = namespace(db, collection);
-    let count = match pushed_down_count(conn, &ns, &filter, skip, limit)? {
-        Some(count) => count,
-        None => {
-            let documents = documents_for_namespace(conn, &ns)?;
-            match count_matching_documents(documents, &filter, skip, limit) {
-                Ok(count) => count,
-                Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+    let hint = match parse_optional_hint(command) {
+        Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &ns)?, hint) {
+            Ok(hint) => Some(hint),
+            Err(errmsg) => return Ok(command_error(2, &errmsg)),
+        },
+        Ok(None) => None,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
+    let count = if let Some(hint) = hint.as_ref() {
+        let documents = match candidate_documents_with_hint(conn, &ns, &filter, Some(hint)) {
+            Ok(documents) => documents,
+            Err(errmsg) => return Ok(command_error(2, &errmsg)),
+        };
+        match count_matching_documents(documents, &filter, skip, limit) {
+            Ok(count) => count,
+            Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+        }
+    } else {
+        match pushed_down_count(conn, &ns, &filter, skip, limit)? {
+            Some(count) => count,
+            None => {
+                let documents = documents_for_namespace(conn, &ns)?;
+                match count_matching_documents(documents, &filter, skip, limit) {
+                    Ok(count) => count,
+                    Err(err) => return Ok(command_error(err.code, &err.errmsg)),
+                }
             }
         }
     };
@@ -1706,6 +1725,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "bypass_document_validation",
             "fields",
             "projection",
+            "hint",
             "$db",
             "lsid",
         ],
@@ -1779,6 +1799,14 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
     };
 
     let namespace = namespace(db, collection);
+    let hint = match parse_optional_hint(command) {
+        Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &namespace)?, hint) {
+            Ok(hint) => Some(hint),
+            Err(errmsg) => return Ok(command_error(2, &errmsg)),
+        },
+        Ok(None) => None,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
     let tx = conn.unchecked_transaction()?;
     ensure_collection_catalog_tx(&tx, &namespace)?;
     let options = if bypass_validation {
@@ -1787,13 +1815,14 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         collection_options_tx(&tx, &namespace)?
     };
     let outcome = if remove {
-        apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref())?
+        apply_find_and_modify_remove(&tx, &namespace, &query, sort.as_deref(), hint.as_ref())?
     } else {
         apply_find_and_modify_update(
             &tx,
             &namespace,
             &query,
             sort.as_deref(),
+            hint.as_ref(),
             update.as_ref().expect("update parsed above"),
             upsert,
             return_new,
@@ -1845,8 +1874,9 @@ fn apply_find_and_modify_remove(
     namespace: &str,
     query: &Document,
     sort: Option<&[(String, i32)]>,
+    hint: Option<&ResolvedHint>,
 ) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
-    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort)? {
+    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
         Ok(target) => target,
         Err(response) => return Ok(Err(response)),
     }) else {
@@ -1876,12 +1906,13 @@ fn apply_find_and_modify_update(
     namespace: &str,
     query: &Document,
     sort: Option<&[(String, i32)]>,
+    hint: Option<&ResolvedHint>,
     update: &UpdateSpec,
     upsert: bool,
     return_new: bool,
     options: &CollectionOptions,
 ) -> Result<std::result::Result<FindAndModifyOutcome, Document>> {
-    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort)? {
+    let Some(target) = (match find_and_modify_target_tx(tx, namespace, query, sort, hint)? {
         Ok(target) => target,
         Err(response) => return Ok(Err(response)),
     }) else {
@@ -1973,9 +2004,14 @@ fn find_and_modify_target_tx(
     namespace: &str,
     query: &Document,
     sort: Option<&[(String, i32)]>,
+    hint: Option<&ResolvedHint>,
 ) -> Result<std::result::Result<Option<StoredDocument>, Document>> {
     let mut matches = Vec::new();
-    for stored in transaction_candidate_documents(tx, namespace, query)? {
+    let candidates = match transaction_candidate_documents_with_hint(tx, namespace, query, hint) {
+        Ok(candidates) => candidates,
+        Err(errmsg) => return Ok(Err(command_error(2, &errmsg))),
+    };
+    for stored in candidates {
         match matches_filter(&stored.document, query) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}
@@ -2372,6 +2408,69 @@ struct RangePlannerKey {
 struct RangeBound {
     key: String,
     inclusive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ResolvedHint {
+    Id,
+    Index(IndexSpec),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ParsedHint {
+    Name(String),
+    Key(Document),
+}
+
+fn parse_optional_hint(document: &Document) -> std::result::Result<Option<ParsedHint>, String> {
+    match document.get("hint") {
+        None => Ok(None),
+        Some(Bson::String(name)) if !name.is_empty() => Ok(Some(ParsedHint::Name(name.clone()))),
+        Some(Bson::String(_)) => Err("hint index name must not be empty".to_string()),
+        Some(Bson::Document(key)) if !key.is_empty() => Ok(Some(ParsedHint::Key(key.clone()))),
+        Some(Bson::Document(_)) => Err("hint key document must not be empty".to_string()),
+        Some(_) => Err("hint must be an index name or key document".to_string()),
+    }
+}
+
+fn resolve_hint(
+    indexes: Vec<IndexSpec>,
+    hint: ParsedHint,
+) -> std::result::Result<ResolvedHint, String> {
+    match hint {
+        ParsedHint::Name(name) if name == "_id_" => Ok(ResolvedHint::Id),
+        ParsedHint::Name(name) => indexes
+            .into_iter()
+            .find(|index| index.name == name)
+            .map(ResolvedHint::Index)
+            .ok_or_else(|| format!("hint index {name} was not found")),
+        ParsedHint::Key(key) if key == doc! { "_id": 1_i32 } || key == doc! { "_id": 1_i64 } => {
+            Ok(ResolvedHint::Id)
+        }
+        ParsedHint::Key(key) => {
+            validate_index_key(&key).map_err(|response| {
+                response
+                    .get_str("errmsg")
+                    .unwrap_or("hint key document is not supported")
+                    .to_string()
+            })?;
+            let matches = indexes
+                .into_iter()
+                .filter(|index| index.key == key)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [index] => Ok(ResolvedHint::Index(index.clone())),
+                [] => Err(format!(
+                    "hint index with key {} was not found",
+                    generated_index_name(&key)
+                )),
+                _ => Err(format!(
+                    "hint key {} matches multiple indexes",
+                    generated_index_name(&key)
+                )),
+            }
+        }
+    }
 }
 
 fn planner_diagnostic(
@@ -4656,7 +4755,7 @@ fn apply_update_entry(
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi"])?;
+    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "update entry requires q document".to_string())?;
@@ -4665,12 +4764,17 @@ fn apply_update_entry(
         .map_err(|_| "update entry requires u document".to_string())?;
     let upsert = optional_bool_doc(entry, "upsert")?.unwrap_or(false);
     let multi = optional_bool_doc(entry, "multi")?.unwrap_or(false);
+    let hint = match parse_optional_hint(entry)? {
+        Some(hint) => Some(resolve_hint(
+            indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
+            hint,
+        )?),
+        None => None,
+    };
     let update = classify_update(update)?;
 
     let mut matches = Vec::new();
-    for stored in
-        transaction_candidate_documents(tx, namespace, query).map_err(|err| err.to_string())?
-    {
+    for stored in transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref())? {
         match matches_filter(&stored.document, query) {
             Ok(true) => matches.push(stored),
             Ok(false) => {}
@@ -4894,6 +4998,68 @@ fn transaction_candidate_documents(
         }
         TransactionCandidatePlan::Fallback => stored_documents_for_namespace_tx(tx, namespace),
     }
+}
+
+fn transaction_candidate_documents_with_hint(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<Vec<StoredDocument>, String> {
+    match hint {
+        None => {
+            transaction_candidate_documents(tx, namespace, filter).map_err(|err| err.to_string())
+        }
+        Some(ResolvedHint::Id) => {
+            let Some(value) = exact_equality_filter_value(filter, "_id") else {
+                return Err("hint _id_ is incompatible with this filter".to_string());
+            };
+            stored_document_by_id_key_tx(tx, namespace, &id_key_from_bson(value))
+                .map(|document| document.into_iter().collect())
+                .map_err(|err| err.to_string())
+        }
+        Some(ResolvedHint::Index(index)) => {
+            hinted_transaction_candidate_documents_for_index(tx, namespace, filter, index)
+        }
+    }
+}
+
+fn hinted_transaction_candidate_documents_for_index(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    filter: &Document,
+    index: &IndexSpec,
+) -> std::result::Result<Vec<StoredDocument>, String> {
+    if !filter_implies_index_membership(index, filter) {
+        return Err(format!(
+            "hint index {} is unsafe for this filter membership",
+            index.name
+        ));
+    }
+    if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)
+        .map_err(|err| err.to_string())?
+    {
+        return Err(format!(
+            "hint index {} has unsupported multikey omissions",
+            index.name
+        ));
+    }
+    if let Some(key_value) = planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_tx(tx, namespace, &index.name, &key_value)
+            .map_err(|err| err.to_string());
+    }
+    if let Some(range) = range_planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_tx_by_range(tx, namespace, &index.name, &range)
+            .map_err(|err| err.to_string());
+    }
+    if let Some((_, key_value)) = prefix_planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_tx(tx, namespace, &index.name, &key_value)
+            .map_err(|err| err.to_string());
+    }
+    Err(format!(
+        "hint index {} is incompatible with this filter",
+        index.name
+    ))
 }
 
 fn indexed_unique_candidate_document_tx(
@@ -5913,7 +6079,7 @@ fn apply_delete_entry(
     let Bson::Document(entry) = entry else {
         return Err("delete entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "limit"])?;
+    reject_unsupported_entry_keys(entry, &["q", "limit", "hint"])?;
     let query = entry
         .get_document("q")
         .map_err(|_| "delete entry requires q document".to_string())?;
@@ -5923,11 +6089,16 @@ fn apply_delete_entry(
         Some(_) => return Err("delete limit must be 0 or 1".to_string()),
         None => return Err("delete entry requires limit".to_string()),
     };
+    let hint = match parse_optional_hint(entry)? {
+        Some(hint) => Some(resolve_hint(
+            indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?,
+            hint,
+        )?),
+        None => None,
+    };
 
     let mut targets = Vec::new();
-    for stored in
-        transaction_candidate_documents(tx, namespace, query).map_err(|err| err.to_string())?
-    {
+    for stored in transaction_candidate_documents_with_hint(tx, namespace, query, hint.as_ref())? {
         match matches_filter(&stored.document, query) {
             Ok(true) => targets.push(stored.id_key),
             Ok(false) => {}
@@ -5984,6 +6155,7 @@ fn find_documents_with_state(
             "skip",
             "limit",
             "singleBatch",
+            "hint",
             "$db",
             "lsid",
         ],
@@ -6023,8 +6195,17 @@ fn find_documents_with_state(
         Err(errmsg) => return Ok(command_error(2, &errmsg)),
     };
     let ns = namespace(db, collection);
+    let hint = match parse_optional_hint(command) {
+        Ok(Some(hint)) => match resolve_hint(indexes_for_namespace(conn, &ns)?, hint) {
+            Ok(hint) => Some(hint),
+            Err(errmsg) => return Ok(command_error(2, &errmsg)),
+        },
+        Ok(None) => None,
+        Err(errmsg) => return Ok(command_error(2, &errmsg)),
+    };
 
-    if sort.is_none()
+    if hint.is_none()
+        && sort.is_none()
         && skip == 0
         && limit.is_none()
         && projection.is_none()
@@ -6053,7 +6234,7 @@ fn find_documents_with_state(
         return Ok(cursor_response(db, collection, 0, "firstBatch", vec![]));
     }
 
-    let docs = match query_documents(
+    let docs = match query_documents_with_hint(
         conn,
         &ns,
         &filter,
@@ -6061,6 +6242,7 @@ fn find_documents_with_state(
         skip,
         limit,
         projection.as_ref(),
+        hint.as_ref(),
     ) {
         Ok(docs) => docs,
         Err(err) => return Ok(command_error(err.code, &err.errmsg)),
@@ -6585,6 +6767,83 @@ fn indexed_candidate_documents(
     Ok(None)
 }
 
+fn stored_document_by_id_key(
+    conn: &Connection,
+    namespace: &str,
+    id_key: &str,
+) -> Result<Option<Document>> {
+    conn.query_row(
+        "SELECT bson FROM documents WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()?
+    .map(decode_document)
+    .transpose()
+}
+
+fn hinted_candidate_documents(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    hint: &ResolvedHint,
+) -> std::result::Result<Vec<Document>, String> {
+    match hint {
+        ResolvedHint::Id => {
+            let Some(value) = exact_equality_filter_value(filter, "_id") else {
+                return Err("hint _id_ is incompatible with this filter".to_string());
+            };
+            stored_document_by_id_key(conn, namespace, &id_key_from_bson(value))
+                .map(|document| document.into_iter().collect())
+                .map_err(|err| err.to_string())
+        }
+        ResolvedHint::Index(index) => {
+            hinted_candidate_documents_for_index(conn, namespace, filter, index)
+        }
+    }
+}
+
+fn hinted_candidate_documents_for_index(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    index: &IndexSpec,
+) -> std::result::Result<Vec<Document>, String> {
+    if !filter_implies_index_membership(index, filter) {
+        return Err(format!(
+            "hint index {} is unsafe for this filter membership",
+            index.name
+        ));
+    }
+    if !index_entries_safe_for_planner(conn, namespace, &index.name)
+        .map_err(|err| err.to_string())?
+    {
+        return Err(format!(
+            "hint index {} has unsupported multikey omissions",
+            index.name
+        ));
+    }
+    if let Some(key_value) = planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("hint index {} could not be scanned", index.name));
+    }
+    if let Some(range) = range_planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_by_range(conn, namespace, &index.name, &range)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("hint index {} could not be range scanned", index.name));
+    }
+    if let Some((_, key_value)) = prefix_planner_key_for_filter(index, filter) {
+        return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("hint index {} could not be prefix scanned", index.name));
+    }
+    Err(format!(
+        "hint index {} is incompatible with this filter",
+        index.name
+    ))
+}
+
 fn indexed_candidate_documents_by_key(
     conn: &Connection,
     namespace: &str,
@@ -6655,7 +6914,19 @@ fn candidate_documents(
     }
 }
 
-fn query_documents(
+fn candidate_documents_with_hint(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+    hint: Option<&ResolvedHint>,
+) -> std::result::Result<Vec<Document>, String> {
+    match hint {
+        Some(hint) => hinted_candidate_documents(conn, namespace, filter, hint),
+        None => candidate_documents(conn, namespace, filter).map_err(|err| err.to_string()),
+    }
+}
+
+fn query_documents_with_hint(
     conn: &Connection,
     namespace: &str,
     filter: &Document,
@@ -6663,9 +6934,10 @@ fn query_documents(
     skip: usize,
     limit: Option<usize>,
     projection: Option<&ProjectionSpec>,
+    hint: Option<&ResolvedHint>,
 ) -> std::result::Result<Vec<Document>, MatchError> {
-    let source_documents = candidate_documents(conn, namespace, filter)
-        .map_err(|err| match_error(8, err.to_string()))?;
+    let source_documents = candidate_documents_with_hint(conn, namespace, filter, hint)
+        .map_err(|err| match_error(2, err))?;
     shape_documents(source_documents, filter, sort, skip, limit, projection)
 }
 
@@ -12163,6 +12435,179 @@ mod tests {
     }
 
     #[test]
+    fn hint_accepts_name_and_key_for_read_and_write_paths() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" },
+                    { "key": { "name": 1_i32 }, "name": "name_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let hinted_find = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "profile.city": "Rome" },
+                "hint": "city_active_1",
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&hinted_find)
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u3"]
+        );
+
+        let hinted_count = count_documents_command(
+            &conn,
+            &doc! {
+                "count": "users",
+                "$db": "app",
+                "query": { "name": { "$gte": "G" } },
+                "hint": { "name": 1_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(hinted_count.get_i64("n").unwrap(), 2);
+
+        let hinted_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "profile.city": "Rome" },
+                    "u": { "$set": { "team": "hint-prefix" } },
+                    "multi": true,
+                    "hint": { "profile.city": 1_i32, "active": 1_i32 },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(hinted_update.get_i32("n").unwrap(), 2);
+
+        let hinted_delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "_id": "u2" }, "limit": 1_i32, "hint": "_id_" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(hinted_delete.get_i32("n").unwrap(), 1);
+
+        let hinted_find_and_modify = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "name": { "$gte": "K" } },
+                "update": { "$set": { "team": "hint-range" } },
+                "new": true,
+                "hint": "name_1",
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hinted_find_and_modify
+                .get_document("value")
+                .unwrap()
+                .get_str("_id")
+                .unwrap(),
+            "u3"
+        );
+    }
+
+    #[test]
+    fn hint_errors_do_not_mutate_documents() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" }],
+            },
+        )
+        .unwrap();
+
+        let bad_find = find_documents(
+            &conn,
+            &doc! {
+                "find": "users",
+                "$db": "app",
+                "filter": { "name": "Ada" },
+                "hint": "city_active_1",
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_find);
+
+        let bad_update = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "name": "Ada" },
+                    "u": { "$set": { "team": "bad-hint" } },
+                    "hint": "city_active_1",
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_update)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(
+            find_ids(&conn, doc! { "team": "bad-hint" }),
+            Vec::<String>::new()
+        );
+
+        let bad_delete = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "users",
+                "$db": "app",
+                "deletes": [{ "q": { "name": "Ada" }, "limit": 1_i32, "hint": "missing_1" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_delete)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada" }), vec!["u1"]);
+
+        let bad_find_and_modify = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "name": "Ada" },
+                "update": { "$set": { "team": "bad-fam-hint" } },
+                "hint": "missing_1",
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_find_and_modify);
+        assert_eq!(
+            find_ids(&conn, doc! { "team": "bad-fam-hint" }),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn planner_uses_sparse_and_partial_indexes_only_when_filter_implies_membership() {
         let conn = test_conn();
         insert_documents(
@@ -14711,7 +15156,7 @@ mod tests {
             doc! { "q": { "_id": "u1" }, "limit": -1_i32 },
             doc! { "q": { "_id": "u1" }, "limit": "1" },
             doc! { "q": { "$where": "bad" }, "limit": 1_i32 },
-            doc! { "q": { "_id": "u1" }, "limit": 1_i32, "hint": { "_id": 1_i32 } },
+            doc! { "q": { "_id": "u1" }, "limit": 1_i32, "hint": "missing_1" },
         ] {
             let response = delete_documents(
                 &conn,
