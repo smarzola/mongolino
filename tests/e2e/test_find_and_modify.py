@@ -258,6 +258,37 @@ def test_find_and_modify_targets_array_backed_matches_when_index_entries_are_inc
     assert collection.find_one({"_id": "j2"}) is None
 
 
+def test_find_and_modify_keeps_scalar_multikey_entries_fresh(collection):
+    collection.insert_many(
+        [
+            {"_id": "j1", "tags": ["queued"], "state": "queued"},
+            {"_id": "j2", "tags": ["done"], "state": "done"},
+        ]
+    )
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+
+    updated = collection.find_one_and_update(
+        {"tags": "queued"},
+        {"$push": {"tags": "running"}, "$set": {"state": "running"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated["_id"] == "j1"
+    assert [doc["_id"] for doc in collection.find({"tags": "running"})] == ["j1"]
+
+    replaced = collection.find_one_and_replace(
+        {"tags": "running"},
+        {"_id": "j1", "tags": ["archived"], "state": "archived"},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert replaced["_id"] == "j1"
+    assert list(collection.find({"tags": "running"})) == []
+    assert [doc["_id"] for doc in collection.find({"tags": "archived"})] == ["j1"]
+
+    removed = collection.find_one_and_delete({"tags": "archived"})
+    assert removed["_id"] == "j1"
+    assert list(collection.find({"tags": "archived"})) == []
+
+
 def test_find_one_and_update_upsert_returns_inserted_document(collection):
     result = collection.find_one_and_update(
         {"_id": "counter", "kind": "local"},

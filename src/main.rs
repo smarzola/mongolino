@@ -3192,6 +3192,7 @@ fn index_entries_safe_for_planner_tx(
     )?)
 }
 
+#[cfg(test)]
 fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
     planner_keys_for_document(spec, document).into_iter().next()
 }
@@ -7342,12 +7343,12 @@ mod tests {
         let conn = test_conn();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "tags": ["math"] }] },
+            &doc! { "insert": "users", "$db": "app", "documents": [{ "_id": "u1", "scores": [1_i32] }] },
         )
         .unwrap();
         insert_documents(
             &conn,
-            &doc! { "insert": "users", "$db": "other", "documents": [{ "_id": "u2", "tags": ["math"] }] },
+            &doc! { "insert": "users", "$db": "other", "documents": [{ "_id": "u2", "scores": [1_i32] }] },
         )
         .unwrap();
         create_indexes(
@@ -7355,7 +7356,7 @@ mod tests {
             &doc! {
                 "createIndexes": "users",
                 "$db": "app",
-                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+                "indexes": [{ "key": { "scores": 1_i32 }, "name": "scores_1" }],
             },
         )
         .unwrap();
@@ -7364,7 +7365,7 @@ mod tests {
             &doc! {
                 "createIndexes": "users",
                 "$db": "other",
-                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+                "indexes": [{ "key": { "scores": 1_i32 }, "name": "scores_1" }],
             },
         )
         .unwrap();

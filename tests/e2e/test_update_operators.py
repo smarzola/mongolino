@@ -497,6 +497,30 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
     assert indexed.find_one({"city": "Rome", "score": 12})["_id"] == "u1"
     assert indexed.find_one({"city": "Rome", "score": 4}) is None
 
+    multikey = mongo_client["update_operator_multikey_index_freshness"].users
+    multikey.insert_many(
+        [
+            {"_id": "m1", "tags": ["math"]},
+            {"_id": "m2", "tags": ["systems"]},
+        ]
+    )
+    multikey.create_index([("tags", ASCENDING)], name="tags_1")
+    multikey.create_index([("labels", ASCENDING)], name="labels_1")
+
+    multikey.update_one({"_id": "m1"}, {"$push": {"tags": "logic"}})
+    assert [doc["_id"] for doc in multikey.find({"tags": "logic"})] == ["m1"]
+
+    multikey.update_one({"_id": "m1"}, {"$pull": {"tags": "math"}})
+    assert list(multikey.find({"tags": "math"})) == []
+    assert [doc["_id"] for doc in multikey.find({"tags": "logic"})] == ["m1"]
+
+    multikey.update_one({"_id": "m1"}, {"$rename": {"tags": "labels"}})
+    assert list(multikey.find({"tags": "logic"})) == []
+    assert [doc["_id"] for doc in multikey.find({"labels": "logic"})] == ["m1"]
+
+    multikey.update_one({"_id": "m1"}, {"$unset": {"labels": ""}})
+    assert list(multikey.find({"labels": "logic"})) == []
+
 
 def test_new_update_modifier_batch_ordering(collection):
     collection.insert_many(

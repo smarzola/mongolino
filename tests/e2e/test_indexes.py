@@ -33,6 +33,18 @@ def index_entry_count(db_path, namespace, index_name):
         ).fetchone()[0]
 
 
+def index_key_entry_count(db_path, namespace, index_name, key_value):
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM index_entries
+             WHERE namespace = ? AND index_name = ? AND key_value = ?
+            """,
+            (namespace, index_name, key_value),
+        ).fetchone()[0]
+
+
 def test_create_list_and_drop_indexes(collection):
     assert index_names(collection) == ["_id_"]
 
@@ -95,10 +107,10 @@ def test_duplicate_index_create_is_idempotent_and_conflict_errors(collection):
 
 
 def test_drop_indexes_all_preserves_id_index(collection, mongolino_server):
-    collection.insert_one({"_id": "u1", "tags": ["math"]})
+    collection.insert_one({"_id": "u1", "scores": [1]})
     collection.create_index([("email", ASCENDING)], name="email_1")
     collection.create_index([("name", ASCENDING)], name="name_1")
-    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.create_index([("scores", ASCENDING)], name="scores_1")
 
     assert multikey_omission_count(
         mongolino_server.db_path,
@@ -406,10 +418,10 @@ def test_unique_index_rejects_array_values(collection):
     assert "does not support array value" in str(excinfo.value)
 
 
-def test_indexed_find_falls_back_when_single_field_index_has_array_omissions(collection):
+def test_indexed_find_uses_single_field_scalar_multikey_entries(collection):
     collection.insert_many(
         [
-            {"_id": "u1", "tags": ["math", "logic"], "nested": [{"kind": "first"}, {"kind": "second"}]},
+            {"_id": "u1", "tags": ["math", "math", "logic"], "nested": [{"kind": "first"}, {"kind": "second"}]},
             {"_id": "u2", "tags": "math", "nested": {"kind": "second"}},
             {"_id": "u3", "tags": "systems", "nested": {"kind": "first"}},
         ]
@@ -425,6 +437,7 @@ def test_indexed_find_falls_back_when_single_field_index_has_array_omissions(col
         "u1",
         "u2",
     ]
+    assert collection.count_documents({"tags": "math"}) == 2
 
 
 def test_indexed_find_falls_back_when_compound_index_has_array_omissions(collection):
@@ -479,6 +492,26 @@ def test_indexed_query_results_stay_correct_after_mutations(collection):
         "u1"
     ]
     assert collection.count_documents({"profile.city": "Milan"}) == 1
+
+
+def test_multikey_index_entries_stay_fresh_after_insert_replace_delete(collection, mongolino_server):
+    namespace = f"{collection.database.name}.{collection.name}"
+
+    collection.create_index([("tags", ASCENDING)], name="tags_1")
+    collection.insert_one({"_id": "u1", "tags": ["math", "math", "logic"]})
+
+    assert index_entry_count(mongolino_server.db_path, namespace, "tags_1") == 2
+    assert index_key_entry_count(mongolino_server.db_path, namespace, "tags_1", "str:math") == 1
+    assert ids(collection.find({"tags": "math"})) == ["u1"]
+
+    collection.replace_one({"_id": "u1"}, {"_id": "u1", "tags": ["systems"]})
+    assert ids(collection.find({"tags": "math"})) == []
+    assert ids(collection.find({"tags": "systems"})) == ["u1"]
+    assert index_entry_count(mongolino_server.db_path, namespace, "tags_1") == 1
+
+    collection.delete_one({"tags": "systems"})
+    assert collection.count_documents({"tags": "systems"}) == 0
+    assert index_entry_count(mongolino_server.db_path, namespace, "tags_1") == 0
 
 
 def test_sparse_and_partial_indexed_find_preserves_membership_safety(collection):

@@ -143,7 +143,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Multikey entry model and deduplication
-- [ ] Milestone 1: Entry maintenance and mutation freshness
+- [x] Milestone 1: Entry maintenance and mutation freshness
 - [ ] Milestone 2: Read/count/write planner pushdown
 - [ ] Milestone 3: Unique and unsupported multikey semantics
 - [ ] Milestone 4: Benchmarks, docs, and final verification
@@ -185,7 +185,7 @@ Status 2026-07-04: implemented distinct supported scalar multikey entry
 generation for single-field indexes, dotted array leaf extraction, distinct SQL
 candidate/count lookups, and numeric-array fallback sentinels. Verified with
 `cargo fmt -- --check`, `cargo test planner`, and `cargo test index`. Commit:
-pending.
+`72c352f`.
 
 ## Milestone 1: Entry Maintenance And Mutation Freshness
 
@@ -226,6 +226,16 @@ cargo test find_and_modify
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py
 cargo test
 ```
+
+Status 2026-07-04: added PyMongo coverage for scalar multikey insert,
+replacement, delete, update operators, and findAndModify freshness; adjusted
+legacy omission-sentinel cleanup fixtures to use unsupported numeric arrays.
+Verified with `cargo fmt -- --check`, `cargo test index`, `cargo test update`,
+`cargo test find_and_modify`, `cargo build`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py`,
+and `cargo test`. The first sandboxed PyMongo attempt failed at localhost bind
+with `PermissionError: Operation not permitted`, then passed unsandboxed.
+Commit: pending.
 
 ## Milestone 2: Read/Count/Write Planner Pushdown
 
