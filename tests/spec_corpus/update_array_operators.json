@@ -25,10 +25,32 @@
       ],
       "docs": [
         {
-          "kind": "a"
+          "kind": "a",
+          "score": 1,
+          "meta": {
+            "flag": false
+          }
         },
         {
-          "kind": "b"
+          "kind": "a",
+          "score": 3,
+          "meta": {
+            "flag": true
+          }
+        },
+        {
+          "kind": "b",
+          "score": 4,
+          "meta": {
+            "flag": true
+          }
+        },
+        {
+          "kind": "c",
+          "score": 2,
+          "meta": {
+            "flag": true
+          }
         }
       ],
       "letters": [
@@ -39,7 +61,17 @@
     },
     {
       "_id": "u2",
-      "active": true
+      "active": true,
+      "docs": [
+        {
+          "kind": "a",
+          "score": 4
+        },
+        {
+          "kind": "b",
+          "score": 2
+        }
+      ]
     }
   ],
   "operations": [
@@ -74,7 +106,10 @@
             "$gte": 3
           },
           "docs": {
-            "kind": "a"
+            "kind": "a",
+            "score": {
+              "$gte": 2
+            }
           }
         },
         "$pullAll": {
@@ -97,6 +132,11 @@
       "update": {
         "$push": {
           "events": "seen"
+        },
+        "$pull": {
+          "docs": {
+            "kind": "b"
+          }
         }
       },
       "expect_result": {
@@ -110,10 +150,10 @@
         "_id": "u1"
       },
       "update": {
-        "$pullAll": {
-          "events": [
-            "missing"
-          ]
+        "$pull": {
+          "docs": {
+            "meta.flag": true
+          }
         }
       },
       "return_document": "after",
@@ -141,7 +181,11 @@
         ],
         "docs": [
           {
-            "kind": "b"
+            "kind": "a",
+            "score": 1,
+            "meta": {
+              "flag": false
+            }
           }
         ],
         "letters": [
@@ -171,6 +215,25 @@
         "type": "WriteError",
         "contains": "$push option $sort is not supported"
       }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$pull": {
+          "docs": {
+            "kind": {
+              "$regex": "^a"
+            }
+          }
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "unsupported query operator $regex"
+      }
     }
   ],
   "expect_final_documents": [
@@ -198,7 +261,11 @@
       ],
       "docs": [
         {
-          "kind": "b"
+          "kind": "a",
+          "score": 1,
+          "meta": {
+            "flag": false
+          }
         }
       ],
       "letters": [
@@ -211,6 +278,12 @@
     {
       "_id": "u2",
       "active": true,
+      "docs": [
+        {
+          "kind": "a",
+          "score": 4
+        }
+      ],
       "events": [
         "seen"
       ]

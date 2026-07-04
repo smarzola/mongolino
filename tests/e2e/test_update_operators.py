@@ -143,10 +143,22 @@ def test_array_update_operators_happy_path_and_update_many(collection):
                 "unique": ["math"],
                 "numbers": [1, 2, 3],
                 "scores": [1, 3, 5],
-                "docs": [{"kind": "a"}, {"kind": "b"}],
+                "docs": [
+                    {"kind": "a", "score": 1, "meta": {"flag": False}},
+                    {"kind": "a", "score": 3, "meta": {"flag": True}},
+                    {"kind": "b", "score": 4, "meta": {"flag": True}},
+                    {"kind": "c", "score": 2, "meta": {"flag": True}},
+                ],
                 "letters": ["x", "y", "z"],
             },
-            {"_id": "u2", "active": True},
+            {
+                "_id": "u2",
+                "active": True,
+                "docs": [
+                    {"kind": "a", "score": 4},
+                    {"kind": "b", "score": 2},
+                ],
+            },
         ]
     )
 
@@ -156,13 +168,19 @@ def test_array_update_operators_happy_path_and_update_many(collection):
             "$push": {"tags": "logic", "batch": {"$each": ["a", "b"]}},
             "$addToSet": {"unique": {"$each": ["math", "logic"]}},
             "$pop": {"numbers": 1},
-            "$pull": {"scores": {"$gte": 3}, "docs": {"kind": "a"}},
+            "$pull": {
+                "scores": {"$gte": 3},
+                "docs": {"kind": "a", "score": {"$gte": 2}},
+            },
             "$pullAll": {"letters": ["x", "z"]},
         },
     )
     assert result.modified_count == 1
 
-    many = collection.update_many({"active": True}, {"$push": {"events": "seen"}})
+    many = collection.update_many(
+        {"active": True},
+        {"$push": {"events": "seen"}, "$pull": {"docs": {"kind": "b"}}},
+    )
     assert many.matched_count == 2
     assert many.modified_count == 2
 
@@ -172,10 +190,18 @@ def test_array_update_operators_happy_path_and_update_many(collection):
     assert doc["unique"] == ["math", "logic"]
     assert doc["numbers"] == [1, 2]
     assert doc["scores"] == [1]
-    assert doc["docs"] == [{"kind": "b"}]
+    assert doc["docs"] == [
+        {"kind": "a", "score": 1, "meta": {"flag": False}},
+        {"kind": "c", "score": 2, "meta": {"flag": True}},
+    ]
     assert doc["letters"] == ["y"]
     assert doc["events"] == ["seen"]
-    assert collection.find_one({"_id": "u2"})["events"] == ["seen"]
+    assert collection.find_one({"_id": "u2"}) == {
+        "_id": "u2",
+        "active": True,
+        "docs": [{"kind": "a", "score": 4}],
+        "events": ["seen"],
+    }
 
 
 def test_array_update_operators_find_one_and_update(collection):
@@ -186,6 +212,11 @@ def test_array_update_operators_find_one_and_update(collection):
             "unique": ["math"],
             "numbers": [1, 2],
             "scores": [1, 4],
+            "docs": [
+                {"kind": "a", "score": 1},
+                {"kind": "a", "score": 3},
+                {"kind": "b", "score": 5},
+            ],
             "letters": ["x", "y"],
         }
     )
@@ -196,7 +227,7 @@ def test_array_update_operators_find_one_and_update(collection):
             "$push": {"tags": {"$each": ["logic", "systems"]}},
             "$addToSet": {"unique": {"$each": ["math", "logic"]}},
             "$pop": {"numbers": -1},
-            "$pull": {"scores": {"$gt": 2}},
+            "$pull": {"scores": {"$gt": 2}, "docs": {"kind": "a", "score": {"$gte": 2}}},
             "$pullAll": {"letters": ["x"]},
         },
         return_document=ReturnDocument.AFTER,
@@ -206,11 +237,20 @@ def test_array_update_operators_find_one_and_update(collection):
     assert doc["unique"] == ["math", "logic"]
     assert doc["numbers"] == [2]
     assert doc["scores"] == [1]
+    assert doc["docs"] == [{"kind": "a", "score": 1}, {"kind": "b", "score": 5}]
     assert doc["letters"] == ["y"]
 
 
 def test_array_update_operator_errors_preserve_documents(collection):
-    collection.insert_one({"_id": "u1", "tags": [], "name": "Ada", "profile": "flat"})
+    collection.insert_one(
+        {
+            "_id": "u1",
+            "tags": [],
+            "name": "Ada",
+            "profile": "flat",
+            "docs": [{"name": "Ada"}, {"name": "Grace"}],
+        }
+    )
 
     bad_updates = [
         {"$push": {"tags": {"$each": ["x"], "$position": 0}}},
@@ -222,6 +262,7 @@ def test_array_update_operator_errors_preserve_documents(collection):
         {"$pullAll": {"tags": "x"}},
         {"$push": {"name": "x"}},
         {"$pull": {"name": "Ada"}},
+        {"$pull": {"docs": {"name": {"$regex": "^A"}}}},
         {"$push": {"profile.tags": "x"}},
         {"$push": {"tags.$": "x"}},
     ]
@@ -234,6 +275,7 @@ def test_array_update_operator_errors_preserve_documents(collection):
         "tags": [],
         "name": "Ada",
         "profile": "flat",
+        "docs": [{"name": "Ada"}, {"name": "Grace"}],
     }
 
 

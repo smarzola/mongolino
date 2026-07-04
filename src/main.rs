@@ -3599,6 +3599,9 @@ fn pull_matches(value: &Bson, condition: &Bson) -> std::result::Result<bool, Str
     {
         return matches_operator_document(&[value], document).map_err(|err| err.errmsg);
     }
+    if let (Bson::Document(value), Bson::Document(condition)) = (value, condition) {
+        return matches_filter(value, condition).map_err(|err| err.errmsg);
+    }
     Ok(update_values_equal(value, condition))
 }
 
@@ -8248,10 +8251,22 @@ mod tests {
                         "unique": ["math"],
                         "numbers": [1_i32, 2_i32, 3_i32],
                         "scores": [1_i32, 3_i32, 5_i32],
-                        "docs": [{ "kind": "a" }, { "kind": "b" }],
+                        "docs": [
+                            { "kind": "a", "score": 1_i32, "meta": { "flag": false } },
+                            { "kind": "a", "score": 3_i32, "meta": { "flag": true } },
+                            { "kind": "b", "score": 4_i32, "meta": { "flag": true } },
+                            { "kind": "c", "score": 2_i32, "meta": { "flag": true } },
+                        ],
                         "letters": ["x", "y", "z"],
                     },
-                    { "_id": "u2", "active": true },
+                    {
+                        "_id": "u2",
+                        "active": true,
+                        "docs": [
+                            { "kind": "a", "score": 4_i32 },
+                            { "kind": "b", "score": 2_i32 },
+                        ],
+                    },
                 ],
             },
         )
@@ -8269,7 +8284,10 @@ mod tests {
                             "$push": { "tags": "logic", "batch": { "$each": ["a", "b"] } },
                             "$addToSet": { "unique": { "$each": ["math", "logic"] } },
                             "$pop": { "numbers": 1_i32 },
-                            "$pull": { "scores": { "$gte": 3_i32 }, "docs": { "kind": "a" } },
+                            "$pull": {
+                                "scores": { "$gte": 3_i32 },
+                                "docs": { "kind": "a", "score": { "$gte": 2_i32 } },
+                            },
                             "$pullAll": { "letters": ["x", "z"] },
                         },
                     }
@@ -8287,7 +8305,7 @@ mod tests {
                 "updates": [
                     {
                         "q": { "active": true },
-                        "u": { "$push": { "events": "seen" } },
+                        "u": { "$push": { "events": "seen" }, "$pull": { "docs": { "kind": "b" } } },
                         "multi": true,
                     }
                 ],
@@ -8320,7 +8338,10 @@ mod tests {
         assert_eq!(docs[0].get_array("scores").unwrap(), &bson_ints(&[1]));
         assert_eq!(
             docs[0].get_array("docs").unwrap(),
-            &bson_documents(vec![doc! { "kind": "b" }])
+            &bson_documents(vec![
+                doc! { "kind": "a", "score": 1_i32, "meta": { "flag": false } },
+                doc! { "kind": "c", "score": 2_i32, "meta": { "flag": true } },
+            ])
         );
         assert_eq!(docs[0].get_array("letters").unwrap(), &bson_strings(&["y"]));
         assert_eq!(
@@ -8330,6 +8351,10 @@ mod tests {
         assert_eq!(
             docs[1].get_array("events").unwrap(),
             &bson_strings(&["seen"])
+        );
+        assert_eq!(
+            docs[1].get_array("docs").unwrap(),
+            &bson_documents(vec![doc! { "kind": "a", "score": 4_i32 }])
         );
     }
 
@@ -8348,6 +8373,11 @@ mod tests {
                         "unique": ["math"],
                         "numbers": [1_i32, 2_i32],
                         "scores": [1_i32, 4_i32],
+                        "docs": [
+                            { "kind": "a", "score": 1_i32 },
+                            { "kind": "a", "score": 3_i32 },
+                            { "kind": "b", "score": 5_i32 },
+                        ],
                         "letters": ["x", "y"],
                     }
                 ],
@@ -8366,7 +8396,10 @@ mod tests {
                     "$push": { "tags": { "$each": ["logic", "systems"] } },
                     "$addToSet": { "unique": { "$each": ["math", "logic"] } },
                     "$pop": { "numbers": -1_i32 },
-                    "$pull": { "scores": { "$gt": 2_i32 } },
+                    "$pull": {
+                        "scores": { "$gt": 2_i32 },
+                        "docs": { "kind": "a", "score": { "$gte": 2_i32 } },
+                    },
                     "$pullAll": { "letters": ["x"] },
                 },
                 "new": true,
@@ -8385,6 +8418,13 @@ mod tests {
         );
         assert_eq!(value.get_array("numbers").unwrap(), &bson_ints(&[2]));
         assert_eq!(value.get_array("scores").unwrap(), &bson_ints(&[1]));
+        assert_eq!(
+            value.get_array("docs").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "a", "score": 1_i32 },
+                doc! { "kind": "b", "score": 5_i32 },
+            ])
+        );
         assert_eq!(value.get_array("letters").unwrap(), &bson_strings(&["y"]));
     }
 
@@ -8540,7 +8580,13 @@ mod tests {
             &doc! {
                 "insert": "users",
                 "$db": "app",
-                "documents": [{ "_id": "u1", "tags": [], "name": "Ada", "profile": "flat" }],
+                "documents": [{
+                    "_id": "u1",
+                    "tags": [],
+                    "name": "Ada",
+                    "profile": "flat",
+                    "docs": [{ "name": "Ada" }, { "name": "Grace" }],
+                }],
             },
         )
         .unwrap();
@@ -8555,6 +8601,7 @@ mod tests {
             doc! { "$pullAll": { "tags": "x" } },
             doc! { "$push": { "name": "x" } },
             doc! { "$pull": { "name": "Ada" } },
+            doc! { "$pull": { "docs": { "name": { "$regex": "^A" } } } },
             doc! { "$push": { "profile.tags": "x" } },
             doc! { "$push": { "tags.$": "x" } },
         ] {
@@ -8570,6 +8617,18 @@ mod tests {
             assert_eq!(response.get_f64("ok").unwrap(), 1.0);
             assert!(!write_errors(&response).is_empty());
         }
+
+        let stored = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            stored[0].get_array("docs").unwrap(),
+            &bson_documents(vec![doc! { "name": "Ada" }, doc! { "name": "Grace" }])
+        );
     }
 
     #[test]
