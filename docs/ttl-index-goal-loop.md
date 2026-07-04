@@ -565,7 +565,7 @@ Status:
   uv lock --check`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
   --locked --dev`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
   --locked pytest tests/e2e` (186 passed, outside sandbox due localhost bind).
-  Commit: pending.
+  Commit: `3fdeafd`.
 
 Likely files:
 
