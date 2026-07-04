@@ -1451,6 +1451,155 @@ fn non_negative_stage_usize(value: &Bson, operator: &str) -> std::result::Result
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum AggregationExpression {
+    FieldPath(String),
+    Literal(Bson),
+    Document(Vec<(String, AggregationExpression)>),
+}
+
+impl AggregationExpression {
+    fn evaluate(&self, document: &Document) -> Option<Bson> {
+        match self {
+            Self::FieldPath(path) => get_document_path(document, path).cloned(),
+            Self::Literal(value) => Some(value.clone()),
+            Self::Document(fields) => {
+                let mut out = Document::new();
+                for (field, expression) in fields {
+                    out.insert(field, expression.evaluate(document).unwrap_or(Bson::Null));
+                }
+                Some(Bson::Document(out))
+            }
+        }
+    }
+}
+
+fn parse_aggregation_expression(
+    value: &Bson,
+    context: &str,
+    allow_document_key_spec: bool,
+) -> std::result::Result<AggregationExpression, Document> {
+    match value {
+        Bson::String(value) if value.starts_with('$') => {
+            let path = parse_aggregation_field_path(value, context)?;
+            Ok(AggregationExpression::FieldPath(path))
+        }
+        Bson::Null
+        | Bson::Boolean(_)
+        | Bson::String(_)
+        | Bson::Int32(_)
+        | Bson::Int64(_)
+        | Bson::Double(_)
+        | Bson::ObjectId(_)
+        | Bson::DateTime(_) => Ok(AggregationExpression::Literal(value.clone())),
+        Bson::Document(document) if allow_document_key_spec => {
+            if document.keys().any(|key| key.starts_with('$')) {
+                return Err(command_error(
+                    72,
+                    &format!("{context} does not support expression operators"),
+                ));
+            }
+            let mut fields = Vec::new();
+            for (field, nested) in document {
+                validate_group_key_field_name(field, context)?;
+                fields.push((
+                    field.to_string(),
+                    parse_aggregation_expression(nested, context, false)?,
+                ));
+            }
+            Ok(AggregationExpression::Document(fields))
+        }
+        Bson::Document(_) => Err(command_error(
+            72,
+            &format!("{context} does not support document expressions"),
+        )),
+        Bson::Array(_) => Err(command_error(
+            72,
+            &format!("{context} does not support array expressions"),
+        )),
+        _ => Err(command_error(
+            72,
+            &format!("{context} expression type is not supported"),
+        )),
+    }
+}
+
+fn parse_aggregation_field_path(
+    value: &str,
+    context: &str,
+) -> std::result::Result<String, Document> {
+    let Some(path) = value.strip_prefix('$') else {
+        return Err(command_error(
+            9,
+            &format!("{context} requires a field path"),
+        ));
+    };
+    validate_aggregation_path(path, context, true)?;
+    Ok(path.to_string())
+}
+
+fn validate_aggregation_path(
+    path: &str,
+    context: &str,
+    reject_dollar_segments: bool,
+) -> std::result::Result<(), Document> {
+    if path.is_empty() {
+        return Err(command_error(
+            9,
+            &format!("{context} field path cannot be empty"),
+        ));
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err(command_error(
+                9,
+                &format!("{context} field path contains an empty segment"),
+            ));
+        }
+        if reject_dollar_segments && segment.contains('$') {
+            return Err(command_error(
+                9,
+                &format!("{context} field path contains unsupported $ segment"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_group_key_field_name(field: &str, context: &str) -> std::result::Result<(), Document> {
+    if field.is_empty() || field.starts_with('$') || field.contains('.') {
+        return Err(command_error(
+            9,
+            &format!("{context} document key fields must be simple field names"),
+        ));
+    }
+    Ok(())
+}
+
+fn aggregation_values_equal(left: &Bson, right: &Bson) -> bool {
+    match (numeric_value(left), numeric_value(right)) {
+        (Some(left), Some(right)) => return left == right,
+        _ => {}
+    }
+    match (left, right) {
+        (Bson::Document(left), Bson::Document(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left_value)| {
+                    right.get(key).is_some_and(|right_value| {
+                        aggregation_values_equal(left_value, right_value)
+                    })
+                })
+        }
+        (Bson::Array(left), Bson::Array(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left_value, right_value)| {
+                    aggregation_values_equal(left_value, right_value)
+                })
+        }
+        _ => left == right,
+    }
+}
+
 fn is_count_documents_group(group: &Document) -> bool {
     group.len() == 2
         && matches!(group.get("_id"), Some(Bson::Int32(1) | Bson::Int64(1)))
@@ -6397,6 +6546,73 @@ mod tests {
         .unwrap();
         let batch = first_batch(&response);
         assert_eq!(batch[0].get_i64("n").unwrap(), 1);
+    }
+
+    #[test]
+    fn aggregation_expression_parses_and_evaluates_supported_subset() {
+        let document = doc! {
+            "_id": "u1",
+            "team": "red",
+            "active": true,
+            "profile": { "city": "Rome" },
+        };
+
+        let field = parse_aggregation_expression(
+            &Bson::String("$profile.city".to_string()),
+            "$group _id",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            field.evaluate(&document),
+            Some(Bson::String("Rome".to_string()))
+        );
+
+        let literal =
+            parse_aggregation_expression(&Bson::String("literal".to_string()), "$group _id", false)
+                .unwrap();
+        assert_eq!(
+            literal.evaluate(&document),
+            Some(Bson::String("literal".to_string()))
+        );
+
+        let key = parse_aggregation_expression(
+            &Bson::Document(doc! { "team": "$team", "active": "$active", "missing": "$missing" }),
+            "$group _id",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            key.evaluate(&document),
+            Some(Bson::Document(
+                doc! { "team": "red", "active": true, "missing": Bson::Null }
+            ))
+        );
+    }
+
+    #[test]
+    fn aggregation_expression_rejects_unsupported_shapes() {
+        for value in [
+            Bson::String("$".to_string()),
+            Bson::String("$$ROOT".to_string()),
+            Bson::String("$profile..city".to_string()),
+            Bson::Array(vec![Bson::Int32(1)]),
+            Bson::Document(doc! { "$add": [1_i32, 2_i32] }),
+        ] {
+            let response = parse_aggregation_expression(&value, "$group _id", false)
+                .expect_err("expression should be rejected");
+            assert_command_error(&response);
+        }
+
+        for value in [
+            Bson::Document(doc! { "nested.field": "$team" }),
+            Bson::Document(doc! { "$team": "$team" }),
+            Bson::Document(doc! { "nested": { "team": "$team" } }),
+        ] {
+            let response = parse_aggregation_expression(&value, "$group _id", true)
+                .expect_err("document key spec should be rejected");
+            assert_command_error(&response);
+        }
     }
 
     #[test]

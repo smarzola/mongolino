@@ -102,13 +102,19 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Aggregation expression and grouping design
+- [x] Milestone 0: Aggregation expression and grouping design
 - [ ] Milestone 1: `$unwind` stage
 - [ ] Milestone 2: `$group` keys and scalar accumulators
 - [ ] Milestone 3: Array-style accumulators and pipeline composition
 - [ ] Milestone 4: Adversarial coverage, README, spec corpus, and final verification
 
 ## Milestone 0: Aggregation Expression And Grouping Design
+
+Status 2026-07-04:
+
+- Added the internal aggregation expression subset for field paths, scalar literals, and simple document key specs, with Rust coverage for supported evaluation and malformed shapes.
+- Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`.
+- Commit: pending at status-update time; final hash reported in handoff.
 
 Problem:
 
