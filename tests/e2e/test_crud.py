@@ -1,5 +1,8 @@
+import sqlite3
+from datetime import datetime, timezone
+
 import pytest
-from bson import ObjectId
+from bson import BSON, ObjectId
 from bson.int64 import Int64
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, WriteError
@@ -212,6 +215,85 @@ def test_find_sort_skip_limit_and_batch_size_cursor_iteration(collection):
     assert ids(collection.find({}).sort("_id", ASCENDING).batch_size(1)) == ["u1", "u2", "u3"]
     assert ids(collection.find({}).sort("_id", ASCENDING).limit(2).batch_size(1)) == ["u1", "u2"]
     assert ids(collection.find({}).sort("_id", ASCENDING).batch_size(2)) == ["u1", "u2", "u3"]
+
+
+def test_collation_find_count_distinct_update_and_delete(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "name": "Ada", "team": "Core"},
+            {"_id": "u2", "name": "ada", "team": "core"},
+            {"_id": "u3", "name": "Grace", "team": "Ops"},
+            {"_id": "u4", "name": 42, "team": "Misc"},
+        ]
+    )
+    collation = {"locale": "en", "strength": 2}
+
+    assert ids(collection.find({"name": "ada"}).sort("_id", ASCENDING)) == ["u2"]
+    assert ids(collection.find({"name": "ada"}, collation=collation).sort("_id", ASCENDING)) == [
+        "u1",
+        "u2",
+    ]
+    assert collection.count_documents({"team": "CORE"}, collation=collation) == 2
+    assert collection.distinct("team", {"name": "ADA"}, collation=collation) == ["Core"]
+
+    updated = collection.update_many(
+        {"team": "CORE"},
+        {"$set": {"matched": True}},
+        collation=collation,
+    )
+    assert updated.matched_count == 2
+    assert ids(collection.find({"matched": True}).sort("_id", ASCENDING)) == ["u1", "u2"]
+
+    deleted = collection.delete_one({"name": "ADA"}, collation=collation)
+    assert deleted.deleted_count == 1
+    assert ids(collection.find({}).sort("_id", ASCENDING)) == ["u2", "u3", "u4"]
+
+
+def test_invalid_collation_read_and_write_do_not_sweep_ttl_or_mutate(collection, mongolino_server):
+    expired = ObjectId("000000000000000000000001")
+    collection.insert_many(
+        [
+            {"_id": expired, "expiresAt": datetime(2000, 1, 1, tzinfo=timezone.utc), "name": "Ada"},
+            {
+                "_id": "target",
+                "expiresAt": datetime(2100, 1, 1, tzinfo=timezone.utc),
+                "name": "Grace",
+            },
+        ]
+    )
+    collection.create_index([("expiresAt", ASCENDING)], expireAfterSeconds=0)
+
+    with pytest.raises(OperationFailure) as read_error:
+        list(collection.find({"name": "ada"}, collation={"locale": "en", "numericOrdering": True}))
+    assert read_error.value.code == 72
+
+    with pytest.raises(WriteError):
+        collection.update_one(
+            {"name": "GRACE"},
+            {"$set": {"mutated": True}},
+            collation={"locale": "en", "numericOrdering": True},
+        )
+
+    namespace = f"{collection.database.name}.{collection.name}"
+    with sqlite3.connect(f"file:{mongolino_server.db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT bson FROM documents WHERE namespace = ? ORDER BY created_at",
+            (namespace,),
+        ).fetchall()
+    documents = {BSON(row[0]).decode()["_id"]: BSON(row[0]).decode() for row in rows}
+
+    assert expired in documents
+    assert documents["target"].get("mutated") is None
+
+
+def test_non_simple_collation_rejects_string_ranges(collection):
+    collection.insert_many([{"_id": "u1", "name": "Ada"}, {"_id": "u2", "name": "grace"}])
+
+    with pytest.raises(OperationFailure) as excinfo:
+        list(collection.find({"name": {"$gte": "a"}}, collation={"locale": "en", "strength": 2}))
+
+    assert excinfo.value.code == 72
+    assert "range" in str(excinfo.value)
 
 
 def test_find_command_get_more_batches(collection):

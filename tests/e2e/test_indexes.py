@@ -107,6 +107,57 @@ def test_sparse_and_partial_index_metadata_roundtrip(collection):
     assert "email_active_partial" not in index_names(collection)
 
 
+def test_collation_index_metadata_and_unique_enforcement(collection):
+    collation = {"locale": "en", "strength": 2}
+    collection.insert_one({"_id": "u1", "email": "Ada@Example.Test"})
+
+    created = collection.create_index(
+        [("email", ASCENDING)],
+        name="email_ci",
+        unique=True,
+        collation=collation,
+    )
+    assert created == "email_ci"
+
+    indexes = {index["name"]: index for index in collection.list_indexes()}
+    assert indexes["email_ci"]["collation"] == collation
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u2", "email": "ada@example.test"})
+
+    assert ids(collection.find({"email": "ADA@EXAMPLE.TEST"}, collation=collation)) == ["u1"]
+
+
+def test_collation_index_rejects_unsupported_and_unsafe_specs(collection):
+    with pytest.raises(OperationFailure) as unsupported:
+        collection.create_index(
+            [("name", ASCENDING)],
+            name="name_numeric_ordering",
+            collation={"locale": "en", "strength": 2, "numericOrdering": True},
+        )
+    assert unsupported.value.code == 72
+
+    with pytest.raises(OperationFailure):
+        collection.create_index(
+            [("name", ASCENDING)],
+            name="name_partial_ci",
+            partialFilterExpression={"active": True},
+            collation={"locale": "en", "strength": 2},
+        )
+
+    with pytest.raises(OperationFailure):
+        collection.create_index(
+            [("expiresAt", ASCENDING)],
+            name="expires_ci",
+            expireAfterSeconds=60,
+            collation={"locale": "en", "strength": 2},
+        )
+
+    assert "name_numeric_ordering" not in index_names(collection)
+    assert "name_partial_ci" not in index_names(collection)
+    assert "expires_ci" not in index_names(collection)
+
+
 def test_ttl_index_metadata_roundtrip_and_invalid_specs(collection, mongolino_server):
     collection.insert_one(
         {

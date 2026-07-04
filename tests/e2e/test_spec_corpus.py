@@ -132,53 +132,85 @@ def execute_operation(operation, collection):
     if name == "insert_one":
         return collection.insert_one(operation["document"])
     if name == "find":
+        kwargs = {"projection": operation.get("projection")}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         cursor = collection.find(
             operation.get("filter", {}),
-            projection=operation.get("projection"),
+            **kwargs,
         )
         if "batch_size" in operation:
             cursor = cursor.batch_size(operation["batch_size"])
-        return list(cursor.sort("_id", 1))
+        return list(cursor.sort(_sort(operation) or [("_id", 1)]))
     if name == "update_one":
+        kwargs = {"upsert": operation.get("upsert", False)}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.update_one(
             operation.get("filter", {}),
             operation["update"],
-            upsert=operation.get("upsert", False),
+            **kwargs,
         )
     if name == "update_many":
-        return collection.update_many(operation.get("filter", {}), operation["update"])
+        kwargs = {}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
+        return collection.update_many(operation.get("filter", {}), operation["update"], **kwargs)
     if name == "find_one_and_update":
+        kwargs = {
+            "projection": operation.get("projection"),
+            "sort": _sort(operation),
+            "upsert": operation.get("upsert", False),
+            "return_document": _return_document(operation),
+        }
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.find_one_and_update(
             operation.get("filter", {}),
             operation["update"],
-            projection=operation.get("projection"),
-            sort=_sort(operation),
-            upsert=operation.get("upsert", False),
-            return_document=_return_document(operation),
+            **kwargs,
         )
     if name == "find_one_and_replace":
+        kwargs = {
+            "projection": operation.get("projection"),
+            "sort": _sort(operation),
+            "upsert": operation.get("upsert", False),
+            "return_document": _return_document(operation),
+        }
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.find_one_and_replace(
             operation.get("filter", {}),
             operation["replacement"],
-            projection=operation.get("projection"),
-            sort=_sort(operation),
-            upsert=operation.get("upsert", False),
-            return_document=_return_document(operation),
+            **kwargs,
         )
     if name == "find_one_and_delete":
+        kwargs = {
+            "projection": operation.get("projection"),
+            "sort": _sort(operation),
+        }
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.find_one_and_delete(
             operation.get("filter", {}),
-            projection=operation.get("projection"),
-            sort=_sort(operation),
+            **kwargs,
         )
     if name == "delete_one":
-        return collection.delete_one(operation.get("filter", {}))
+        kwargs = {}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
+        return collection.delete_one(operation.get("filter", {}), **kwargs)
     if name == "delete_many":
-        return collection.delete_many(operation.get("filter", {}))
+        kwargs = {}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
+        return collection.delete_many(operation.get("filter", {}), **kwargs)
     if name == "aggregate":
         kwargs = {}
         if "batch_size" in operation:
             kwargs["batchSize"] = operation["batch_size"]
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return list(collection.aggregate(operation["pipeline"], **kwargs))
     if name == "count_documents":
         kwargs = {}
@@ -186,9 +218,14 @@ def execute_operation(operation, collection):
             kwargs["skip"] = operation["skip"]
         if "limit" in operation:
             kwargs["limit"] = operation["limit"]
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.count_documents(operation.get("filter", {}), **kwargs)
     if name == "distinct":
-        return collection.distinct(operation["key"], operation.get("filter"))
+        kwargs = {}
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
+        return collection.distinct(operation["key"], operation.get("filter"), **kwargs)
     if name == "create_index":
         kwargs = {
             "name": operation.get("index_name"),
@@ -196,6 +233,8 @@ def execute_operation(operation, collection):
         }
         if "expireAfterSeconds" in operation:
             kwargs["expireAfterSeconds"] = operation["expireAfterSeconds"]
+        if "collation" in operation:
+            kwargs["collation"] = operation["collation"]
         return collection.create_index(
             list(operation["keys"].items()),
             **kwargs,

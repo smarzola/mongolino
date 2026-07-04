@@ -35,6 +35,36 @@ def test_aggregate_match_sort_project(collection):
     ]
 
 
+def test_aggregate_match_sort_and_count_with_collation(collection):
+    collection.insert_many(
+        [
+            {"_id": "s1", "team": "Red", "name": "bravo"},
+            {"_id": "s2", "team": "red", "name": "Alpha"},
+            {"_id": "s3", "team": "BLUE", "name": "charlie"},
+        ]
+    )
+    collation = {"locale": "en", "strength": 2}
+
+    result = list(
+        collection.aggregate(
+            [
+                {"$match": {"team": "RED"}},
+                {"$sort": {"name": 1}},
+                {"$project": {"_id": 1, "name": 1}},
+            ],
+            collation=collation,
+        )
+    )
+    assert result == [{"_id": "s2", "name": "Alpha"}, {"_id": "s1", "name": "bravo"}]
+
+    assert list(
+        collection.aggregate(
+            [{"$match": {"team": "red"}}, {"$count": "total"}],
+            collation=collation,
+        )
+    ) == [{"total": 2}]
+
+
 def test_aggregate_skip_limit_stage_order(collection):
     seed_scores(collection)
 

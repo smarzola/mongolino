@@ -194,7 +194,7 @@ When a milestone is complete:
 - [x] Milestone 1: Collation-aware read matching, sorting, and distinct
 - [x] Milestone 2: Collation-aware write target selection and no-mutation errors
 - [x] Milestone 3: Index metadata, unique enforcement, and safe planning
-- [ ] Milestone 4: PyMongo/spec-corpus adversarial coverage
+- [x] Milestone 4: PyMongo/spec-corpus adversarial coverage
 - [ ] Milestone 5: Benchmarks, docs, scorecard, final verification
 
 ## Milestone 0: Collation Parser And Comparison Model
@@ -402,7 +402,7 @@ enforce case-insensitive conflicts, and planner/hint paths use only matching
 collation-aware indexes. Verified with `cargo fmt -- --check`,
 `cargo test collation`, `cargo test index`, `cargo test unique`,
 `cargo test planner`, `cargo test hint`, and `cargo test ttl`. Commit:
-pending.
+496043a.
 
 ## Milestone 4: PyMongo/Spec-Corpus Adversarial Coverage
 
@@ -456,6 +456,19 @@ cargo fmt -- --check
 cargo test collation
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_crud.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_find_and_modify.py tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py
 ```
+
+Status 2026-07-04: Complete. Added PyMongo e2e coverage for supported
+collation on find, count_documents, distinct, aggregate, update/delete target
+selection, findAndModify target selection, index metadata, and unique index
+enforcement. Added a local corpus case for supported equality/sort/distinct,
+index metadata readback, and unsupported option/range errors. Invalid collation
+with expired TTL documents is now verified by direct SQLite readback so the
+assertion does not itself trigger a sweep. Verified with `cargo fmt -- --check`,
+`cargo test collation`, and
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_crud.py tests/e2e/test_metadata.py tests/e2e/test_aggregation.py tests/e2e/test_find_and_modify.py tests/e2e/test_indexes.py tests/e2e/test_spec_corpus.py`
+after the same pytest command was blocked in-sandbox by
+`socket.bind(("127.0.0.1", 0))` returning `PermissionError: [Errno 1]
+Operation not permitted`. PyMongo result: 142 passed. Commit: pending.
 
 ## Milestone 5: Benchmarks, Docs, Scorecard, Final Verification
 

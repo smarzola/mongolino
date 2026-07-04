@@ -164,4 +164,4 @@ def test_count_and_distinct_unsupported_options_are_explicit(collection):
     with pytest.raises(OperationFailure) as distinct_error:
         collection.distinct("name", collation={"locale": "en"})
     assert distinct_error.value.code == 72
-    assert "collation is not supported" in str(distinct_error.value)
+    assert "requires strength 2" in str(distinct_error.value)

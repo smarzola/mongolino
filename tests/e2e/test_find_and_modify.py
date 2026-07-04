@@ -46,6 +46,34 @@ def test_find_one_and_update_after_and_sorted_selection(collection):
     assert collection.find_one({"_id": "j1"})["state"] == "queued"
 
 
+def test_find_and_modify_targets_and_sorts_with_collation(collection):
+    collection.insert_many(
+        [
+            {"_id": "j1", "owner": "Ada", "state": "Queued", "priority": 1},
+            {"_id": "j2", "owner": "ada", "state": "queued", "priority": 2},
+            {"_id": "j3", "owner": "Grace", "state": "done", "priority": 3},
+        ]
+    )
+    collation = {"locale": "en", "strength": 2}
+
+    updated = collection.find_one_and_update(
+        {"state": "QUEUED"},
+        {"$set": {"state": "running"}},
+        sort=[("owner", DESCENDING)],
+        projection={"_id": 1, "owner": 1, "state": 1},
+        collation=collation,
+        return_document=ReturnDocument.AFTER,
+    )
+    assert updated == {"_id": "j1", "owner": "Ada", "state": "running"}
+
+    removed = collection.find_one_and_delete(
+        {"owner": "ADA"},
+        projection={"_id": 1, "owner": 1},
+        collation=collation,
+    )
+    assert removed == {"_id": "j1", "owner": "Ada"}
+
+
 def test_find_one_and_replace_preserves_id_and_duplicate_unique_conflicts(collection):
     seed_jobs(collection)
     collection.create_index([("email", ASCENDING)], name="email_1", unique=True)

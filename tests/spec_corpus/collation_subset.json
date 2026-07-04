@@ -1,0 +1,257 @@
+{
+  "name": "collation supported subset and explicit errors",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "handle": "ada1",
+      "name": "Ada",
+      "team": "Core"
+    },
+    {
+      "_id": "u2",
+      "handle": "grace1",
+      "name": "ada",
+      "team": "core"
+    },
+    {
+      "_id": "u3",
+      "handle": "hopper1",
+      "name": "Grace",
+      "team": "Ops"
+    }
+  ],
+  "operations": [
+    {
+      "name": "find",
+      "filter": {
+        "name": "ADA"
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "handle": "ada1",
+          "name": "Ada",
+          "team": "Core"
+        },
+        {
+          "_id": "u2",
+          "handle": "grace1",
+          "name": "ada",
+          "team": "core"
+        }
+      ]
+    },
+    {
+      "name": "count_documents",
+      "filter": {
+        "team": "CORE"
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_result": {
+        "count": 2
+      }
+    },
+    {
+      "name": "distinct",
+      "key": "team",
+      "filter": {
+        "name": "ada"
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_result": {
+        "values": [
+          "Core"
+        ]
+      }
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
+          "$match": {
+            "team": "core"
+          }
+        },
+        {
+          "$sort": {
+            "name": -1
+          }
+        },
+        {
+          "$project": {
+            "_id": 1,
+            "name": 1
+          }
+        }
+      ],
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "name": "Ada"
+        },
+        {
+          "_id": "u2",
+          "name": "ada"
+        }
+      ]
+    },
+    {
+      "name": "update_many",
+      "filter": {
+        "team": "CORE"
+      },
+      "update": {
+        "$set": {
+          "matched": true
+        }
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_result": {
+        "matched_count": 2,
+        "modified_count": 2
+      }
+    },
+    {
+      "name": "create_index",
+      "keys": {
+        "handle": 1
+      },
+      "index_name": "handle_ci",
+      "unique": true,
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_result": {
+        "name": "handle_ci"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "listIndexes": "$$collection"
+      },
+      "expect_path_values": [
+        {
+          "path": [
+            "cursor",
+            "firstBatch",
+            1,
+            "collation"
+          ],
+          "value": {
+            "locale": "en",
+            "strength": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "name": "ADA"
+      },
+      "update": {
+        "$set": {
+          "state": "claimed"
+        }
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "return_document": "after",
+      "expect_result": {
+        "_id": "u1",
+        "handle": "ada1",
+        "matched": true,
+        "name": "Ada",
+        "state": "claimed",
+        "team": "Core"
+      }
+    },
+    {
+      "name": "delete_one",
+      "filter": {
+        "name": "ADA"
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "name": {
+          "$gte": "a"
+        }
+      },
+      "collation": {
+        "locale": "en",
+        "strength": 2
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "code": 72,
+        "contains": "range"
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "name": "GRACE"
+      },
+      "update": {
+        "$set": {
+          "state": "bad"
+        }
+      },
+      "collation": {
+        "locale": "en",
+        "numericOrdering": true
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "collation"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u2",
+      "handle": "grace1",
+      "matched": true,
+      "name": "ada",
+      "team": "core"
+    },
+    {
+      "_id": "u3",
+      "handle": "hopper1",
+      "name": "Grace",
+      "team": "Ops"
+    }
+  ]
+}
