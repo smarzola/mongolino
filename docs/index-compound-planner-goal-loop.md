@@ -209,7 +209,7 @@ Status:
   filter classification. Compound planner keys use index key order and reject
   numeric, null, missing, array, document, partial, extra-field, logical, and
   unsupported operator filters. Verified with `cargo fmt -- --check`;
-  `cargo test planner`; `cargo test index`. Commit hash: pending.
+  `cargo test planner`; `cargo test index`. Commit hash: `37587a2`.
 
 ## Milestone 1: Compound Index Entry Maintenance
 
