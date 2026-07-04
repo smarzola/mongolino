@@ -2202,6 +2202,9 @@ fn pushed_down_count(
             index_name,
             key_value,
         } => sql_count_index_entries(conn, namespace, &index_name, &key_value)?,
+        CountPlan::IndexedRange { index_name, range } => {
+            sql_count_index_entries_by_range(conn, namespace, &index_name, &range)?
+        }
         CountPlan::Fallback => return Ok(None),
     };
     Ok(Some(apply_count_skip_limit(total, skip, limit)))
@@ -2236,6 +2239,49 @@ fn sql_count_index_entries(
     )?)
 }
 
+fn sql_count_index_entries_by_range(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    range: &RangePlannerKey,
+) -> Result<i64> {
+    let bounds = range_sql_bounds(range);
+    Ok(conn.query_row(
+        &format!(
+            "SELECT COUNT(DISTINCT id_key) FROM index_entries WHERE namespace = ?1 AND index_name = ?2 AND {}",
+            bounds.predicate
+        ),
+        params![namespace, index_name, bounds.lower, bounds.upper],
+        |row| row.get(0),
+    )?)
+}
+
+struct RangeSqlBounds {
+    predicate: String,
+    lower: String,
+    upper: String,
+}
+
+fn range_sql_bounds(range: &RangePlannerKey) -> RangeSqlBounds {
+    let lower_fallback = range.key_prefix.clone();
+    let upper_fallback = format!("{}\u{10ffff}", range.key_prefix);
+    let (lower_operator, lower) = match &range.lower {
+        Some(bound) if bound.inclusive => (">=", format!("{}{}", range.key_prefix, bound.key)),
+        Some(bound) => (">", format!("{}{}", range.key_prefix, bound.key)),
+        None => (">=", lower_fallback),
+    };
+    let (upper_operator, upper) = match &range.upper {
+        Some(bound) if bound.inclusive => ("<=", format!("{}{}", range.key_prefix, bound.key)),
+        Some(bound) => ("<", format!("{}{}", range.key_prefix, bound.key)),
+        None => ("<", upper_fallback),
+    };
+    RangeSqlBounds {
+        predicate: format!("key_value {lower_operator} ?3 AND key_value {upper_operator} ?4"),
+        lower,
+        upper,
+    }
+}
+
 fn apply_count_skip_limit(total: i64, skip: usize, limit: Option<usize>) -> i64 {
     let after_skip = total.saturating_sub(skip as i64);
     match limit {
@@ -2251,6 +2297,10 @@ enum CountPlan {
     IndexedEquality {
         index_name: String,
         key_value: String,
+    },
+    IndexedRange {
+        index_name: String,
+        range: RangePlannerKey,
     },
     Fallback,
 }
@@ -2444,6 +2494,23 @@ fn plan_count(conn: &Connection, namespace: &str, filter: &Document) -> Result<C
         return Ok(CountPlan::IndexedEquality {
             index_name: index.name,
             key_value,
+        });
+    }
+    for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        let Some(range) = range_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter)
+            || !count_filter_covered_by_range_index(&index, filter, &range)
+        {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+            continue;
+        }
+        return Ok(CountPlan::IndexedRange {
+            index_name: index.name,
+            range,
         });
     }
     let Some((field, value)) = exact_single_equality_filter(filter) else {
@@ -3391,7 +3458,13 @@ fn planner_keys_for_document(spec: &IndexSpec, document: &Document) -> Vec<Strin
                 .collect();
         }
         return get_document_path(document, field)
-            .map(|value| vec![id_key_from_bson(value)])
+            .map(|value| {
+                let mut keys = vec![id_key_from_bson(value)];
+                if let Some(range_key) = range_planner_key_value(&[], value) {
+                    keys.push(range_key);
+                }
+                keys
+            })
             .unwrap_or_default();
     }
     compound_planner_keys_for_document(spec, document)
@@ -3403,15 +3476,21 @@ fn compound_planner_keys_for_document(spec: &IndexSpec, document: &Document) -> 
         keys.push(full_key);
     }
     let mut prefix_parts = Vec::new();
-    for field in spec.key.keys().take(spec.key.len().saturating_sub(1)) {
+    let key_len = spec.key.len();
+    for (position, field) in spec.key.keys().enumerate() {
         let Some(value) = get_document_path(document, field) else {
             break;
         };
+        if let Some(range_key) = range_planner_key_value(&prefix_parts, value) {
+            keys.push(range_key);
+        }
         if !is_compound_planner_scalar(value) {
             break;
         }
-        prefix_parts.push(id_key_from_bson(value));
-        keys.push(encode_compound_prefix_planner_key(&prefix_parts));
+        if position + 1 < key_len {
+            prefix_parts.push(id_key_from_bson(value));
+            keys.push(encode_compound_prefix_planner_key(&prefix_parts));
+        }
     }
     keys
 }
@@ -3684,6 +3763,32 @@ fn count_filter_covered_by_index(spec: &IndexSpec, filter: &Document) -> bool {
                 partial_filter_contains_implied_field_predicate(partial, field, condition)
             })
         }
+    })
+}
+
+fn count_filter_covered_by_range_index(
+    spec: &IndexSpec,
+    filter: &Document,
+    range: &RangePlannerKey,
+) -> bool {
+    if filter.keys().any(|key| key.starts_with('$')) {
+        return false;
+    }
+    let indexed_fields = spec.key.keys().cloned().collect::<Vec<_>>();
+    filter.iter().all(|(field, condition)| {
+        if field == &range.field {
+            return range_bounds_for_condition(condition).is_some();
+        }
+        if indexed_fields
+            .iter()
+            .take(range.equality_prefix_len)
+            .any(|indexed| indexed == field)
+        {
+            return exact_equality_value(condition).is_some();
+        }
+        spec.partial_filter.as_ref().is_some_and(|partial| {
+            partial_filter_contains_implied_field_predicate(partial, field, condition)
+        })
     })
 }
 
@@ -4692,6 +4797,10 @@ enum TransactionCandidatePlan {
         index_name: String,
         key_value: String,
     },
+    IndexedRange {
+        index_name: String,
+        range: RangePlannerKey,
+    },
     Fallback,
 }
 
@@ -4719,6 +4828,21 @@ fn plan_transaction_candidates(
             index_name: index.name,
             key_value,
             unique: index.unique,
+        });
+    }
+    for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
+        let Some(range) = range_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
+        if !index_entries_safe_for_planner_tx(tx, namespace, &index.name)? {
+            continue;
+        }
+        return Ok(TransactionCandidatePlan::IndexedRange {
+            index_name: index.name,
+            range,
         });
     }
     for index in planner_indexes(indexes_for_namespace_tx(tx, namespace)?) {
@@ -4765,6 +4889,9 @@ fn transaction_candidate_documents(
             index_name,
             key_value,
         } => indexed_candidate_documents_tx(tx, namespace, &index_name, &key_value),
+        TransactionCandidatePlan::IndexedRange { index_name, range } => {
+            indexed_candidate_documents_tx_by_range(tx, namespace, &index_name, &range)
+        }
         TransactionCandidatePlan::Fallback => stored_documents_for_namespace_tx(tx, namespace),
     }
 }
@@ -4819,6 +4946,41 @@ fn indexed_candidate_documents_tx(
     stmt.query_map(params![namespace, index_name, key_value], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?
+    .map(|row| {
+        let (id_key, bytes) = row?;
+        Ok(StoredDocument {
+            id_key,
+            document: decode_document(bytes)?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()
+}
+
+fn indexed_candidate_documents_tx_by_range(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    index_name: &str,
+    range: &RangePlannerKey,
+) -> Result<Vec<StoredDocument>> {
+    let bounds = range_sql_bounds(range);
+    let mut stmt = tx.prepare(&format!(
+        r#"
+        SELECT DISTINCT d.id_key, d.bson, d.created_at
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+           AND {}
+         ORDER BY d.created_at
+        "#,
+        bounds.predicate
+    ))?;
+    stmt.query_map(
+        params![namespace, index_name, bounds.lower, bounds.upper],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )?
     .map(|row| {
         let (id_key, bytes) = row?;
         Ok(StoredDocument {
@@ -6397,6 +6559,18 @@ fn indexed_candidate_documents(
         return indexed_candidate_documents_by_key(conn, namespace, &index.name, &key_value);
     }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
+        let Some(range) = range_planner_key_for_filter(&index, filter) else {
+            continue;
+        };
+        if !filter_implies_index_membership(&index, filter) {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, namespace, &index.name)? {
+            continue;
+        }
+        return indexed_candidate_documents_by_range(conn, namespace, &index.name, &range);
+    }
+    for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
         let Some((_, key_value)) = prefix_planner_key_for_filter(&index, filter) else {
             continue;
         };
@@ -6434,6 +6608,37 @@ fn indexed_candidate_documents_by_key(
         .query_map(params![namespace, index_name, key_value], |row| {
             row.get::<_, Vec<u8>>(1)
         })?
+        .map(|row| decode_document(row?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(documents))
+}
+
+fn indexed_candidate_documents_by_range(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    range: &RangePlannerKey,
+) -> Result<Option<Vec<Document>>> {
+    let bounds = range_sql_bounds(range);
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        SELECT DISTINCT d.id_key, d.bson, d.created_at
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+           AND {}
+         ORDER BY d.created_at
+        "#,
+        bounds.predicate
+    ))?;
+    let documents = stmt
+        .query_map(
+            params![namespace, index_name, bounds.lower, bounds.upper],
+            |row| row.get::<_, Vec<u8>>(1),
+        )?
         .map(|row| decode_document(row?))
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(documents))
@@ -7022,13 +7227,20 @@ fn compare_bson(
     expected: &Bson,
     predicate: impl Fn(std::cmp::Ordering) -> bool,
 ) -> bool {
-    let Some(left) = numeric_value(candidate) else {
+    match (numeric_value(candidate), numeric_value(expected)) {
+        (Some(left), Some(right)) => {
+            return left.partial_cmp(&right).is_some_and(predicate);
+        }
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    let Some((left_type, left)) = sortable_range_value_key(candidate) else {
         return false;
     };
-    let Some(right) = numeric_value(expected) else {
+    let Some((right_type, right)) = sortable_range_value_key(expected) else {
         return false;
     };
-    left.partial_cmp(&right).is_some_and(predicate)
+    left_type == right_type && predicate(left.cmp(&right))
 }
 
 fn numeric_value(value: &Bson) -> Option<f64> {
@@ -11747,6 +11959,210 @@ mod tests {
     }
 
     #[test]
+    fn range_planner_uses_index_entries_for_find_count_and_write_targets() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "e1", "account": "a", "created": "2026-01-01", "state": "queued" },
+                    { "_id": "e2", "account": "a", "created": "2026-02-01", "state": "queued" },
+                    { "_id": "e3", "account": "a", "created": "2026-03-01", "state": "done" },
+                    { "_id": "e4", "account": "b", "created": "2026-03-01", "state": "queued" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "created": 1_i32 }, "name": "created_1" },
+                    { "key": { "account": 1_i32, "created": 1_i32 }, "name": "account_created_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_ids_in(
+                &conn,
+                "events",
+                doc! { "created": { "$gte": "2026-02-01", "$lte": "2026-03-01" } },
+            ),
+            vec!["e2", "e3", "e4"]
+        );
+        assert_eq!(
+            find_ids_in(&conn, "events", doc! { "created": { "$gt": "2026-03-01" } },),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.events",
+                &doc! { "account": "a", "created": { "$gte": "2026-02-01", "$lt": "2026-04-01" } }
+            )
+            .unwrap(),
+            CountPlan::IndexedRange {
+                index_name: "account_created_1".to_string(),
+                range: RangePlannerKey {
+                    field: "created".to_string(),
+                    equality_prefix_len: 1,
+                    key_prefix: "range:1:5:str:a:".to_string(),
+                    lower: Some(RangeBound {
+                        key: "str:2026-02-01".to_string(),
+                        inclusive: true,
+                    }),
+                    upper: Some(RangeBound {
+                        key: "str:2026-04-01".to_string(),
+                        inclusive: false,
+                    }),
+                },
+            }
+        );
+        assert_eq!(
+            pushed_down_count(
+                &conn,
+                "app.events",
+                &doc! { "account": "a", "created": { "$gte": "2026-02-01", "$lt": "2026-04-01" } },
+                0,
+                None,
+            )
+            .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.events",
+                &doc! { "created": { "$gte": "2026-02-01" }, "state": "queued" }
+            )
+            .unwrap(),
+            CountPlan::Fallback
+        );
+
+        let updated = update_documents(
+            &conn,
+            &doc! {
+                "update": "events",
+                "$db": "app",
+                "updates": [{ "q": { "account": "a", "created": { "$gte": "2026-02-01" } }, "u": { "$set": { "state": "range-updated" } }, "multi": true }],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_i32("n").unwrap(), 2);
+        assert_eq!(
+            find_ids_in(&conn, "events", doc! { "state": "range-updated" }),
+            vec!["e2", "e3"]
+        );
+
+        let moved = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "events",
+                "$db": "app",
+                "query": { "account": "b", "created": { "$gte": "2026-03-01" } },
+                "update": { "$set": { "created": "2026-04-01" } },
+                "new": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            moved
+                .get_document("value")
+                .unwrap()
+                .get_str("created")
+                .unwrap(),
+            "2026-04-01"
+        );
+        assert_eq!(
+            find_ids_in(
+                &conn,
+                "events",
+                doc! { "created": { "$gte": "2026-04-01" } },
+            ),
+            vec!["e4"]
+        );
+
+        let deleted = delete_documents(
+            &conn,
+            &doc! {
+                "delete": "events",
+                "$db": "app",
+                "deletes": [{ "q": { "created": { "$gte": "2026-04-01" } }, "limit": 0_i32 }],
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted.get_i32("n").unwrap(), 1);
+        assert_eq!(
+            find_ids_in(
+                &conn,
+                "events",
+                doc! { "created": { "$gte": "2026-04-01" } },
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn range_planner_falls_back_for_unsafe_shapes_and_membership() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "e1", "created": "2026-01-01", "score": 1_i32 },
+                    { "_id": "e2", "created": "2026-02-01", "score": 2_i32 },
+                    { "_id": "e3", "score": 3_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "created": 1_i32 }, "name": "created_sparse", "sparse": true },
+                    { "key": { "score": 1_i32 }, "name": "score_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_transaction_candidates(
+                &conn.unchecked_transaction().unwrap(),
+                "app.events",
+                &doc! { "created": { "$gte": "2026-01-01" } }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::Fallback
+        );
+        assert_eq!(
+            plan_count(&conn, "app.events", &doc! { "score": { "$gte": 1_i32 } }).unwrap(),
+            CountPlan::Fallback
+        );
+        assert_eq!(
+            plan_count(
+                &conn,
+                "app.events",
+                &doc! { "created": { "$in": ["2026-01-01"] } }
+            )
+            .unwrap(),
+            CountPlan::Fallback
+        );
+    }
+
+    #[test]
     fn planner_uses_sparse_and_partial_indexes_only_when_filter_implies_membership() {
         let conn = test_conn();
         insert_documents(
@@ -12057,7 +12473,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 20);
         let omissions: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.users' AND index_name = 'city_active_1'",
@@ -12366,10 +12782,14 @@ mod tests {
     }
 
     fn find_ids(conn: &Connection, filter: Document) -> Vec<String> {
+        find_ids_in(conn, "users", filter)
+    }
+
+    fn find_ids_in(conn: &Connection, collection: &str, filter: Document) -> Vec<String> {
         first_batch(
             &find_documents(
                 &conn,
-                &doc! { "find": "users", "$db": "app", "filter": filter },
+                &doc! { "find": collection, "$db": "app", "filter": filter },
             )
             .unwrap(),
         )

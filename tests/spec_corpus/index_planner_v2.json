@@ -1,0 +1,132 @@
+{
+  "name": "index planner v2 prefix and range",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "e1",
+      "account": "a",
+      "created": "2026-01-01",
+      "state": "queued"
+    },
+    {
+      "_id": "e2",
+      "account": "a",
+      "created": "2026-02-01",
+      "state": "queued"
+    },
+    {
+      "_id": "e3",
+      "account": "a",
+      "created": "2026-03-01",
+      "state": "done"
+    },
+    {
+      "_id": "e4",
+      "account": "b",
+      "created": "2026-03-01",
+      "state": "queued"
+    }
+  ],
+  "operations": [
+    {
+      "name": "create_index",
+      "keys": {
+        "account": 1,
+        "created": 1
+      },
+      "index_name": "account_created_1",
+      "expect_result": {
+        "name": "account_created_1"
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "account": "a"
+      },
+      "expect_documents": [
+        {
+          "_id": "e1",
+          "account": "a",
+          "created": "2026-01-01",
+          "state": "queued"
+        },
+        {
+          "_id": "e2",
+          "account": "a",
+          "created": "2026-02-01",
+          "state": "queued"
+        },
+        {
+          "_id": "e3",
+          "account": "a",
+          "created": "2026-03-01",
+          "state": "done"
+        }
+      ]
+    },
+    {
+      "name": "count_documents",
+      "filter": {
+        "account": "a",
+        "created": {
+          "$gte": "2026-02-01"
+        }
+      },
+      "expect_result": {
+        "count": 2
+      }
+    },
+    {
+      "name": "update_many",
+      "filter": {
+        "account": "a",
+        "created": {
+          "$gte": "2026-02-01"
+        }
+      },
+      "update": {
+        "$set": {
+          "state": "range-updated"
+        }
+      },
+      "expect_result": {
+        "matched_count": 2,
+        "modified_count": 2
+      }
+    },
+    {
+      "name": "delete_many",
+      "filter": {
+        "account": "b",
+        "created": {
+          "$lte": "2026-03-01"
+        }
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "e1",
+      "account": "a",
+      "created": "2026-01-01",
+      "state": "queued"
+    },
+    {
+      "_id": "e2",
+      "account": "a",
+      "created": "2026-02-01",
+      "state": "range-updated"
+    },
+    {
+      "_id": "e3",
+      "account": "a",
+      "created": "2026-03-01",
+      "state": "range-updated"
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 from bson.int64 import Int64
@@ -304,7 +305,7 @@ def test_unique_sparse_index_membership_and_null_semantics(collection, mongolino
     collection.create_index([("email", ASCENDING)], name="email_sparse", unique=True, sparse=True)
 
     namespace = f"{collection.database.name}.{collection.name}"
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 2
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 3
 
     collection.insert_one({"_id": "u5", "name": "missing-c"})
     with pytest.raises(DuplicateKeyError):
@@ -313,12 +314,12 @@ def test_unique_sparse_index_membership_and_null_semantics(collection, mongolino
         collection.insert_one({"_id": "u7", "email": "ada@example.test"})
 
     collection.update_one({"_id": "u5"}, {"$set": {"email": "grace@example.test"}})
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 3
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 5
     with pytest.raises(DuplicateKeyError):
         collection.update_one({"_id": "u2"}, {"$set": {"email": "grace@example.test"}})
 
     collection.update_one({"_id": "u5"}, {"$unset": {"email": ""}})
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 2
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_sparse") == 3
 
 
 def test_unique_compound_sparse_requires_all_fields(collection, mongolino_server):
@@ -338,7 +339,7 @@ def test_unique_compound_sparse_requires_all_fields(collection, mongolino_server
     )
 
     namespace = f"{collection.database.name}.{collection.name}"
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_role_sparse") == 2
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_role_sparse") == 8
 
     collection.insert_one({"_id": "u5", "email": "ada@example.test"})
     collection.insert_one({"_id": "u6", "role": "admin"})
@@ -371,20 +372,20 @@ def test_unique_partial_index_membership_and_supported_predicates(collection, mo
     )
 
     namespace = f"{collection.database.name}.{collection.name}"
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 2
-    assert index_entry_count(mongolino_server.db_path, namespace, "handle_active_partial") == 1
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 4
+    assert index_entry_count(mongolino_server.db_path, namespace, "handle_active_partial") == 2
 
     collection.insert_one({"_id": "u5", "email": "same@example.test", "active": False})
     with pytest.raises(DuplicateKeyError):
         collection.insert_one({"_id": "u6", "email": "same@example.test", "active": True})
 
     collection.update_one({"_id": "u5"}, {"$set": {"email": "new@example.test", "active": True}})
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 3
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 6
     with pytest.raises(DuplicateKeyError):
         collection.update_one({"_id": "u2"}, {"$set": {"active": True}})
 
     collection.update_one({"_id": "u5"}, {"$set": {"active": False}})
-    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 2
+    assert index_entry_count(mongolino_server.db_path, namespace, "email_active_partial") == 4
 
 
 def test_unique_unordered_bulk_partial_success_and_drop_index(collection):
@@ -636,6 +637,57 @@ def test_compound_prefix_find_uses_fresh_index_entries(collection):
 
     collection.delete_one({"_id": "u1"})
     assert ids(collection.find({"profile.city": "Rome"}).sort("_id", ASCENDING)) == ["u4"]
+
+
+def test_indexed_range_find_and_count_documents(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "e1",
+                "account": "a",
+                "created": "2026-01-01",
+                "seen_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            },
+            {
+                "_id": "e2",
+                "account": "a",
+                "created": "2026-02-01",
+                "seen_at": datetime(2026, 2, 1, tzinfo=timezone.utc),
+            },
+            {
+                "_id": "e3",
+                "account": "a",
+                "created": "2026-03-01",
+                "seen_at": datetime(2026, 3, 1, tzinfo=timezone.utc),
+            },
+            {
+                "_id": "e4",
+                "account": "b",
+                "created": "2026-03-01",
+                "seen_at": datetime(2026, 3, 1, tzinfo=timezone.utc),
+            },
+        ]
+    )
+    collection.create_index([("created", ASCENDING)], name="created_1")
+    collection.create_index([("account", ASCENDING), ("created", ASCENDING)], name="account_created_1")
+    collection.create_index([("seen_at", ASCENDING)], name="seen_at_1")
+
+    assert ids(
+        collection.find({"created": {"$gte": "2026-02-01", "$lte": "2026-03-01"}}).sort(
+            "_id", ASCENDING
+        )
+    ) == ["e2", "e3", "e4"]
+    assert ids(collection.find({"account": "a", "created": {"$gt": "2026-01-01"}}).sort("_id", ASCENDING)) == [
+        "e2",
+        "e3",
+    ]
+    assert collection.count_documents({"account": "a", "created": {"$gte": "2026-02-01"}}) == 2
+    assert ids(
+        collection.find({"seen_at": {"$gte": datetime(2026, 2, 1, tzinfo=timezone.utc)}}).sort(
+            "_id", ASCENDING
+        )
+    ) == ["e2", "e3", "e4"]
+    assert ids(collection.find({"created": {"$gte": 1}}).sort("_id", ASCENDING)) == []
 
 
 def test_indexed_scalar_write_targeting_keeps_entries_fresh(collection):

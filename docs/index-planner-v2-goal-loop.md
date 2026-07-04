@@ -168,7 +168,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Planner v2 architecture and diagnostics model
 - [x] Milestone 1: Equality-prefix candidate narrowing
-- [ ] Milestone 2: Safe range scans and count pushdown
+- [x] Milestone 2: Safe range scans and count pushdown
 - [ ] Milestone 3: Hint command semantics
 - [ ] Milestone 4: Explain diagnostics
 - [ ] Milestone 5: Sort-aware read planning
@@ -330,6 +330,17 @@ cargo test planner
 cargo test count
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py tests/e2e/test_spec_corpus.py
 ```
+
+Status 2026-07-04: Added maintained `range` index-entry keys for safe string,
+bool, ObjectId, and date scalar ordering, wired single-field and compound
+equality-prefix-plus-range plans into `find`, covered `count`, update/delete
+targeting, and findAndModify, and extended matcher range validation to the same
+scalar subset. Verification passed with `cargo fmt -- --check`, `cargo test
+range`, `cargo test planner`, `cargo test count`, `cargo build`, and
+unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked
+pytest tests/e2e/test_indexes.py tests/e2e/test_crud.py
+tests/e2e/test_spec_corpus.py` after the sandboxed e2e run failed to bind
+localhost. Commit: reported in goal-loop status after commit creation.
 
 ## Milestone 3: Hint Command Semantics
 
