@@ -123,7 +123,7 @@ Status 2026-07-04: Done. Added transaction-local `_id` and safe indexed scalar
 candidate planning/loading, with Rust tests for classification and created-order
 candidate delivery. Verification passed: `cargo fmt -- --check`,
 `cargo test planner`, `cargo test update`, `cargo test delete`,
-`cargo test find_and_modify`, and `cargo test`. Commit: `5b1f921`.
+`cargo test find_and_modify`, and `cargo test`. Commit: `7b7937e`.
 
 Likely files:
 
