@@ -3006,6 +3006,26 @@ fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String>
                 append_update_paths(operator, operand, &mut paths)?;
                 modifiers.inc = operand.clone();
             }
+            "$rename" => {
+                append_rename_paths(operator, operand, &mut paths)?;
+                modifiers.rename = operand.clone();
+            }
+            "$min" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                modifiers.min = operand.clone();
+            }
+            "$max" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                modifiers.max = operand.clone();
+            }
+            "$mul" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                modifiers.mul = operand.clone();
+            }
+            "$setOnInsert" => {
+                append_update_paths(operator, operand, &mut paths)?;
+                modifiers.set_on_insert = operand.clone();
+            }
             _ => return Err(format!("unsupported update operator {operator}")),
         }
     }
@@ -3024,6 +3044,23 @@ fn append_update_paths(
     for key in document.keys() {
         validate_update_path(operator, key)?;
         paths.push(key.to_string());
+    }
+    Ok(())
+}
+
+fn append_rename_paths(
+    operator: &str,
+    document: &Document,
+    paths: &mut Vec<String>,
+) -> std::result::Result<(), String> {
+    for (source, destination) in document {
+        validate_update_path(operator, source)?;
+        let Bson::String(destination) = destination else {
+            return Err("$rename destinations must be strings".to_string());
+        };
+        validate_update_path(operator, destination)?;
+        paths.push(source.to_string());
+        paths.push(destination.to_string());
     }
     Ok(())
 }
@@ -3053,6 +3090,14 @@ fn apply_update_to_document(
     original: &Document,
     update: &UpdateSpec,
 ) -> std::result::Result<Document, String> {
+    apply_update_to_document_for_context(original, update, false)
+}
+
+fn apply_update_to_document_for_context(
+    original: &Document,
+    update: &UpdateSpec,
+    is_upsert_insert: bool,
+) -> std::result::Result<Document, String> {
     match update {
         UpdateSpec::Replacement(replacement) => {
             let mut document = replacement.clone();
@@ -3072,11 +3117,31 @@ fn apply_update_to_document(
             for (path, value) in &modifiers.set {
                 set_update_path(&mut document, path, value.clone())?;
             }
+            if is_upsert_insert {
+                for (path, value) in &modifiers.set_on_insert {
+                    set_update_path(&mut document, path, value.clone())?;
+                }
+            }
             for path in modifiers.unset.keys() {
                 unset_update_path(&mut document, path)?;
             }
             for (path, operand) in &modifiers.inc {
                 inc_update_path(&mut document, path, operand)?;
+            }
+            for (source, destination) in &modifiers.rename {
+                let Bson::String(destination) = destination else {
+                    return Err("$rename destinations must be strings".to_string());
+                };
+                rename_update_path(&mut document, source, destination)?;
+            }
+            for (path, operand) in &modifiers.min {
+                min_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.max {
+                max_update_path(&mut document, path, operand)?;
+            }
+            for (path, operand) in &modifiers.mul {
+                mul_update_path(&mut document, path, operand)?;
             }
             Ok(document)
         }
@@ -3099,7 +3164,7 @@ fn build_upsert_document(
         }
         UpdateSpec::Modifier(_) => {
             let mut document = equality_document_from_filter(query)?;
-            document = apply_update_to_document(&document, update)?;
+            document = apply_update_to_document_for_context(&document, update, true)?;
             Ok(document)
         }
     }
@@ -3184,6 +3249,40 @@ fn unset_update_path(document: &mut Document, path: &str) -> std::result::Result
     Ok(())
 }
 
+fn take_update_path(
+    document: &mut Document,
+    path: &str,
+) -> std::result::Result<Option<Bson>, String> {
+    let mut parts = path.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return Err("update path must not be empty".to_string());
+    };
+    let mut current = document;
+    for part in parts {
+        match current.get(part) {
+            Some(Bson::Document(_)) => {
+                current = current
+                    .get_document_mut(part)
+                    .map_err(|_| format!("cannot traverse scalar parent {part}"))?;
+            }
+            Some(_) => return Err(format!("cannot traverse scalar parent {part}")),
+            None => return Ok(None),
+        }
+    }
+    Ok(current.remove(last))
+}
+
+fn rename_update_path(
+    document: &mut Document,
+    source: &str,
+    destination: &str,
+) -> std::result::Result<(), String> {
+    let Some(value) = take_update_path(document, source)? else {
+        return Ok(());
+    };
+    set_update_path(document, destination, value)
+}
+
 fn inc_update_path(
     document: &mut Document,
     path: &str,
@@ -3200,6 +3299,63 @@ fn inc_update_path(
             set_update_path(document, path, updated)
         }
         Some(_) => Err("$inc can only apply to numeric fields".to_string()),
+    }
+}
+
+fn min_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let existing = get_document_path(document, path).cloned();
+    match existing {
+        None => set_update_path(document, path, operand.clone()),
+        Some(current) if compare_bson_order(&current, operand).is_gt() => {
+            set_update_path(document, path, operand.clone())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn max_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    let existing = get_document_path(document, path).cloned();
+    match existing {
+        None => set_update_path(document, path, operand.clone()),
+        Some(current) if compare_bson_order(&current, operand).is_lt() => {
+            set_update_path(document, path, operand.clone())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn mul_update_path(
+    document: &mut Document,
+    path: &str,
+    operand: &Bson,
+) -> std::result::Result<(), String> {
+    if numeric_value(operand).is_none() {
+        return Err("$mul operands must be numeric".to_string());
+    }
+    let existing = get_document_path(document, path).cloned();
+    match existing {
+        None => set_update_path(document, path, zero_for_numeric_operand(operand)),
+        Some(current) if numeric_value(&current).is_some() => {
+            let updated = multiply_numeric_bson(&current, operand)?;
+            set_update_path(document, path, updated)
+        }
+        Some(_) => Err("$mul can only apply to numeric fields".to_string()),
+    }
+}
+
+fn zero_for_numeric_operand(operand: &Bson) -> Bson {
+    match operand {
+        Bson::Double(_) => Bson::Double(0.0),
+        Bson::Int64(_) => Bson::Int64(0),
+        _ => Bson::Int32(0),
     }
 }
 
@@ -3232,6 +3388,38 @@ fn add_numeric_bson(left: &Bson, right: &Bson) -> std::result::Result<Bson, Stri
             .map(Bson::Int64)
             .ok_or_else(|| "$inc overflowed int64".to_string()),
         _ => unreachable!("non-numeric $inc operands should be rejected before addition"),
+    }
+}
+
+fn multiply_numeric_bson(left: &Bson, right: &Bson) -> std::result::Result<Bson, String> {
+    match (left, right) {
+        (Bson::Double(left), _) | (_, Bson::Double(left)) if left.is_nan() => {
+            Err("$mul does not support NaN".to_string())
+        }
+        (Bson::Double(_), _) | (_, Bson::Double(_)) => Ok(Bson::Double(
+            numeric_value(left).unwrap() * numeric_value(right).unwrap(),
+        )),
+        (Bson::Int32(left), Bson::Int32(right)) => {
+            let product = (*left as i64) * (*right as i64);
+            if (i32::MIN as i64..=i32::MAX as i64).contains(&product) {
+                Ok(Bson::Int32(product as i32))
+            } else {
+                Ok(Bson::Int64(product))
+            }
+        }
+        (Bson::Int64(left), Bson::Int64(right)) => left
+            .checked_mul(*right)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$mul overflowed int64".to_string()),
+        (Bson::Int64(left), Bson::Int32(right)) => left
+            .checked_mul(*right as i64)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$mul overflowed int64".to_string()),
+        (Bson::Int32(left), Bson::Int64(right)) => (*left as i64)
+            .checked_mul(*right)
+            .map(Bson::Int64)
+            .ok_or_else(|| "$mul overflowed int64".to_string()),
+        _ => unreachable!("non-numeric $mul operands should be rejected before multiplication"),
     }
 }
 
@@ -7430,6 +7618,196 @@ mod tests {
     }
 
     #[test]
+    fn update_scalar_modifiers_support_rename_min_max_mul_and_set_on_insert() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "u1",
+                        "age": 37_i32,
+                        "score": 7_i32,
+                        "multiplier": 4_i32,
+                        "profile": { "city": "Rome" },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+
+        let existing = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u1" },
+                        "u": {
+                            "$rename": { "profile.city": "location" },
+                            "$min": { "age": 35_i32, "floor": 4_i32 },
+                            "$max": { "score": 10_i32, "ceiling": 8_i32 },
+                            "$mul": { "multiplier": 3_i32, "missingProduct": 2_i32 },
+                            "$setOnInsert": { "created": true },
+                        },
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(existing.get_i32("n").unwrap(), 1);
+        assert_eq!(existing.get_i32("nModified").unwrap(), 1);
+
+        let docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(docs[0].get_str("location").unwrap(), "Rome");
+        assert!(
+            !docs[0]
+                .get_document("profile")
+                .unwrap()
+                .contains_key("city")
+        );
+        assert_eq!(docs[0].get_i32("age").unwrap(), 35);
+        assert_eq!(docs[0].get_i32("floor").unwrap(), 4);
+        assert_eq!(docs[0].get_i32("score").unwrap(), 10);
+        assert_eq!(docs[0].get_i32("ceiling").unwrap(), 8);
+        assert_eq!(docs[0].get_i32("multiplier").unwrap(), 12);
+        assert_eq!(docs[0].get_i32("missingProduct").unwrap(), 0);
+        assert!(!docs[0].contains_key("created"));
+
+        let upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    {
+                        "q": { "_id": "u2", "email": "new@example.test" },
+                        "u": {
+                            "$set": { "name": "New" },
+                            "$setOnInsert": { "created": true },
+                            "$mul": { "count": 2_i32 },
+                        },
+                        "upsert": true,
+                    }
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(upsert.get_i32("nUpserted").unwrap(), 1);
+        let inserted = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u2" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(inserted[0].get_str("email").unwrap(), "new@example.test");
+        assert_eq!(inserted[0].get_str("name").unwrap(), "New");
+        assert!(inserted[0].get_bool("created").unwrap());
+        assert_eq!(inserted[0].get_i32("count").unwrap(), 0);
+    }
+
+    #[test]
+    fn find_and_modify_uses_scalar_modifiers_and_ignores_set_on_insert_for_matches() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+
+        let response = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u2" },
+                "update": {
+                    "$rename": { "profile.city": "city" },
+                    "$mul": { "age": 2_i32 },
+                    "$min": { "score": 5_i32 },
+                    "$setOnInsert": { "created": true },
+                },
+                "new": true,
+            },
+        )
+        .unwrap();
+
+        let value = response.get_document("value").unwrap();
+        assert_eq!(value.get_str("city").unwrap(), "London");
+        assert_eq!(value.get_i64("age").unwrap(), 78);
+        assert_eq!(value.get_i32("score").unwrap(), 5);
+        assert!(!value.contains_key("created"));
+    }
+
+    #[test]
+    fn update_scalar_modifiers_reject_invalid_operands_and_paths() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "name": "Ada", "profile": { "city": "Rome" }, "count": "many" },
+                    { "_id": "overflow", "value": Bson::Int64(i64::MAX) },
+                ],
+            },
+        )
+        .unwrap();
+
+        for update in [
+            doc! { "$rename": { "name": 5_i32 } },
+            doc! { "$rename": { "_id": "other" } },
+            doc! { "$rename": { "name": "_id" } },
+            doc! { "$rename": { "profile": "profile.city" } },
+            doc! { "$rename": { "items.$.name": "name" } },
+            doc! { "$mul": { "count": 2_i32 } },
+            doc! { "$mul": { "count": "bad" } },
+            doc! { "$set": { "created": false }, "$setOnInsert": { "created": true } },
+        ] {
+            let response = update_documents(
+                &conn,
+                &doc! {
+                    "update": "users",
+                    "$db": "app",
+                    "updates": [{ "q": { "_id": "u1" }, "u": update }],
+                },
+            )
+            .unwrap();
+            assert_eq!(response.get_f64("ok").unwrap(), 1.0);
+            assert!(!write_errors(&response).is_empty());
+        }
+
+        let overflow = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [
+                    { "q": { "_id": "overflow" }, "u": { "$mul": { "value": 2_i32 } } }
+                ],
+            },
+        )
+        .unwrap();
+        assert!(!write_errors(&overflow).is_empty());
+        let stored = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "overflow" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(stored[0].get_i64("value").unwrap(), i64::MAX);
+    }
+
+    #[test]
     fn update_inc_handles_mixed_integer_precision_and_overflow() {
         let conn = test_conn();
         insert_documents(
@@ -7664,7 +8042,7 @@ mod tests {
         }
 
         for update in [
-            doc! { "$rename": { "name": "displayName" } },
+            doc! { "$bit": { "age": { "and": 1_i32 } } },
             doc! { "$push": { "tags": "logic" } },
             doc! { "$pull": { "tags": "logic" } },
         ] {
@@ -7697,7 +8075,7 @@ mod tests {
             doc! { "q": { "_id": "u1" }, "u": 1_i32 },
             doc! { "q": { "_id": "u1" }, "u": {} },
             doc! { "q": { "_id": "u1" }, "u": { "$set": { "name": "x" }, "plain": true } },
-            doc! { "q": { "_id": "u1" }, "u": { "$rename": { "name": "n" } } },
+            doc! { "q": { "_id": "u1" }, "u": { "$bit": { "age": { "and": 1_i32 } } } },
             doc! { "q": { "_id": "u1" }, "u": { "$push": { "tags": "x" } } },
             doc! { "q": { "_id": "u1" }, "u": { "$pull": { "tags": "x" } } },
             doc! { "q": { "_id": "u1" }, "u": { "_id": "other", "name": "x" } },

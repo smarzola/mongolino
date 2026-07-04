@@ -1,0 +1,144 @@
+{
+  "name": "update scalar operators",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "age": 37,
+      "score": 7,
+      "multiplier": 4,
+      "profile": {
+        "city": "Rome"
+      }
+    },
+    {
+      "_id": "u2",
+      "age": 39,
+      "profile": {
+        "city": "London"
+      }
+    }
+  ],
+  "operations": [
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$rename": {
+          "profile.city": "location"
+        },
+        "$min": {
+          "age": 35,
+          "floor": 4
+        },
+        "$max": {
+          "score": 10,
+          "ceiling": 8
+        },
+        "$mul": {
+          "multiplier": 3,
+          "missingProduct": 2
+        },
+        "$setOnInsert": {
+          "created": true
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u3",
+        "email": "new@example.test"
+      },
+      "update": {
+        "$set": {
+          "name": "New"
+        },
+        "$setOnInsert": {
+          "created": true
+        },
+        "$mul": {
+          "count": 2
+        }
+      },
+      "upsert": true,
+      "expect_result": {
+        "matched_count": 0,
+        "modified_count": 0,
+        "upserted_id": "u3"
+      }
+    },
+    {
+      "name": "find_one_and_update",
+      "filter": {
+        "_id": "u2"
+      },
+      "update": {
+        "$rename": {
+          "profile.city": "city"
+        },
+        "$mul": {
+          "age": 2
+        },
+        "$setOnInsert": {
+          "created": true
+        }
+      },
+      "return_document": "after",
+      "expect_documents": {
+        "_id": "u2",
+        "age": 78,
+        "city": "London",
+        "profile": {}
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$rename": {
+          "location": "_id"
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "update cannot change _id"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "u1",
+      "age": 35,
+      "score": 10,
+      "multiplier": 12,
+      "profile": {},
+      "location": "Rome",
+      "floor": 4,
+      "ceiling": 8,
+      "missingProduct": 0
+    },
+    {
+      "_id": "u2",
+      "age": 78,
+      "profile": {},
+      "city": "London"
+    },
+    {
+      "_id": "u3",
+      "email": "new@example.test",
+      "name": "New",
+      "created": true,
+      "count": 0
+    }
+  ]
+}
