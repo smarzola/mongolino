@@ -199,6 +199,32 @@
     {
       "name": "update_one",
       "filter": {
+        "_id": "u2"
+      },
+      "update": {
+        "$pull": {
+          "docs": {
+            "$or": [
+              {
+                "score": {
+                  "$gte": 4
+                }
+              },
+              {
+                "kind": "missing"
+              }
+            ]
+          }
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
         "_id": "u1"
       },
       "update": {
@@ -233,6 +259,45 @@
       "expect_error": {
         "type": "WriteError",
         "contains": "unsupported query operator $regex"
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$pull": {
+          "docs": {
+            "$or": [
+              {
+                "kind": "a"
+              }
+            ],
+            "$where": "bad"
+          }
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "unsupported query operator $or"
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$pull": {
+          "docs": {
+            "$and": []
+          }
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "$and requires a non-empty array"
       }
     }
   ],
@@ -278,12 +343,7 @@
     {
       "_id": "u2",
       "active": true,
-      "docs": [
-        {
-          "kind": "a",
-          "score": 4
-        }
-      ],
+      "docs": [],
       "events": [
         "seen"
       ]

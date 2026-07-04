@@ -3594,13 +3594,17 @@ fn pull_all_update_path(
 }
 
 fn pull_matches(value: &Bson, condition: &Bson) -> std::result::Result<bool, String> {
+    if let (Bson::Document(value), Bson::Document(condition)) = (value, condition)
+        && condition
+            .keys()
+            .all(|key| !key.starts_with('$') || matches!(key.as_str(), "$and" | "$or" | "$nor"))
+    {
+        return matches_filter(value, condition).map_err(|err| err.errmsg);
+    }
     if let Bson::Document(document) = condition
         && document.keys().any(|key| key.starts_with('$'))
     {
         return matches_operator_document(&[value], document).map_err(|err| err.errmsg);
-    }
-    if let (Bson::Document(value), Bson::Document(condition)) = (value, condition) {
-        return matches_filter(value, condition).map_err(|err| err.errmsg);
     }
     Ok(update_values_equal(value, condition))
 }
@@ -8359,6 +8363,124 @@ mod tests {
     }
 
     #[test]
+    fn pull_document_arrays_supports_logical_predicates() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{
+                    "_id": "u1",
+                    "or_items": [
+                        { "kind": "active", "score": 5_i32 },
+                        { "kind": "archived", "score": 2_i32 },
+                        { "kind": "active", "score": 0_i32 },
+                        { "kind": "review", "score": 3_i32 },
+                    ],
+                    "and_items": [
+                        { "kind": "active", "score": 1_i32 },
+                        { "kind": "active", "score": 4_i32 },
+                        { "kind": "archived", "score": 1_i32 },
+                    ],
+                    "nor_items": [
+                        { "kind": "active", "score": 5_i32 },
+                        { "kind": "archived", "score": 2_i32 },
+                        { "kind": "active", "score": 0_i32 },
+                    ],
+                    "none_items": [
+                        { "kind": "active", "score": 5_i32 },
+                        { "kind": "review", "score": 3_i32 },
+                    ],
+                    "scores": [1_i32, 3_i32, 5_i32],
+                    "docs": [{ "kind": "a" }, { "kind": "b" }],
+                }],
+            },
+        )
+        .unwrap();
+
+        let response = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "u1" },
+                    "u": {
+                        "$pull": {
+                            "or_items": {
+                                "$or": [
+                                    { "kind": "archived" },
+                                    { "score": { "$lte": 0_i32 } },
+                                ],
+                            },
+                            "and_items": {
+                                "$and": [
+                                    { "kind": "active" },
+                                    { "score": { "$lte": 1_i32 } },
+                                ],
+                            },
+                            "nor_items": {
+                                "$nor": [
+                                    { "kind": "archived" },
+                                    { "score": { "$lte": 0_i32 } },
+                                ],
+                            },
+                            "none_items": { "$or": [{ "kind": "missing" }] },
+                            "scores": { "$gte": 3_i32 },
+                            "docs": { "$eq": { "kind": "a" } },
+                        },
+                    },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(response.get_i32("nModified").unwrap(), 1);
+
+        let docs = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        let document = &docs[0];
+        assert_eq!(
+            document.get_array("or_items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "active", "score": 5_i32 },
+                doc! { "kind": "review", "score": 3_i32 },
+            ])
+        );
+        assert_eq!(
+            document.get_array("and_items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "active", "score": 4_i32 },
+                doc! { "kind": "archived", "score": 1_i32 },
+            ])
+        );
+        assert_eq!(
+            document.get_array("nor_items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "archived", "score": 2_i32 },
+                doc! { "kind": "active", "score": 0_i32 },
+            ])
+        );
+        assert_eq!(
+            document.get_array("none_items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "active", "score": 5_i32 },
+                doc! { "kind": "review", "score": 3_i32 },
+            ])
+        );
+        assert_eq!(document.get_array("scores").unwrap(), &bson_ints(&[1]));
+        assert_eq!(
+            document.get_array("docs").unwrap(),
+            &bson_documents(vec![doc! { "kind": "b" }])
+        );
+    }
+
+    #[test]
     fn find_and_modify_uses_array_modifiers() {
         let conn = test_conn();
         insert_documents(
@@ -8602,6 +8724,9 @@ mod tests {
             doc! { "$push": { "name": "x" } },
             doc! { "$pull": { "name": "Ada" } },
             doc! { "$pull": { "docs": { "name": { "$regex": "^A" } } } },
+            doc! { "$pull": { "docs": { "$or": [{ "name": "Ada" }], "$where": "bad" } } },
+            doc! { "$pull": { "docs": { "$and": [] } } },
+            doc! { "$pull": { "docs": { "$nor": [{ "name": "Ada" }, "bad"] } } },
             doc! { "$push": { "profile.tags": "x" } },
             doc! { "$push": { "tags.$": "x" } },
         ] {

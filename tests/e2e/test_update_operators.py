@@ -204,6 +204,126 @@ def test_array_update_operators_happy_path_and_update_many(collection):
     }
 
 
+def test_pull_document_arrays_supports_logical_predicates(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "or",
+                "items": [
+                    {"kind": "active", "score": 5},
+                    {"kind": "archived", "score": 2},
+                    {"kind": "active", "score": 0},
+                    {"kind": "review", "score": 3},
+                ],
+            },
+            {
+                "_id": "and",
+                "items": [
+                    {"kind": "active", "score": 1},
+                    {"kind": "active", "score": 4},
+                    {"kind": "archived", "score": 1},
+                ],
+            },
+            {
+                "_id": "nor",
+                "items": [
+                    {"kind": "active", "score": 5},
+                    {"kind": "archived", "score": 2},
+                    {"kind": "active", "score": 0},
+                ],
+            },
+            {
+                "_id": "none",
+                "items": [
+                    {"kind": "active", "score": 5},
+                    {"kind": "review", "score": 3},
+                ],
+            },
+            {
+                "_id": "preserve",
+                "scores": [1, 3, 5],
+                "docs": [{"kind": "a"}, {"kind": "b"}],
+            },
+        ]
+    )
+
+    assert (
+        collection.update_one(
+            {"_id": "or"},
+            {
+                "$pull": {
+                    "items": {
+                        "$or": [{"kind": "archived"}, {"score": {"$lte": 0}}]
+                    }
+                }
+            },
+        ).modified_count
+        == 1
+    )
+    assert (
+        collection.update_one(
+            {"_id": "and"},
+            {
+                "$pull": {
+                    "items": {
+                        "$and": [{"kind": "active"}, {"score": {"$lte": 1}}]
+                    }
+                }
+            },
+        ).modified_count
+        == 1
+    )
+    assert (
+        collection.update_one(
+            {"_id": "nor"},
+            {
+                "$pull": {
+                    "items": {
+                        "$nor": [{"kind": "archived"}, {"score": {"$lte": 0}}]
+                    }
+                }
+            },
+        ).modified_count
+        == 1
+    )
+    assert (
+        collection.update_one(
+            {"_id": "none"},
+            {"$pull": {"items": {"$or": [{"kind": "missing"}]}}},
+        ).modified_count
+        == 0
+    )
+    assert (
+        collection.update_one(
+            {"_id": "preserve"},
+            {"$pull": {"scores": {"$gte": 3}, "docs": {"$eq": {"kind": "a"}}}},
+        ).modified_count
+        == 1
+    )
+
+    assert collection.find_one({"_id": "or"})["items"] == [
+        {"kind": "active", "score": 5},
+        {"kind": "review", "score": 3},
+    ]
+    assert collection.find_one({"_id": "and"})["items"] == [
+        {"kind": "active", "score": 4},
+        {"kind": "archived", "score": 1},
+    ]
+    assert collection.find_one({"_id": "nor"})["items"] == [
+        {"kind": "archived", "score": 2},
+        {"kind": "active", "score": 0},
+    ]
+    assert collection.find_one({"_id": "none"})["items"] == [
+        {"kind": "active", "score": 5},
+        {"kind": "review", "score": 3},
+    ]
+    assert collection.find_one({"_id": "preserve"}) == {
+        "_id": "preserve",
+        "scores": [1],
+        "docs": [{"kind": "b"}],
+    }
+
+
 def test_array_update_operators_find_one_and_update(collection):
     collection.insert_one(
         {
@@ -263,6 +383,9 @@ def test_array_update_operator_errors_preserve_documents(collection):
         {"$push": {"name": "x"}},
         {"$pull": {"name": "Ada"}},
         {"$pull": {"docs": {"name": {"$regex": "^A"}}}},
+        {"$pull": {"docs": {"$or": [{"name": "Ada"}], "$where": "bad"}}},
+        {"$pull": {"docs": {"$and": []}}},
+        {"$pull": {"docs": {"$nor": [{"name": "Ada"}, "bad"]}}},
         {"$push": {"profile.tags": "x"}},
         {"$push": {"tags.$": "x"}},
     ]
