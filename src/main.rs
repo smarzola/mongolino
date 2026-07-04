@@ -1107,13 +1107,12 @@ fn aggregate_pipeline_documents(
                 let Bson::Document(group) = operand else {
                     return Ok(Err(command_error(9, "$group requires a document")));
                 };
-                if !is_count_documents_group(group) {
-                    return Ok(Err(command_error(
-                        72,
-                        "aggregate only supports PyMongo count_documents group shape",
-                    )));
-                }
-                documents = vec![doc! { "_id": 1_i32, "n": documents.len() as i64 }];
+                let preserve_empty_count = is_count_documents_group(group);
+                let group = match parse_group_stage(group) {
+                    Ok(group) => group,
+                    Err(response) => return Ok(Err(response)),
+                };
+                documents = apply_group_stage(documents, &group, preserve_empty_count);
             }
             _ => {
                 return Ok(Err(command_error(
@@ -1250,6 +1249,284 @@ fn apply_unwind_stage(documents: Vec<Document>, spec: &UnwindSpec) -> Vec<Docume
 fn set_unwind_index(document: &mut Document, spec: &UnwindSpec, index: Bson) {
     if let Some(path) = &spec.include_array_index {
         set_document_path(document, path, index);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GroupSpec {
+    id: AggregationExpression,
+    accumulators: Vec<AccumulatorSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AccumulatorSpec {
+    field: String,
+    op: AccumulatorOp,
+    expression: AggregationExpression,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AccumulatorOp {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug)]
+struct GroupState {
+    id: Bson,
+    accumulators: Vec<AccumulatorState>,
+}
+
+#[derive(Clone, Debug)]
+enum AccumulatorState {
+    Sum { total: f64, saw_double: bool },
+    Avg { total: f64, count: i64 },
+    Min(Option<Bson>),
+    Max(Option<Bson>),
+    First(Option<Bson>),
+    Last(Option<Bson>),
+}
+
+fn parse_group_stage(group: &Document) -> std::result::Result<GroupSpec, Document> {
+    let Some(id) = group.get("_id") else {
+        return Err(command_error(9, "$group requires an _id expression"));
+    };
+    let id = parse_aggregation_expression(id, "$group _id", true)?;
+    let mut accumulators = Vec::new();
+    for (field, value) in group {
+        if field == "_id" {
+            continue;
+        }
+        validate_group_key_field_name(field, "$group accumulator")?;
+        let Bson::Document(accumulator) = value else {
+            return Err(command_error(
+                9,
+                "$group accumulator fields require an accumulator document",
+            ));
+        };
+        if accumulator.len() != 1 {
+            return Err(command_error(
+                9,
+                "$group accumulator documents must contain one operator",
+            ));
+        }
+        let (operator, operand) = accumulator
+            .iter()
+            .next()
+            .expect("accumulator len checked above");
+        let op = match operator.as_str() {
+            "$sum" => AccumulatorOp::Sum,
+            "$avg" => AccumulatorOp::Avg,
+            "$min" => AccumulatorOp::Min,
+            "$max" => AccumulatorOp::Max,
+            "$first" => AccumulatorOp::First,
+            "$last" => AccumulatorOp::Last,
+            _ => {
+                return Err(command_error(
+                    72,
+                    &format!("$group accumulator {operator} is not supported"),
+                ));
+            }
+        };
+        let expression = parse_accumulator_expression(op, operand)?;
+        accumulators.push(AccumulatorSpec {
+            field: field.to_string(),
+            op,
+            expression,
+        });
+    }
+    Ok(GroupSpec { id, accumulators })
+}
+
+fn parse_accumulator_expression(
+    op: AccumulatorOp,
+    operand: &Bson,
+) -> std::result::Result<AggregationExpression, Document> {
+    match op {
+        AccumulatorOp::Sum => match operand {
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => {
+                parse_aggregation_expression(operand, "$group $sum", false)
+            }
+            Bson::String(value) if value.starts_with('$') => {
+                parse_aggregation_expression(operand, "$group $sum", false)
+            }
+            _ => Err(command_error(
+                72,
+                "$group $sum supports numeric constants and field paths",
+            )),
+        },
+        AccumulatorOp::Avg => match operand {
+            Bson::String(value) if value.starts_with('$') => {
+                parse_aggregation_expression(operand, "$group $avg", false)
+            }
+            _ => Err(command_error(72, "$group $avg supports field paths")),
+        },
+        AccumulatorOp::Min | AccumulatorOp::Max | AccumulatorOp::First | AccumulatorOp::Last => {
+            parse_aggregation_expression(operand, "$group accumulator", false)
+        }
+    }
+}
+
+fn apply_group_stage(
+    documents: Vec<Document>,
+    spec: &GroupSpec,
+    preserve_empty_count: bool,
+) -> Vec<Document> {
+    if documents.is_empty() {
+        return if preserve_empty_count {
+            vec![doc! { "_id": 1_i32, "n": 0_i64 }]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let mut groups = Vec::<GroupState>::new();
+    for document in &documents {
+        let id = spec.id.evaluate(document).unwrap_or(Bson::Null);
+        let group_index = groups
+            .iter()
+            .position(|group| aggregation_values_equal(&group.id, &id));
+        let index = match group_index {
+            Some(index) => index,
+            None => {
+                groups.push(GroupState {
+                    id,
+                    accumulators: spec
+                        .accumulators
+                        .iter()
+                        .map(|accumulator| AccumulatorState::new(accumulator.op))
+                        .collect(),
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[index];
+        for (state, accumulator) in group.accumulators.iter_mut().zip(&spec.accumulators) {
+            state.accumulate(accumulator, document);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| group.into_document(spec))
+        .collect()
+}
+
+impl AccumulatorState {
+    fn new(op: AccumulatorOp) -> Self {
+        match op {
+            AccumulatorOp::Sum => Self::Sum {
+                total: 0.0,
+                saw_double: false,
+            },
+            AccumulatorOp::Avg => Self::Avg {
+                total: 0.0,
+                count: 0,
+            },
+            AccumulatorOp::Min => Self::Min(None),
+            AccumulatorOp::Max => Self::Max(None),
+            AccumulatorOp::First => Self::First(None),
+            AccumulatorOp::Last => Self::Last(None),
+        }
+    }
+
+    fn accumulate(&mut self, spec: &AccumulatorSpec, document: &Document) {
+        let value = spec.expression.evaluate(document);
+        match self {
+            Self::Sum { total, saw_double } => {
+                if let Some(value) = value
+                    && let Some((number, is_double)) = numeric_bson_value(&value)
+                {
+                    *total += number;
+                    *saw_double |= is_double;
+                }
+            }
+            Self::Avg { total, count } => {
+                if let Some(value) = value
+                    && let Some((number, _)) = numeric_bson_value(&value)
+                {
+                    *total += number;
+                    *count += 1;
+                }
+            }
+            Self::Min(current) => {
+                let Some(value) = value else {
+                    return;
+                };
+                if current
+                    .as_ref()
+                    .is_none_or(|current| compare_bson_order(&value, current).is_lt())
+                {
+                    *current = Some(value);
+                }
+            }
+            Self::Max(current) => {
+                let Some(value) = value else {
+                    return;
+                };
+                if current
+                    .as_ref()
+                    .is_none_or(|current| compare_bson_order(&value, current).is_gt())
+                {
+                    *current = Some(value);
+                }
+            }
+            Self::First(current) => {
+                if current.is_none() {
+                    *current = Some(value.unwrap_or(Bson::Null));
+                }
+            }
+            Self::Last(current) => {
+                *current = Some(value.unwrap_or(Bson::Null));
+            }
+        }
+    }
+
+    fn into_bson(self) -> Bson {
+        match self {
+            Self::Sum { total, saw_double } => numeric_total_to_bson(total, saw_double),
+            Self::Avg { total, count } => {
+                if count == 0 {
+                    Bson::Null
+                } else {
+                    Bson::Double(total / count as f64)
+                }
+            }
+            Self::Min(value) | Self::Max(value) | Self::First(value) | Self::Last(value) => {
+                value.unwrap_or(Bson::Null)
+            }
+        }
+    }
+}
+
+impl GroupState {
+    fn into_document(self, spec: &GroupSpec) -> Document {
+        let mut out = doc! { "_id": self.id };
+        for (state, accumulator) in self.accumulators.into_iter().zip(&spec.accumulators) {
+            out.insert(&accumulator.field, state.into_bson());
+        }
+        out
+    }
+}
+
+fn numeric_bson_value(value: &Bson) -> Option<(f64, bool)> {
+    match value {
+        Bson::Int32(value) => Some((*value as f64, false)),
+        Bson::Int64(value) => Some((*value as f64, false)),
+        Bson::Double(value) => Some((*value, true)),
+        _ => None,
+    }
+}
+
+fn numeric_total_to_bson(total: f64, saw_double: bool) -> Bson {
+    if !saw_double && total.fract() == 0.0 && total >= i64::MIN as f64 && total <= i64::MAX as f64 {
+        Bson::Int64(total as i64)
+    } else {
+        Bson::Double(total)
     }
 }
 
@@ -6902,6 +7179,101 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_group_supports_keys_and_scalar_accumulators() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "scores",
+                "$db": "app",
+                "documents": [
+                    { "_id": "s1", "team": "red", "score": 7_i32, "active": true },
+                    { "_id": "s2", "team": "blue", "score": 5_i32, "active": false },
+                    { "_id": "s3", "team": "red", "score": 11_i32, "active": true },
+                    { "_id": "s4", "team": "red", "score": "bad", "active": false },
+                    { "_id": "s5", "team": "blue", "active": true },
+                ],
+            },
+        )
+        .unwrap();
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "scores",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$group": {
+                            "_id": "$team",
+                            "n": { "$sum": 1_i32 },
+                            "scoreTotal": { "$sum": "$score" },
+                            "avgScore": { "$avg": "$score" },
+                            "minScore": { "$min": "$score" },
+                            "maxScore": { "$max": "$score" },
+                            "firstId": { "$first": "$_id" },
+                            "lastActive": { "$last": "$active" },
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! {
+                    "_id": "blue",
+                    "n": 2_i64,
+                    "scoreTotal": 5_i64,
+                    "avgScore": 5.0,
+                    "minScore": 5_i32,
+                    "maxScore": 5_i32,
+                    "firstId": "s2",
+                    "lastActive": true,
+                },
+                doc! {
+                    "_id": "red",
+                    "n": 3_i64,
+                    "scoreTotal": 18_i64,
+                    "avgScore": 9.0,
+                    "minScore": 7_i32,
+                    "maxScore": "bad",
+                    "firstId": "s1",
+                    "lastActive": false,
+                },
+            ]
+        );
+
+        let document_key = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "scores",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$group": {
+                            "_id": { "team": "$team", "active": "$active" },
+                            "n": { "$sum": 1_i32 },
+                        }
+                    },
+                    { "$sort": { "n": -1_i32 } },
+                    { "$limit": 1_i32 },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&document_key),
+            vec![doc! { "_id": { "team": "red", "active": true }, "n": 2_i64 }]
+        );
+    }
+
+    #[test]
     fn aggregate_cursor_batch_size_uses_get_more_and_cleans_up() {
         let conn = test_conn();
         seed_find_documents(&conn);
@@ -7033,13 +7405,22 @@ mod tests {
                 doc! { "$unwind": { "path": "$tags", "unknown": true } },
             )],
             vec![Bson::Document(
-                doc! { "$group": { "_id": "$state", "n": { "$sum": 1_i32 } } },
-            )],
-            vec![Bson::Document(
-                doc! { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32 }, "extra": { "$sum": 1_i32 } } },
-            )],
-            vec![Bson::Document(
                 doc! { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32, "extra": 1_i32 } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "n": { "$sum": 1_i32 } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": "$team", "n": { "$median": "$score" } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": "$team", "n": { "$avg": 1_i32 } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": "$team", "n": { "$sum": "literal" } } },
+            )],
+            vec![Bson::Document(
+                doc! { "$group": { "_id": "$team", "n": { "$first": { "$add": [1_i32, 2_i32] } } } },
             )],
         ] {
             let response = aggregate_command(

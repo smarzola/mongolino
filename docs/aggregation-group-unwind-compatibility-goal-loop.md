@@ -104,7 +104,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Aggregation expression and grouping design
 - [x] Milestone 1: `$unwind` stage
-- [ ] Milestone 2: `$group` keys and scalar accumulators
+- [x] Milestone 2: `$group` keys and scalar accumulators
 - [ ] Milestone 3: Array-style accumulators and pipeline composition
 - [ ] Milestone 4: Adversarial coverage, README, spec corpus, and final verification
 
@@ -161,7 +161,7 @@ Status 2026-07-04:
 - Added `$unwind` string and document forms with default drop behavior, preservation, scalar handling, array index output, and explicit option/path errors.
 - Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`; `cargo build`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` outside the sandbox.
 - Sandboxed e2e attempt failed at localhost port allocation with `PermissionError: [Errno 1] Operation not permitted` from `tests/e2e/conftest.py:103`.
-- Commit: pending at status-update time; final hash reported in handoff.
+- Commit: `8a75ac9`.
 
 Problem:
 
@@ -206,6 +206,12 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 2: `$group` Keys And Scalar Accumulators
+
+Status 2026-07-04:
+
+- Replaced the count-only `$group` branch with bounded `_id` key parsing and `$sum`, `$avg`, `$min`, `$max`, `$first`, and `$last` accumulators while preserving the PyMongo count-documents group shape.
+- Verification passed: `cargo fmt -- --check`; `cargo test aggregate`; `cargo test`; `cargo build`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py` outside the sandbox.
+- Commit: pending at status-update time; final hash reported in handoff.
 
 Problem:
 

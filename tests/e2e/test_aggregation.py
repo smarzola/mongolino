@@ -121,6 +121,76 @@ def test_aggregate_unwind_default_and_preserve_behavior(collection):
     ]
 
 
+def test_aggregate_group_scalar_accumulators(collection):
+    collection.insert_many(
+        [
+            {"_id": "s1", "team": "red", "score": 7, "active": True},
+            {"_id": "s2", "team": "blue", "score": 5, "active": False},
+            {"_id": "s3", "team": "red", "score": 11, "active": True},
+            {"_id": "s4", "team": "red", "score": "bad", "active": False},
+            {"_id": "s5", "team": "blue", "active": True},
+        ]
+    )
+
+    result = list(
+        collection.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$team",
+                        "n": {"$sum": 1},
+                        "scoreTotal": {"$sum": "$score"},
+                        "avgScore": {"$avg": "$score"},
+                        "minScore": {"$min": "$score"},
+                        "maxScore": {"$max": "$score"},
+                        "firstId": {"$first": "$_id"},
+                        "lastActive": {"$last": "$active"},
+                    }
+                },
+                {"$sort": {"_id": 1}},
+            ]
+        )
+    )
+
+    assert result == [
+        {
+            "_id": "blue",
+            "n": 2,
+            "scoreTotal": 5,
+            "avgScore": 5.0,
+            "minScore": 5,
+            "maxScore": 5,
+            "firstId": "s2",
+            "lastActive": True,
+        },
+        {
+            "_id": "red",
+            "n": 3,
+            "scoreTotal": 18,
+            "avgScore": 9.0,
+            "minScore": 7,
+            "maxScore": "bad",
+            "firstId": "s1",
+            "lastActive": False,
+        },
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": {"team": "$team", "active": "$active"},
+                        "n": {"$sum": 1},
+                    }
+                },
+                {"$sort": {"n": -1}},
+                {"$limit": 1},
+            ]
+        )
+    ) == [{"_id": {"team": "red", "active": True}, "n": 2}]
+
+
 def test_aggregate_unsupported_stage_is_explicit_error(collection):
     seed_scores(collection)
 
@@ -128,19 +198,19 @@ def test_aggregate_unsupported_stage_is_explicit_error(collection):
         list(collection.aggregate([{"$lookup": {"from": "other"}}]))
     assert "$lookup" in str(excinfo.value)
 
-    with pytest.raises(OperationFailure) as excinfo:
-        list(collection.aggregate([{"$group": {"_id": "$team", "n": {"$sum": 1}}}]))
-    assert "count_documents group shape" in str(excinfo.value)
-
     for group in [
-        {"_id": 1, "n": {"$sum": 1}, "extra": {"$sum": 1}},
         {"_id": 1, "n": {"$sum": 1, "extra": 1}},
+        {"n": {"$sum": 1}},
+        {"_id": "$team", "n": {"$median": "$score"}},
+        {"_id": "$team", "n": {"$avg": 1}},
+        {"_id": "$team", "n": {"$sum": "literal"}},
+        {"_id": "$team", "n": {"$first": {"$add": [1, 2]}}},
     ]:
         with pytest.raises(OperationFailure) as excinfo:
             collection.database.command(
                 {"aggregate": collection.name, "pipeline": [{"$group": group}], "cursor": {}}
             )
-        assert "count_documents group shape" in str(excinfo.value)
+        assert "$group" in str(excinfo.value)
 
 
 def test_aggregate_unwind_rejects_malformed_options(collection):

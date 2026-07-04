@@ -75,6 +75,54 @@
       "name": "aggregate",
       "pipeline": [
         {
+          "$group": {
+            "_id": "$team",
+            "n": {
+              "$sum": 1
+            },
+            "scoreTotal": {
+              "$sum": "$score"
+            },
+            "avgScore": {
+              "$avg": "$score"
+            },
+            "firstId": {
+              "$first": "$_id"
+            },
+            "lastActive": {
+              "$last": "$active"
+            }
+          }
+        },
+        {
+          "$sort": {
+            "_id": 1
+          }
+        }
+      ],
+      "expect_documents": [
+        {
+          "_id": "blue",
+          "n": 1,
+          "scoreTotal": 5,
+          "avgScore": 5.0,
+          "firstId": "s2",
+          "lastActive": false
+        },
+        {
+          "_id": "red",
+          "n": 2,
+          "scoreTotal": 18,
+          "avgScore": 9.0,
+          "firstId": "s1",
+          "lastActive": true
+        }
+      ]
+    },
+    {
+      "name": "aggregate",
+      "pipeline": [
+        {
           "$lookup": {
             "from": "other"
           }
