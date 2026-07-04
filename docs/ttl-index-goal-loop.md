@@ -178,7 +178,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: TTL metadata model and migration-safe persistence
 - [x] Milestone 1: `createIndexes` TTL validation and listing
-- [ ] Milestone 2: Deterministic TTL sweeper core
+- [x] Milestone 2: Deterministic TTL sweeper core
 - [ ] Milestone 3: Wire-visible read/write sweep integration
 - [ ] Milestone 4: `collMod` TTL update subset
 - [ ] Milestone 5: Adversarial PyMongo/spec-corpus coverage
@@ -264,7 +264,7 @@ Status:
   `cargo test list_indexes`; `cargo test create_indexes`;
   `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
   tests/e2e/test_indexes.py` (30 passed, outside sandbox due localhost bind).
-  Commit: pending.
+  Commit: `c335a16`.
 
 Likely files:
 
@@ -312,6 +312,14 @@ Acceptance criteria:
   - no TTL indexes means no document mutation.
 - Sweep code is namespace-bounded and does not scan unrelated collections.
 - Milestone status is marked done in this file and committed.
+
+Status:
+
+- 2026-07-04: Completed deterministic namespace-scoped TTL sweeper core with a
+  testable clock, atomic document/index-entry deletion, repeated-sweep
+  idempotency, multiple TTL index handling, and non-date/non-expiring safety.
+  Verification passed: `cargo fmt -- --check`; `cargo test ttl`;
+  `cargo test index_entries`. Commit: pending.
 
 Likely files:
 

@@ -4464,6 +4464,82 @@ fn indexes_for_namespace_tx(
     .map_err(Into::into)
 }
 
+fn ttl_indexes_for_namespace_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<IndexSpec>> {
+    Ok(indexes_for_namespace_tx(tx, namespace)?
+        .into_iter()
+        .filter(|index| index.expire_after_seconds.is_some())
+        .collect())
+}
+
+fn sweep_ttl_namespace(conn: &Connection, namespace: &str) -> Result<i32> {
+    sweep_ttl_namespace_at(conn, namespace, bson::DateTime::now())
+}
+
+fn sweep_ttl_namespace_at(
+    conn: &Connection,
+    namespace: &str,
+    sweep_time: bson::DateTime,
+) -> Result<i32> {
+    let tx = conn.unchecked_transaction()?;
+    let removed = sweep_ttl_namespace_at_tx(&tx, namespace, sweep_time)?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+fn sweep_ttl_namespace_at_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    sweep_time: bson::DateTime,
+) -> Result<i32> {
+    let ttl_indexes = ttl_indexes_for_namespace_tx(tx, namespace)?;
+    if ttl_indexes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut expired_ids = HashSet::new();
+    for stored in stored_documents_for_namespace_tx(tx, namespace)? {
+        if ttl_indexes
+            .iter()
+            .any(|index| ttl_index_expires_document(index, &stored.document, sweep_time))
+        {
+            expired_ids.insert(stored.id_key);
+        }
+    }
+
+    let mut removed = 0_i32;
+    for id_key in expired_ids {
+        delete_index_entries_for_document_tx(tx, namespace, &id_key)?;
+        removed += tx.execute(
+            "DELETE FROM documents WHERE namespace = ?1 AND id_key = ?2",
+            params![namespace, id_key],
+        )? as i32;
+    }
+    Ok(removed)
+}
+
+fn ttl_index_expires_document(
+    index: &IndexSpec,
+    document: &Document,
+    sweep_time: bson::DateTime,
+) -> bool {
+    let Some(expire_after_seconds) = index.expire_after_seconds else {
+        return false;
+    };
+    let Some(field) = single_field_index_name(index) else {
+        return false;
+    };
+    let cutoff = sweep_time
+        .timestamp_millis()
+        .saturating_sub(expire_after_seconds.saturating_mul(1000));
+    matches!(
+        get_document_path(document, field),
+        Some(Bson::DateTime(value)) if value.timestamp_millis() <= cutoff
+    )
+}
+
 fn sql_string_error(err: MongolinoError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
 }
@@ -11765,6 +11841,201 @@ mod tests {
             .unwrap();
         assert_eq!(index_count, 0);
         assert_eq!(entry_count, 0);
+    }
+
+    #[test]
+    fn ttl_sweep_deletes_expired_dates_and_cleans_index_entries() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                    { "key": { "status": 1_i32 }, "name": "status_1" },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "status": "old", "expiresAt": bson::DateTime::from_millis(1_699_999_940_000_i64) },
+                    { "_id": "older", "status": "old", "expiresAt": bson::DateTime::from_millis(1_699_999_939_999_i64) },
+                    { "_id": "future", "status": "new", "expiresAt": bson::DateTime::from_millis(1_699_999_940_001_i64) },
+                ],
+            },
+        )
+        .unwrap();
+
+        let removed = sweep_ttl_namespace_at(
+            &conn,
+            "app.events",
+            bson::DateTime::from_millis(1_700_000_000_000_i64),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining = documents_for_namespace(&conn, "app.events").unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|document| document.get_str("_id").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["future"]
+        );
+        for id in ["expired", "older"] {
+            let entry_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.events' AND id_key = ?1",
+                    params![id_key_from_bson(&Bson::String(id.to_string()))],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let omission_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM index_multikey_omissions WHERE namespace = 'app.events' AND id_key = ?1",
+                    params![id_key_from_bson(&Bson::String(id.to_string()))],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(entry_count, 0);
+            assert_eq!(omission_count, 0);
+        }
+        assert_eq!(
+            sweep_ttl_namespace_at(
+                &conn,
+                "app.events",
+                bson::DateTime::from_millis(1_700_000_000_000_i64),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ttl_sweep_keeps_non_expiring_values_and_non_ttl_namespaces() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 0_i32 }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "future", "expiresAt": bson::DateTime::from_millis(1_700_000_000_001_i64) },
+                    { "_id": "missing" },
+                    { "_id": "null", "expiresAt": Bson::Null },
+                    { "_id": "string", "expiresAt": "2024-01-01" },
+                    { "_id": "number", "expiresAt": 1_i32 },
+                    { "_id": "array", "expiresAt": [bson::DateTime::from_millis(1_i64)] },
+                    { "_id": "document", "expiresAt": { "nested": bson::DateTime::from_millis(1_i64) } },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "ordinary",
+                "$db": "app",
+                "documents": [{ "_id": "o1", "expiresAt": bson::DateTime::from_millis(1_i64) }],
+            },
+        )
+        .unwrap();
+
+        let removed = sweep_ttl_namespace_at(
+            &conn,
+            "app.events",
+            bson::DateTime::from_millis(1_700_000_000_000_i64),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.events").unwrap().len(),
+            7
+        );
+        assert_eq!(
+            sweep_ttl_namespace_at(
+                &conn,
+                "app.ordinary",
+                bson::DateTime::from_millis(1_700_000_000_000_i64),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            documents_for_namespace(&conn, "app.ordinary")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ttl_sweep_expires_when_any_ttl_index_matches() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "createdAt": 1_i32 }, "name": "created_ttl", "expireAfterSeconds": 60_i32 },
+                    { "key": { "deletedAt": 1_i32 }, "name": "deleted_ttl", "expireAfterSeconds": 0_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    {
+                        "_id": "deleted",
+                        "createdAt": bson::DateTime::from_millis(1_700_000_000_001_i64),
+                        "deletedAt": bson::DateTime::from_millis(1_700_000_000_000_i64),
+                    },
+                    {
+                        "_id": "created",
+                        "createdAt": bson::DateTime::from_millis(1_699_999_940_000_i64),
+                        "deletedAt": bson::DateTime::from_millis(1_700_000_000_001_i64),
+                    },
+                    {
+                        "_id": "kept",
+                        "createdAt": bson::DateTime::from_millis(1_700_000_000_001_i64),
+                        "deletedAt": bson::DateTime::from_millis(1_700_000_000_001_i64),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let removed = sweep_ttl_namespace_at(
+            &conn,
+            "app.events",
+            bson::DateTime::from_millis(1_700_000_000_000_i64),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining = documents_for_namespace(&conn, "app.events").unwrap();
+        assert_eq!(remaining[0].get_str("_id").unwrap(), "kept");
     }
 
     #[test]
