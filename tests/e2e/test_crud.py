@@ -237,6 +237,34 @@ def test_update_targets_id_indexed_scalar_and_fallback_filters(collection):
     assert collection.find_one({"_id": "u3"})["score"] == 1
 
 
+def test_update_targets_compound_indexed_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    one = collection.update_one(
+        {"profile.city": "Rome", "active": True},
+        {"$set": {"team": "compound-one"}},
+    )
+    assert one.matched_count == 1
+    assert one.modified_count == 1
+    assert collection.find_one({"_id": "u1"})["team"] == "compound-one"
+
+    many = collection.update_many(
+        {"profile.city": "Rome", "active": True},
+        {"$inc": {"score": 1}},
+    )
+    assert many.matched_count == 2
+    assert many.modified_count == 2
+    assert collection.find_one({"_id": "u1"})["score"] == 8
+    assert collection.find_one({"_id": "u3"})["score"] == 1
+
+    fallback_numeric = collection.update_one(
+        {"profile.city": "Rome", "active": 1},
+        {"$set": {"team": "numeric-fallback"}},
+    )
+    assert fallback_numeric.matched_count == 0
+
+
 def test_replacement_update_and_upsert(collection):
     seed_users(collection)
 
@@ -304,6 +332,19 @@ def test_delete_targets_id_indexed_scalar_and_fallback_filters(collection):
     fallback = collection.delete_many({"$or": [{"name": "Nobody"}, {"age": 41}]})
     assert fallback.deleted_count == 1
     assert ids(collection.find({})) == []
+
+
+def test_delete_targets_compound_indexed_filters(collection):
+    seed_users(collection)
+    collection.create_index([("profile.city", ASCENDING), ("active", ASCENDING)], name="city_active_1")
+
+    one = collection.delete_one({"profile.city": "Rome", "active": True})
+    assert one.deleted_count == 1
+    assert ids(collection.find({"profile.city": "Rome", "active": True})) == ["u3"]
+
+    many = collection.delete_many({"profile.city": "Rome", "active": True})
+    assert many.deleted_count == 1
+    assert ids(collection.find({})) == ["u2"]
 
 
 def seed_users(collection):

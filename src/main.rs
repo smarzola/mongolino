@@ -7642,6 +7642,7 @@ mod tests {
                     { "key": { "active": 1_i32 }, "name": "active_1" },
                     { "key": { "profile.city": 1_i32 }, "name": "city_1" },
                     { "key": { "age": 1_i32 }, "name": "age_1" },
+                    { "key": { "profile.city": 1_i32, "active": 1_i32 }, "name": "city_active_1" },
                 ],
             },
         )
@@ -7676,6 +7677,18 @@ mod tests {
                 key_value: "str:Rome".to_string(),
             }
         );
+        assert_eq!(
+            plan_transaction_candidates(
+                &tx,
+                "app.users",
+                &doc! { "profile.city": "Rome", "active": true }
+            )
+            .unwrap(),
+            TransactionCandidatePlan::IndexedEquality {
+                index_name: "city_active_1".to_string(),
+                key_value: "compound:2:8:str:Rome:9:bool:true".to_string(),
+            }
+        );
 
         for filter in [
             doc! {},
@@ -7690,6 +7703,8 @@ mod tests {
             doc! { "age": 37_i32 },
             doc! { "age": 37_i64 },
             doc! { "age": 37.0 },
+            doc! { "profile.city": "Rome", "active": 1_i32 },
+            doc! { "profile.city": "Rome", "active": true, "name": "Ada" },
         ] {
             assert_eq!(
                 plan_transaction_candidates(&tx, "app.users", &filter).unwrap(),
@@ -9173,7 +9188,7 @@ mod tests {
                 "insert": "users",
                 "$db": "app",
                 "documents": [
-                    { "_id": "u1", "email": "ada@example.test", "rank": 1_i32 },
+                    { "_id": "u1", "email": "ada@example.test", "rank": 1_i32, "role": "admin" },
                     { "_id": "u2", "email": "grace@example.test" },
                 ],
             },
@@ -9187,7 +9202,8 @@ mod tests {
                 "indexes": [
                     { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
                     { "key": { "rank": 1_i32 }, "name": "rank_1", "unique": true },
-                    { "key": { "email": 1_i32, "rank": 1_i32 }, "name": "compound_1", "unique": true }
+                    { "key": { "email": 1_i32, "rank": 1_i32 }, "name": "compound_1", "unique": true },
+                    { "key": { "email": 1_i32, "role": 1_i32 }, "name": "email_role_1", "unique": true }
                 ],
             },
         )
@@ -9201,6 +9217,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let compound = index_by_name_tx(&tx, "app.users", "compound_1")
+            .unwrap()
+            .unwrap();
+        let email_role = index_by_name_tx(&tx, "app.users", "email_role_1")
             .unwrap()
             .unwrap();
 
@@ -9233,6 +9252,15 @@ mod tests {
             )
             .unwrap()
         );
+        let compound_conflict = unique_conflict_check_with_index_entries_tx(
+            &tx,
+            "app.users",
+            &email_role,
+            &doc! { "_id": "u3", "email": "ada@example.test", "role": "admin" },
+            None,
+        )
+        .unwrap_err();
+        assert!(compound_conflict.contains("duplicate key error"));
 
         for (index, document) in [
             (&email, doc! { "_id": "missing" }),

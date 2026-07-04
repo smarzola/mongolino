@@ -135,6 +135,41 @@ def test_numeric_unique_index_conflicts_across_bson_number_types(collection):
     assert collection.find_one({"_id": "u4"}) is None
 
 
+def test_unique_compound_index_enforces_safe_and_fallback_values(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "email": "ada@example.test", "role": "admin", "n": 1},
+            {"_id": "u2", "email": "grace@example.test", "role": "admin", "n": 2},
+        ]
+    )
+    collection.create_index([("email", ASCENDING), ("role", ASCENDING)], name="email_role_1", unique=True)
+    collection.create_index([("email", ASCENDING), ("n", ASCENDING)], name="email_n_1", unique=True)
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u3", "email": "ada@example.test", "role": "admin", "n": 3})
+
+    collection.insert_one({"_id": "u4", "email": "ada@example.test", "role": "viewer", "n": 4})
+    assert collection.find_one({"_id": "u4"})["role"] == "viewer"
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one(
+            {"_id": "u4"},
+            {"$set": {"role": "admin"}},
+        )
+    assert collection.find_one({"_id": "u4"})["role"] == "viewer"
+
+    with pytest.raises(DuplicateKeyError):
+        collection.insert_one({"_id": "u5", "email": "ada@example.test", "role": "numeric", "n": 1.0})
+
+    with pytest.raises(DuplicateKeyError):
+        collection.update_one(
+            {"_id": "u6"},
+            {"$set": {"email": "ada@example.test", "role": "numeric", "n": Int64(1)}},
+            upsert=True,
+        )
+    assert collection.find_one({"_id": "u6"}) is None
+
+
 def test_unique_index_missing_and_null_fallback_semantics(collection):
     collection.insert_one({"_id": "u1", "name": "missing"})
     collection.create_index([("email", ASCENDING)], name="email_1", unique=True)

@@ -470,6 +470,7 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
     indexed.insert_one({"_id": "u1", "profile": {"city": "Rome"}, "score": 4})
     indexed.create_index([("city", ASCENDING)])
     indexed.create_index([("score", ASCENDING)])
+    indexed.create_index([("city", ASCENDING), ("score", ASCENDING)])
     indexed.update_one(
         {"_id": "u1"},
         {"$rename": {"profile.city": "city"}, "$mul": {"score": 3}},
@@ -478,6 +479,8 @@ def test_new_update_modifiers_preserve_validation_unique_and_indexes(mongo_clien
     assert indexed.find_one({"profile.city": "Rome"}) is None
     assert indexed.find_one({"score": 12})["_id"] == "u1"
     assert indexed.find_one({"score": 4}) is None
+    assert indexed.find_one({"city": "Rome", "score": 12})["_id"] == "u1"
+    assert indexed.find_one({"city": "Rome", "score": 4}) is None
 
 
 def test_new_update_modifier_batch_ordering(collection):

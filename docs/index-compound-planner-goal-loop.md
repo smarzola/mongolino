@@ -162,7 +162,7 @@ When a milestone is complete:
 - [x] Milestone 0: Compound key encoding and planner classification
 - [x] Milestone 1: Compound index entry maintenance
 - [x] Milestone 2: Compound read and count pushdown
-- [ ] Milestone 3: Compound write target and unique pushdown
+- [x] Milestone 3: Compound write target and unique pushdown
 - [ ] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Compound Key Encoding And Planner Classification
@@ -362,6 +362,21 @@ cargo test unique
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_crud.py tests/e2e/test_indexes.py tests/e2e/test_find_and_modify.py tests/e2e/test_update_operators.py
 cargo test
 ```
+
+Status:
+
+- 2026-07-04: Transaction-local candidate planning now covers safe full-key
+  compound equality for update, delete, and findAndModify, with matcher
+  validation retained before mutation. Compound unique checks use index-entry
+  pushdown for safe non-numeric scalar full keys and fall back for numeric and
+  unsafe shapes. Verified with `cargo fmt -- --check`; `cargo test update`;
+  `cargo test delete`; `cargo test find_and_modify`; `cargo test unique`;
+  `cargo test`; sandboxed PyMongo e2e failed at localhost bind with
+  `PermissionError: [Errno 1] Operation not permitted`; unsandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_crud.py tests/e2e/test_indexes.py
+  tests/e2e/test_find_and_modify.py tests/e2e/test_update_operators.py`
+  passed. Commit hash: pending.
 
 ## Milestone 4: Benchmarks, Docs, And Final Verification
 

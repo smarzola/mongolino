@@ -141,29 +141,29 @@ def test_find_and_modify_targets_id_indexed_scalar_and_fallback_filters(collecti
 
 def test_find_and_modify_refreshes_compound_index_entries(collection):
     seed_jobs(collection)
-    collection.create_index([("state", ASCENDING), ("priority", ASCENDING)], name="state_priority_1")
+    collection.create_index([("state", ASCENDING), ("email", ASCENDING)], name="state_email_1")
 
     updated = collection.find_one_and_update(
-        {"state": "queued", "priority": 3},
+        {"state": "queued", "email": "b@example.test"},
         {"$set": {"state": "running"}},
         return_document=ReturnDocument.AFTER,
     )
     assert updated["_id"] == "j2"
-    assert collection.find_one({"state": "queued", "priority": 3}) is None
-    assert collection.find_one({"state": "running", "priority": 3})["_id"] == "j2"
+    assert collection.find_one({"state": "queued", "email": "b@example.test"}) is None
+    assert collection.find_one({"state": "running", "email": "b@example.test"})["_id"] == "j2"
 
     replaced = collection.find_one_and_replace(
-        {"state": "running", "priority": 3},
+        {"state": "running", "email": "b@example.test"},
         {"owner": "b", "priority": 4, "state": "queued", "email": "b@example.test"},
         return_document=ReturnDocument.AFTER,
     )
     assert replaced["_id"] == "j2"
-    assert collection.find_one({"state": "running", "priority": 3}) is None
-    assert collection.find_one({"state": "queued", "priority": 4})["_id"] == "j2"
+    assert collection.find_one({"state": "running", "email": "b@example.test"}) is None
+    assert collection.find_one({"state": "queued", "email": "b@example.test"})["_id"] == "j2"
 
-    removed = collection.find_one_and_delete({"state": "queued", "priority": 4})
+    removed = collection.find_one_and_delete({"state": "queued", "email": "b@example.test"})
     assert removed["_id"] == "j2"
-    assert collection.find_one({"state": "queued", "priority": 4}) is None
+    assert collection.find_one({"state": "queued", "email": "b@example.test"}) is None
 
 
 def test_find_one_and_update_upsert_returns_inserted_document(collection):
