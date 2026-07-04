@@ -276,7 +276,7 @@ Status note:
   uv lock --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
   --locked --dev`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
   --locked pytest tests/e2e`. PyMongo e2e result: 188 passed. Implementation
-  commit: pending checkpoint.
+  commit: `3b4aaaf`.
 
 ## Final Response Requirements
 
