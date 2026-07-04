@@ -64,7 +64,23 @@ When the milestone is complete:
 4. Commit the code, tests, docs, and status-note update with a focused commit message.
 5. Report the commit hash in the final response.
 
-- [ ] Milestone 1: PyMongo findAndModify bypass alias
+- [x] Milestone 1: PyMongo findAndModify bypass alias
+
+Status note 2026-07-04:
+
+- Implemented `findAndModify` support for PyMongo's observed `bypass_document_validation` alias while preserving explicit command errors for conflicting alias values and non-boolean bypass fields.
+- Also fixed the parent-review `collMod` finding: `validator: {}` clears stored `validator`, `validationLevel`, and `validationAction`, while same-command explicit supported `validationLevel` / `validationAction` values are retained.
+- Verification run:
+  - `cargo fmt -- --check` passed.
+  - `cargo test validation_find_and_modify` passed.
+  - `cargo test validation` passed.
+  - `cargo test` passed.
+  - `cargo build` passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_validation.py` failed in the sandbox before server startup with `PermissionError: [Errno 1] Operation not permitted` while binding `127.0.0.1`; the same command passed outside the sandbox with 10 passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e` passed outside the sandbox with 100 passed, 1 skipped.
+- Commit hash: final amended commit reported in handoff.
 
 ## Milestone 1: PyMongo findAndModify Bypass Alias
 

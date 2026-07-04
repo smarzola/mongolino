@@ -101,7 +101,19 @@ def test_coll_mod_updates_and_clears_validator(mongo_client):
 
     response = db.command({"collMod": "users", "validator": {}})
     assert response["ok"] == 1.0
-    assert "validator" not in listed_options(db, "users")
+    options = listed_options(db, "users")
+    assert "validator" not in options
+    assert "validationLevel" not in options
+    assert "validationAction" not in options
+
+    response = db.command(
+        {"collMod": "users", "validator": {}, "validationLevel": "strict"}
+    )
+    assert response["ok"] == 1.0
+    options = listed_options(db, "users")
+    assert "validator" not in options
+    assert options["validationLevel"] == "strict"
+    assert "validationAction" not in options
 
 
 def test_coll_mod_rejects_missing_collection_and_bad_shapes(mongo_client):
@@ -251,6 +263,43 @@ def test_find_and_modify_enforces_validator_and_bypass(mongo_client):
         bypass_document_validation=True,
     )
     assert result["name"] == 5
+
+    result = db.command(
+        {
+            "findAndModify": "users",
+            "query": {"_id": "u1"},
+            "update": {"$set": {"name": 6}},
+            "new": True,
+            "bypass_document_validation": True,
+        }
+    )
+    assert result["value"]["name"] == 6
+
+    with pytest.raises(OperationFailure) as conflicting:
+        db.command(
+            {
+                "findAndModify": "users",
+                "query": {"_id": "u1"},
+                "update": {"$set": {"name": "Mutated"}},
+                "new": True,
+                "bypassDocumentValidation": True,
+                "bypass_document_validation": False,
+            }
+        )
+    assert conflicting.value.code == 9
+    assert "cannot conflict" in str(conflicting.value)
+    assert collection.find_one({"_id": "u1"})["name"] == 6
+
+    with pytest.raises(OperationFailure) as malformed_snake:
+        db.command(
+            {
+                "findAndModify": "users",
+                "query": {"_id": "u1"},
+                "update": {"$set": {"name": "Ada"}},
+                "bypass_document_validation": "yes",
+            }
+        )
+    assert malformed_snake.value.code == 9
 
     with pytest.raises(OperationFailure) as malformed:
         db.command(

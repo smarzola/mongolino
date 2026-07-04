@@ -763,6 +763,8 @@ fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
         match value {
             Bson::Document(validator) if validator.is_empty() => {
                 options.remove("validator");
+                options.remove("validationLevel");
+                options.remove("validationAction");
             }
             Bson::Document(validator) => {
                 options.insert("validator", Bson::Document(validator.clone()));
@@ -1148,6 +1150,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "new",
             "upsert",
             "bypassDocumentValidation",
+            "bypass_document_validation",
             "fields",
             "projection",
             "$db",
@@ -1182,7 +1185,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         Ok(value) => value.unwrap_or(false),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
-    let bypass_validation = match optional_bool(command, "bypassDocumentValidation") {
+    let bypass_validation = match optional_document_validation_bypass(command) {
         Ok(value) => value.unwrap_or(false),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
@@ -2570,6 +2573,20 @@ fn optional_bool(command: &Document, key: &str) -> std::result::Result<Option<bo
         None => Ok(None),
         Some(Bson::Boolean(value)) => Ok(Some(*value)),
         Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+fn optional_document_validation_bypass(
+    command: &Document,
+) -> std::result::Result<Option<bool>, String> {
+    let camel = optional_bool(command, "bypassDocumentValidation")?;
+    let snake = optional_bool(command, "bypass_document_validation")?;
+    match (camel, snake) {
+        (Some(camel), Some(snake)) if camel != snake => Err(
+            "bypassDocumentValidation and bypass_document_validation cannot conflict".to_string(),
+        ),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -5075,6 +5092,32 @@ mod tests {
                 .unwrap()
                 .contains_key("validator")
         );
+        assert!(
+            !first_batch(&listed)[0]
+                .get_document("options")
+                .unwrap()
+                .contains_key("validationLevel")
+        );
+        assert!(
+            !first_batch(&listed)[0]
+                .get_document("options")
+                .unwrap()
+                .contains_key("validationAction")
+        );
+
+        let cleared_with_new_level = coll_mod(
+            &conn,
+            &doc! { "collMod": "users", "$db": "app", "validator": {}, "validationLevel": "strict" },
+        )
+        .unwrap();
+        assert_eq!(cleared_with_new_level.get_f64("ok").unwrap(), 1.0);
+        let listed =
+            list_collections(&conn, &doc! { "listCollections": 1_i32, "$db": "app" }).unwrap();
+        let batch = first_batch(&listed);
+        let options = batch[0].get_document("options").unwrap();
+        assert!(!options.contains_key("validator"));
+        assert_eq!(options.get_str("validationLevel").unwrap(), "strict");
+        assert!(!options.contains_key("validationAction"));
     }
 
     #[test]
@@ -5524,6 +5567,78 @@ mod tests {
                 .unwrap(),
             5
         );
+
+        let snake_case_bypassed = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": 6_i32 } },
+                "new": true,
+                "bypass_document_validation": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            snake_case_bypassed
+                .get_document("value")
+                .unwrap()
+                .get_i32("name")
+                .unwrap(),
+            6
+        );
+
+        let conflicting_aliases = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": "Mutated" } },
+                "new": true,
+                "bypassDocumentValidation": true,
+                "bypass_document_validation": false,
+            },
+        )
+        .unwrap();
+        assert_command_error(&conflicting_aliases);
+        assert_eq!(conflicting_aliases.get_i32("code").unwrap(), 9);
+        assert!(
+            conflicting_aliases
+                .get_str("errmsg")
+                .unwrap()
+                .contains("cannot conflict")
+        );
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+                )
+                .unwrap()
+            )[0]
+            .get_i32("name")
+            .unwrap(),
+            6
+        );
+
+        let malformed_snake = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": { "$set": { "name": "Ada" } },
+                "bypass_document_validation": "yes",
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed_snake);
+        assert_eq!(malformed_snake.get_i32("code").unwrap(), 9);
 
         let malformed = find_and_modify(
             &conn,
