@@ -1,0 +1,102 @@
+{
+  "name": "indexed query correctness",
+  "source": "crud",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "u1",
+      "profile": {
+        "city": "Rome"
+      }
+    },
+    {
+      "_id": "u2",
+      "profile": {
+        "city": "London"
+      }
+    },
+    {
+      "_id": "u3",
+      "profile": {
+        "city": "Rome"
+      }
+    }
+  ],
+  "operations": [
+    {
+      "name": "create_index",
+      "keys": {
+        "profile.city": 1
+      },
+      "index_name": "city_1",
+      "expect_result": {
+        "name": "city_1"
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "profile.city": "Rome"
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "profile": {
+            "city": "Rome"
+          }
+        },
+        {
+          "_id": "u3",
+          "profile": {
+            "city": "Rome"
+          }
+        }
+      ]
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": {
+        "$set": {
+          "profile.city": "Milan"
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "delete_one",
+      "filter": {
+        "_id": "u3"
+      },
+      "expect_result": {
+        "deleted_count": 1
+      }
+    },
+    {
+      "name": "find",
+      "filter": {
+        "profile.city": "Rome"
+      },
+      "expect_documents": []
+    },
+    {
+      "name": "find",
+      "filter": {
+        "profile.city": "Milan"
+      },
+      "expect_documents": [
+        {
+          "_id": "u1",
+          "profile": {
+            "city": "Milan"
+          }
+        }
+      ]
+    }
+  ]
+}

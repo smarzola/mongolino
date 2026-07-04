@@ -224,6 +224,17 @@ fn init_document_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_indexes_namespace
             ON indexes(namespace);
 
+        CREATE TABLE IF NOT EXISTS index_entries (
+            namespace TEXT NOT NULL,
+            index_name TEXT NOT NULL,
+            key_value TEXT NOT NULL,
+            id_key TEXT NOT NULL,
+            PRIMARY KEY (namespace, index_name, key_value, id_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_index_entries_lookup
+            ON index_entries(namespace, index_name, key_value);
+
         CREATE TABLE IF NOT EXISTS documents (
             namespace TEXT NOT NULL,
             id_key TEXT NOT NULL,
@@ -684,6 +695,10 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
     tx.execute("DELETE FROM documents WHERE namespace = ?1", params![ns])?;
     tx.execute("DELETE FROM collections WHERE namespace = ?1", params![ns])?;
     tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?;
+    tx.execute(
+        "DELETE FROM index_entries WHERE namespace = ?1",
+        params![ns],
+    )?;
     tx.commit()?;
 
     Ok(doc! {
@@ -710,6 +725,10 @@ fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
     tx.execute("DELETE FROM collections WHERE db = ?1", params![db])?;
     tx.execute(
         "DELETE FROM indexes WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
+    tx.execute(
+        "DELETE FROM index_entries WHERE namespace LIKE ?1",
         params![prefix],
     )?;
     tx.commit()?;
@@ -1049,6 +1068,7 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
             return Ok(command_error(code, &errmsg));
         }
         insert_index_tx(&tx, &namespace, spec)?;
+        rebuild_index_entries_tx(&tx, &namespace, spec)?;
     }
     let after = index_count_tx(&tx, &namespace)? + 1;
     tx.commit()?;
@@ -1135,8 +1155,16 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
     let tx = conn.unchecked_transaction()?;
     let before = index_count_tx(&tx, &ns)? + 1;
     let removed = if index == "*" {
+        tx.execute(
+            "DELETE FROM index_entries WHERE namespace = ?1",
+            params![ns],
+        )?;
         tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?
     } else {
+        tx.execute(
+            "DELETE FROM index_entries WHERE namespace = ?1 AND index_name = ?2",
+            params![ns, index],
+        )?;
         tx.execute(
             "DELETE FROM indexes WHERE namespace = ?1 AND name = ?2",
             params![ns, index],
@@ -1379,6 +1407,105 @@ fn unique_key_for_document(
     Ok(parts.join("|"))
 }
 
+fn rebuild_index_entries_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    spec: &IndexSpec,
+) -> std::result::Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM index_entries WHERE namespace = ?1 AND index_name = ?2",
+        params![namespace, spec.name],
+    )?;
+    for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(sql_string_error)? {
+        insert_index_entry_for_document_tx(tx, namespace, spec, &stored.id_key, &stored.document)?;
+    }
+    Ok(())
+}
+
+fn refresh_index_entries_for_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    id_key: &str,
+    document: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM index_entries WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    let indexes = indexes_for_namespace_tx(tx, namespace).map_err(sql_string_error)?;
+    for spec in indexes {
+        insert_index_entry_for_document_tx(tx, namespace, &spec, id_key, document)?;
+    }
+    Ok(())
+}
+
+fn delete_index_entries_for_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    id_key: &str,
+) -> std::result::Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM index_entries WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    Ok(())
+}
+
+fn insert_index_entry_for_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    spec: &IndexSpec,
+    id_key: &str,
+    document: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    let Some(key_value) = planner_key_for_document(spec, document) else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO index_entries(namespace, index_name, key_value, id_key) VALUES (?1, ?2, ?3, ?4)",
+        params![namespace, spec.name, key_value, id_key],
+    )?;
+    Ok(())
+}
+
+fn planner_key_for_document(spec: &IndexSpec, document: &Document) -> Option<String> {
+    let field = single_field_index_name(spec)?;
+    let value = get_document_path(document, field)?;
+    if matches!(value, Bson::Array(_)) {
+        return None;
+    }
+    Some(id_key_from_bson(value))
+}
+
+fn single_field_index_name(spec: &IndexSpec) -> Option<&str> {
+    if spec.key.len() == 1 {
+        spec.key.keys().next().map(String::as_str)
+    } else {
+        None
+    }
+}
+
+fn indexes_for_namespace_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+) -> Result<Vec<IndexSpec>> {
+    let mut stmt = tx.prepare(
+        "SELECT name, key_bson, unique_index FROM indexes WHERE namespace = ?1 ORDER BY name",
+    )?;
+    stmt.query_map(params![namespace], |row| {
+        let name = row.get::<_, String>(0)?;
+        let key = decode_document_sql(row.get::<_, Vec<u8>>(1)?)?;
+        let unique = row.get::<_, i32>(2)? != 0;
+        Ok(IndexSpec { name, key, unique })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(Into::into)
+}
+
+fn sql_string_error(err: MongolinoError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+}
+
 fn insert_collection_catalog(
     conn: &Connection,
     db: &str,
@@ -1510,7 +1637,10 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
                 continue;
             }
             match stmt.execute(params![namespace, id_key, encoded]) {
-                Ok(_) => inserted += 1,
+                Ok(_) => {
+                    refresh_index_entries_for_document_tx(&tx, &namespace, id_key, document)?;
+                    inserted += 1;
+                }
                 Err(err) if is_sqlite_constraint(&err) => {
                     write_errors.push(write_error(
                         index as i32,
@@ -1708,6 +1838,13 @@ fn apply_update_entry(
         ensure_unique_constraints_tx(tx, namespace, &new_document, None)?;
         insert_stored_document_tx(tx, namespace, &new_document)
             .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
+        refresh_index_entries_for_document_tx(
+            tx,
+            namespace,
+            &id_key_from_bson(&upserted_id),
+            &new_document,
+        )
+        .map_err(|err| err.to_string())?;
         return Ok(UpdateOutcome {
             matched: 0,
             modified: 0,
@@ -1727,6 +1864,8 @@ fn apply_update_entry(
             ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&stored.id_key))?;
             update_stored_document_tx(tx, namespace, &stored.id_key, &new_document)
                 .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
+            refresh_index_entries_for_document_tx(tx, namespace, &stored.id_key, &new_document)
+                .map_err(|err| err.to_string())?;
             modified += 1;
         }
     }
@@ -2194,6 +2333,8 @@ fn apply_delete_entry(
 
     let mut removed = 0_i32;
     for id_key in targets {
+        delete_index_entries_for_document_tx(tx, namespace, &id_key)
+            .map_err(|err| err.to_string())?;
         removed += tx
             .execute(
                 "DELETE FROM documents WHERE namespace = ?1 AND id_key = ?2",
@@ -2304,8 +2445,12 @@ fn find_documents_with_state(
         return Ok(cursor_response(db, collection, 0, "firstBatch", vec![]));
     }
 
+    let source_documents = match indexed_candidate_documents(conn, &ns, &filter)? {
+        Some(documents) => documents,
+        None => documents_for_namespace(conn, &ns)?,
+    };
     let mut docs = Vec::new();
-    for document in documents_for_namespace(conn, &ns)? {
+    for document in source_documents {
         match matches_filter(&document, &filter) {
             Ok(true) => docs.push(document),
             Ok(false) => {}
@@ -2743,6 +2888,64 @@ fn simple_id_equality_filter(filter: &Document) -> Option<&Bson> {
     } else {
         None
     }
+}
+
+fn indexed_candidate_documents(
+    conn: &Connection,
+    namespace: &str,
+    filter: &Document,
+) -> Result<Option<Vec<Document>>> {
+    let Some((field, value)) = simple_equality_filter_field(filter) else {
+        return Ok(None);
+    };
+    if matches!(value, Bson::Array(_)) {
+        return Ok(None);
+    }
+    let Some(index) = indexes_for_namespace(conn, namespace)?
+        .into_iter()
+        .find(|index| single_field_index_name(index).is_some_and(|indexed| indexed == field))
+    else {
+        return Ok(None);
+    };
+    let key_value = id_key_from_bson(value);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT d.bson
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+           AND e.key_value = ?3
+         ORDER BY d.created_at
+        "#,
+    )?;
+    let documents = stmt
+        .query_map(params![namespace, index.name, key_value], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .map(|row| decode_document(row?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(documents))
+}
+
+fn simple_equality_filter_field(filter: &Document) -> Option<(&str, &Bson)> {
+    for (field, value) in filter {
+        if field.starts_with('$') {
+            continue;
+        }
+        if !is_operator_document(value) {
+            return Some((field.as_str(), value));
+        }
+        if let Bson::Document(operators) = value
+            && operators.len() == 1
+            && let Some(eq) = operators.get("$eq")
+        {
+            return Some((field.as_str(), eq));
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -4090,6 +4293,90 @@ mod tests {
         .unwrap();
         assert_command_error(&response);
         assert_eq!(response.get_i32("code").unwrap(), 72);
+    }
+
+    #[test]
+    fn planner_uses_index_entries_for_simple_equality() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "profile.city": 1_i32 }, "name": "city_1" }],
+            },
+        )
+        .unwrap();
+
+        let candidates =
+            indexed_candidate_documents(&conn, "app.users", &doc! { "profile.city": "Rome" })
+                .unwrap()
+                .unwrap();
+        let candidate_ids = candidates
+            .iter()
+            .map(|doc| doc.get_str("_id").unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, vec!["u1", "u3"]);
+
+        assert_eq!(
+            find_ids(&conn, doc! { "profile.city": "Rome" }),
+            vec!["u1", "u3"]
+        );
+    }
+
+    #[test]
+    fn planner_entries_stay_fresh_after_update_delete_and_drop() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "name": 1_i32 }, "name": "name_1" }],
+            },
+        )
+        .unwrap();
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": { "$set": { "name": "Ada Lovelace" } } }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Ada" }),
+            Vec::<String>::new()
+        );
+        assert_eq!(find_ids(&conn, doc! { "name": "Ada Lovelace" }), vec!["u1"]);
+
+        delete_documents(
+            &conn,
+            &doc! { "delete": "users", "$db": "app", "deletes": [{ "q": { "_id": "u1" }, "limit": 1_i32 }] },
+        )
+        .unwrap();
+        assert_eq!(
+            find_ids(&conn, doc! { "name": "Ada Lovelace" }),
+            Vec::<String>::new()
+        );
+
+        drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "users", "$db": "app", "index": "name_1" },
+        )
+        .unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_entries WHERE namespace = 'app.users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

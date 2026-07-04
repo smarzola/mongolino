@@ -137,3 +137,35 @@ def test_unique_index_rejects_array_values(collection):
 
     assert excinfo.value.code == 72
     assert "does not support array value" in str(excinfo.value)
+
+
+def test_indexed_query_results_stay_correct_after_mutations(collection):
+    collection.insert_many(
+        [
+            {"_id": "u1", "name": "Ada", "profile": {"city": "Rome"}},
+            {"_id": "u2", "name": "Grace", "profile": {"city": "London"}},
+            {"_id": "u3", "name": "Katherine", "profile": {"city": "Rome"}},
+        ]
+    )
+    collection.create_index([("profile.city", ASCENDING)], name="city_1")
+
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome"}).sort("_id", 1)] == [
+        "u1",
+        "u3",
+    ]
+
+    collection.update_one({"_id": "u1"}, {"$set": {"profile.city": "Milan"}})
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Rome"}).sort("_id", 1)] == [
+        "u3"
+    ]
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Milan"}).sort("_id", 1)] == [
+        "u1"
+    ]
+
+    collection.delete_one({"_id": "u3"})
+    assert list(collection.find({"profile.city": "Rome"})) == []
+
+    collection.drop_index("city_1")
+    assert [doc["_id"] for doc in collection.find({"profile.city": "Milan"}).sort("_id", 1)] == [
+        "u1"
+    ]
