@@ -148,7 +148,7 @@ When a milestone is complete:
 - [x] Milestone 1: Sparse membership and unique semantics
 - [x] Milestone 2: Partial filter subset and unique semantics
 - [x] Milestone 3: Planner-safe sparse/partial pushdown
-- [ ] Milestone 4: Benchmarks, docs, and final verification
+- [x] Milestone 4: Benchmarks, docs, and final verification
 
 ## Milestone 0: Metadata Model And Parser
 
@@ -378,6 +378,17 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
 
 Use unsandboxed execution for PyMongo e2e if the sandbox blocks localhost
 binding.
+
+Status 2026-07-04: Complete. Ran `cargo fmt -- --check`, `cargo test`,
+`cargo build`, `cargo run --bin mongolino-bench -- --profile smoke --json
+/tmp/mongolino-bench-index-sparse-partial-smoke.json`, `cargo run --bin
+mongolino-bench -- --profile local --json
+/tmp/mongolino-bench-index-sparse-partial-local.json`, `cargo run --bin
+mongolino-bench -- --profile ci --check-budget`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
+`UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+tests/e2e` (unsandboxed for localhost bind). Commit: this milestone commit.
 
 ## Final Response Requirements
 

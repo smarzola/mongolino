@@ -7,7 +7,7 @@ loop, verification, and push.
 
 ## Baseline
 
-Current index support after the compound planner uplift:
+Current index support after the sparse and partial planner uplift:
 
 - `createIndexes`, `listIndexes`, and `dropIndexes` are implemented.
 - `_id_` is always listed and cannot be dropped.
@@ -18,16 +18,28 @@ Current index support after the compound planner uplift:
 - Maintained multikey omission sentinels disable single-field or compound
   index-entry pushdown when an indexed path contains array traversal that would
   otherwise be omitted from scalar planner entries.
+- Sparse indexes are accepted, persisted, listed, and maintained by indexing
+  only documents where all indexed fields are present. Explicit `null` counts
+  as present.
+- Partial indexes are accepted for field equality, field `$eq`,
+  `$exists: true`, and `$and` of those supported predicates. Numeric partial
+  predicates and unsupported operators are explicit command errors.
+- Unique sparse and unique partial indexes enforce duplicates only among
+  included documents.
 - Single-field scalar and full-key compound scalar indexes can accelerate
   `find`, `count`, aggregation `$match` + `$count`, update/delete target
   selection, findAndModify target selection, and safe non-numeric unique checks.
+  Sparse and partial index entries are used only when the query filter safely
+  implies index membership; count pushdown additionally requires all non-key
+  predicates to be covered by the partial membership predicate.
 - Unsupported index types and options return explicit command errors.
 
 Major gaps:
 
 - Compound prefix scans, range scans, sort-only compound planning, and
   collation-aware compound behavior are absent.
-- Sparse and partial index options are rejected.
+- Broader partial filter implication remains unsupported beyond the tested
+  equality, `$eq`, `$exists: true`, and `$and` subset.
 - Multikey indexes do not have MongoDB-compatible array indexing semantics.
   Current planners fall back to Rust matcher scans when indexed array values are
   present; scalar multikey entry maintenance remains reserved for uplift 3.
@@ -44,12 +56,12 @@ behavior, not a claim of full MongoDB parity.
 | Area | Weight | Baseline | After Uplift 1 | Target After 3 Uplifts |
 | --- | ---: | ---: | ---: | ---: |
 | Index command surface and catalog behavior | 15% | 10% | 11% | 12% |
-| Basic btree key specs and metadata | 15% | 8% | 11% | 13% |
+| Basic btree key specs and metadata | 15% | 8% | 11% | 12% |
 | Unique enforcement semantics | 20% | 12% | 14% | 16% |
-| Planner use for reads and writes | 25% | 8% | 15% | 20% |
-| Sparse/partial/multikey practical semantics | 20% | 1% | 1% | 12% |
+| Planner use for reads and writes | 25% | 8% | 15% | 17% |
+| Sparse/partial/multikey practical semantics | 20% | 1% | 1% | 6% |
 | Explicit unsupported behavior and tests | 5% | 4% | 4% | 5% |
-| Total | 100% | 43% | 56% | 78% |
+| Total | 100% | 43% | 56% | 68% |
 
 Completion target for this goal: reach at least **75%** on this scorecard while
 preserving explicit errors for unsupported MongoDB index families.
@@ -110,6 +122,8 @@ Prompt: `docs/index-compound-planner-goal-loop.md`.
 
 Target compatibility movement: **55% -> 67%**.
 
+Delivered compatibility movement: **56% -> 68%**.
+
 Target behavior:
 
 - Parse and list `sparse` and `partialFilterExpression` options for supported
@@ -120,6 +134,22 @@ Target behavior:
 - Use sparse/partial entries for planner pushdown only when query filters imply
   index membership.
 - Keep unsupported partial filter operators explicit.
+
+Delivered behavior:
+
+- `sparse: true|false` and supported `partialFilterExpression` metadata are
+  accepted, persisted, listed, and dropped.
+- Sparse index membership requires every indexed field to be present; explicit
+  `null` remains indexed.
+- Partial index membership supports field equality, field `$eq`,
+  `$exists: true`, and `$and` of supported predicates.
+- Unique sparse and partial indexes enforce duplicates only among included
+  documents across insert, update, upsert, delete, and findAndModify refreshes.
+- Sparse/partial entries are used for find, count, aggregation count, and write
+  target selection only when query filters safely imply index membership.
+- Numeric partial predicates, unsupported partial operators, empty partial
+  filters, `$exists: false`, non-document partial filters, and broader
+  implication forms remain explicit errors or matcher fallbacks.
 
 Prompt to write after uplift 1 review: `docs/index-sparse-partial-goal-loop.md`.
 

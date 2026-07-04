@@ -214,6 +214,70 @@ Current behavior has these SQLite-backed fast paths:
   use the same pushdown only when every key part is present, non-null,
   non-numeric, and scalar. Numeric values fall back to the Rust scan so
   `Int32`, `Int64`, and `Double` equality semantics remain consistent.
+- sparse and partial indexes maintain entries only for member documents.
+  Planner pushdown uses sparse/partial entries only when the query filter
+  safely implies index membership. Count pushdown remains stricter and only
+  uses those entries when non-key predicates are covered by the partial
+  membership predicate.
+
+## Sparse And Partial Index Planner Results
+
+Recorded on 2026-07-04 from the working tree based on commit `f4f3c96` after
+sparse and partial metadata, membership, uniqueness, planner safety, and
+benchmark wiring.
+
+Smoke profile: seeded query dataset 400 documents. Dedicated sparse/partial
+benchmark collections use the same smoke document count, except
+`update_partial_unique_check`, which uses the dedicated 400-document write
+targeting collection.
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 25 | 48.09 | 25991.13 | 1.924 |
+| find_id_equality | 25 | 0.65 | 38722.17 | 0.026 |
+| find_collection_scan | 25 | 117.27 | 213.19 | 4.691 |
+| find_indexed_scalar_equality | 25 | 8.79 | 2845.37 | 0.351 |
+| find_compound_equality | 25 | 8.21 | 3044.85 | 0.328 |
+| find_partial_index_equality | 25 | 7.40 | 3376.23 | 0.296 |
+| count_empty_filter | 25 | 0.67 | 37549.26 | 0.027 |
+| count_simple_equality | 25 | 1.21 | 20580.37 | 0.049 |
+| count_compound_equality | 25 | 1.06 | 23518.34 | 0.043 |
+| count_partial_index_equality | 25 | 0.87 | 28818.44 | 0.035 |
+| update_index_refresh | 25 | 10.84 | 2306.12 | 0.434 |
+| update_compound_target | 25 | 8.65 | 2888.59 | 0.346 |
+| update_partial_unique_check | 25 | 5.13 | 4873.02 | 0.205 |
+| aggregation_match_count | 25 | 1.33 | 18804.66 | 0.053 |
+| aggregation_unwind_group | 25 | 214.05 | 116.80 | 8.562 |
+
+Local profile: seeded query dataset 3000 documents. Dedicated
+`update_partial_unique_check` uses 2000 documents to isolate selective partial
+unique conflict checks from unrelated index refresh overhead.
+
+| Benchmark | Before ms/op | After ms/op | Change |
+| --- | ---: | ---: | ---: |
+| find_partial_index_equality vs find_collection_scan | 30.946 | 2.085 | 14.8x faster |
+| count_partial_index_equality | n/a | 0.031 | below 0.5 ms/op target |
+| update_partial_unique_check | n/a | 0.274 | below 2 ms/op target |
+
+Full local profile after sparse and partial index planner uplift:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| insert_batch_throughput | 100 | 356.04 | 28086.63 | 3.560 |
+| find_id_equality | 100 | 2.24 | 44679.42 | 0.022 |
+| find_collection_scan | 100 | 3094.58 | 32.31 | 30.946 |
+| find_indexed_scalar_equality | 100 | 222.32 | 449.81 | 2.223 |
+| find_compound_equality | 100 | 227.66 | 439.26 | 2.277 |
+| find_partial_index_equality | 100 | 208.54 | 479.53 | 2.085 |
+| count_empty_filter | 100 | 11.98 | 8350.15 | 0.120 |
+| count_simple_equality | 100 | 7.71 | 12977.67 | 0.077 |
+| count_compound_equality | 100 | 3.80 | 26316.36 | 0.038 |
+| count_partial_index_equality | 100 | 3.09 | 32348.94 | 0.031 |
+| update_index_refresh | 100 | 150.51 | 664.41 | 1.505 |
+| update_compound_target | 100 | 141.04 | 709.01 | 1.410 |
+| update_partial_unique_check | 100 | 27.35 | 3655.71 | 0.274 |
+| aggregation_match_count | 100 | 8.43 | 11867.03 | 0.084 |
+| aggregation_unwind_group | 100 | 5703.63 | 17.53 | 57.036 |
 
 The remaining slow local results cluster around full namespace decode:
 

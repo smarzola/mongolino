@@ -15,6 +15,8 @@ use rusqlite::Connection;
 const DB: &str = "bench";
 const COLL: &str = "users";
 const COMPOUND_COLL: &str = "compound_users";
+const PARTIAL_COLL: &str = "partial_users";
+const PARTIAL_UNIQUE_COLL: &str = "partial_unique_users";
 
 #[derive(Clone, Copy, Debug)]
 struct Profile {
@@ -143,6 +145,19 @@ fn run() -> Result<()> {
         },
     )?);
     results.push(harness.bench_command(
+        "find_partial_index_equality",
+        args.profile.iterations,
+        doc! {
+            "find": PARTIAL_COLL,
+            "filter": {
+                "email": partial_target_email(args.profile.documents),
+                "active": true,
+            },
+            "singleBatch": true,
+            "$db": DB,
+        },
+    )?);
+    results.push(harness.bench_command(
         "count_empty_filter",
         args.profile.iterations,
         doc! {
@@ -172,8 +187,21 @@ fn run() -> Result<()> {
             "$db": DB,
         },
     )?);
+    results.push(harness.bench_command(
+        "count_partial_index_equality",
+        args.profile.iterations,
+        doc! {
+            "count": PARTIAL_COLL,
+            "query": {
+                "email": partial_target_email(args.profile.documents),
+                "active": true,
+            },
+            "$db": DB,
+        },
+    )?);
     results.push(harness.bench_update_index_refresh()?);
     results.push(harness.bench_update_compound_target()?);
+    results.push(harness.bench_update_partial_unique_check()?);
     results.push(harness.bench_command(
         "aggregation_match_count",
         args.profile.iterations,
@@ -303,6 +331,8 @@ impl Harness {
             })?;
         }
         self.seed_compound_target_collection()?;
+        self.seed_partial_collection()?;
+        self.seed_partial_unique_collection()?;
         Ok(())
     }
 
@@ -324,6 +354,66 @@ impl Harness {
                 .collect::<Vec<_>>();
             self.command(doc! {
                 "insert": COMPOUND_COLL,
+                "documents": documents,
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn seed_partial_collection(&mut self) -> Result<()> {
+        self.command(doc! {
+            "createIndexes": PARTIAL_COLL,
+            "indexes": [
+                {
+                    "key": { "email": 1_i32 },
+                    "name": "email_active_partial",
+                    "partialFilterExpression": { "active": true },
+                },
+            ],
+            "$db": DB,
+        })?;
+
+        for chunk_start in (0..self.profile.documents).step_by(self.profile.insert_batch) {
+            let chunk_end = (chunk_start + self.profile.insert_batch).min(self.profile.documents);
+            let documents = (chunk_start..chunk_end)
+                .map(seed_document)
+                .map(Bson::Document)
+                .collect::<Vec<_>>();
+            self.command(doc! {
+                "insert": PARTIAL_COLL,
+                "documents": documents,
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn seed_partial_unique_collection(&mut self) -> Result<()> {
+        self.command(doc! {
+            "createIndexes": PARTIAL_UNIQUE_COLL,
+            "indexes": [
+                {
+                    "key": { "email": 1_i32 },
+                    "name": "email_active_unique_partial",
+                    "unique": true,
+                    "partialFilterExpression": { "active": true },
+                },
+            ],
+            "$db": DB,
+        })?;
+
+        let document_count = compound_target_documents(self.profile);
+        for chunk_start in (0..document_count).step_by(self.profile.insert_batch) {
+            let chunk_end = (chunk_start + self.profile.insert_batch).min(document_count);
+            let documents = (chunk_start..chunk_end)
+                .map(seed_document)
+                .map(Bson::Document)
+                .collect::<Vec<_>>();
+            self.command(doc! {
+                "insert": PARTIAL_UNIQUE_COLL,
                 "documents": documents,
                 "ordered": true,
                 "$db": DB,
@@ -414,6 +504,41 @@ impl Harness {
         }
         Ok(BenchResult {
             name: "update_compound_target",
+            dataset_size: document_count,
+            iterations: self.profile.iterations,
+            elapsed: start.elapsed(),
+            operations: self.profile.iterations,
+        })
+    }
+
+    fn bench_update_partial_unique_check(&mut self) -> Result<BenchResult> {
+        let start = Instant::now();
+        let document_count = compound_target_documents(self.profile);
+        for i in 0..self.profile.iterations {
+            self.command(doc! {
+                "update": PARTIAL_UNIQUE_COLL,
+                "updates": [
+                    {
+                        "q": {
+                            "email": partial_target_email(document_count),
+                            "active": true,
+                        },
+                        "u": {
+                            "$set": {
+                                "active": true,
+                                "uniqueTouched": i as i32,
+                            },
+                        },
+                        "multi": false,
+                        "upsert": false,
+                    }
+                ],
+                "ordered": true,
+                "$db": DB,
+            })?;
+        }
+        Ok(BenchResult {
+            name: "update_partial_unique_check",
             dataset_size: document_count,
             iterations: self.profile.iterations,
             elapsed: start.elapsed(),
@@ -552,6 +677,18 @@ fn compound_target_team(documents: usize) -> &'static str {
         2 => "infra",
         _ => "data",
     }
+}
+
+fn partial_target_email(documents: usize) -> String {
+    let midpoint = documents / 2;
+    let index = if midpoint % 2 == 0 {
+        midpoint
+    } else if midpoint + 1 < documents {
+        midpoint + 1
+    } else {
+        midpoint.saturating_sub(1)
+    };
+    format!("user{}@example.test", index)
 }
 
 fn assert_ok(response: &Document, context: &str) -> Result<()> {
@@ -694,11 +831,14 @@ fn budget_threshold(profile: &str, benchmark: &str) -> BudgetThreshold {
         "find_id_equality" => (25.0, 40.0),
         "find_collection_scan" => (250.0, 4.0),
         "find_indexed_scalar_equality" => (80.0, 12.0),
+        "find_partial_index_equality" => (80.0, 12.0),
         "count_empty_filter" => (250.0, 4.0),
         "count_simple_equality" => (250.0, 4.0),
         "count_compound_equality" => (25.0, 40.0),
+        "count_partial_index_equality" => (25.0, 40.0),
         "update_index_refresh" => (150.0, 6.0),
         "update_compound_target" => (80.0, 12.0),
+        "update_partial_unique_check" => (80.0, 12.0),
         "aggregation_match_count" => (350.0, 3.0),
         "aggregation_unwind_group" => (600.0, 1.5),
         "find_compound_equality" => (80.0, 12.0),
