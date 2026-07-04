@@ -100,11 +100,13 @@ When a milestone is complete:
 4. Commit the code, tests, docs, and checklist/status update with a focused commit message.
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
-- [ ] Milestone 0: Update modifier architecture and path validation
+- [x] Milestone 0: Update modifier architecture and path validation
 - [ ] Milestone 1: Scalar modifiers and upsert-only behavior
 - [ ] Milestone 2: Array modifiers
 - [ ] Milestone 3: Invariant hardening across validation, indexes, and findAndModify
 - [ ] Milestone 4: PyMongo/spec corpus, README, and final verification
+
+Milestone 0 status, 2026-07-04: refactored modifier parsing into structured storage and centralized update path validation while keeping existing `$set`, `$unset`, and `$inc` behavior unchanged. Verification passed: `cargo fmt -- --check`; `cargo test update`; `cargo test find_and_modify`; `cargo test validation`; `cargo test`; `cargo build`. Commit hash reported after commit creation.
 
 ## Milestone 0: Update Modifier Architecture and Path Validation
 

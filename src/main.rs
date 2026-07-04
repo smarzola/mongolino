@@ -2936,11 +2936,42 @@ fn optional_bool_doc(document: &Document, key: &str) -> std::result::Result<Opti
 #[derive(Clone, Debug)]
 enum UpdateSpec {
     Replacement(Document),
-    Modifier {
-        set: Document,
-        unset: Document,
-        inc: Document,
-    },
+    Modifier(UpdateModifiers),
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpdateModifiers {
+    set: Document,
+    unset: Document,
+    inc: Document,
+    rename: Document,
+    min: Document,
+    max: Document,
+    mul: Document,
+    set_on_insert: Document,
+    push: Document,
+    add_to_set: Document,
+    pop: Document,
+    pull: Document,
+    pull_all: Document,
+}
+
+impl UpdateModifiers {
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+            && self.unset.is_empty()
+            && self.inc.is_empty()
+            && self.rename.is_empty()
+            && self.min.is_empty()
+            && self.max.is_empty()
+            && self.mul.is_empty()
+            && self.set_on_insert.is_empty()
+            && self.push.is_empty()
+            && self.add_to_set.is_empty()
+            && self.pop.is_empty()
+            && self.pull.is_empty()
+            && self.pull_all.is_empty()
+    }
 }
 
 fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String> {
@@ -2956,9 +2987,7 @@ fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String>
         return Ok(UpdateSpec::Replacement(update.clone()));
     }
 
-    let mut set = Document::new();
-    let mut unset = Document::new();
-    let mut inc = Document::new();
+    let mut modifiers = UpdateModifiers::default();
     let mut paths = Vec::new();
     for (operator, operand) in update {
         let Bson::Document(operand) = operand else {
@@ -2967,24 +2996,24 @@ fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String>
         match operator.as_str() {
             "$set" => {
                 append_update_paths(operator, operand, &mut paths)?;
-                set = operand.clone();
+                modifiers.set = operand.clone();
             }
             "$unset" => {
                 append_update_paths(operator, operand, &mut paths)?;
-                unset = operand.clone();
+                modifiers.unset = operand.clone();
             }
             "$inc" => {
                 append_update_paths(operator, operand, &mut paths)?;
-                inc = operand.clone();
+                modifiers.inc = operand.clone();
             }
             _ => return Err(format!("unsupported update operator {operator}")),
         }
     }
-    if paths.is_empty() {
+    if modifiers.is_empty() {
         return Err("modifier update must contain at least one path".to_string());
     }
     reject_path_collisions(&paths, "update")?;
-    Ok(UpdateSpec::Modifier { set, unset, inc })
+    Ok(UpdateSpec::Modifier(modifiers))
 }
 
 fn append_update_paths(
@@ -2993,13 +3022,29 @@ fn append_update_paths(
     paths: &mut Vec<String>,
 ) -> std::result::Result<(), String> {
     for key in document.keys() {
-        if key.is_empty() || key.starts_with('$') || key.split('.').any(|part| part.is_empty()) {
-            return Err(format!("{operator} contains unsupported path {key}"));
-        }
-        if key == "_id" || key.starts_with("_id.") {
-            return Err("update cannot change _id".to_string());
-        }
+        validate_update_path(operator, key)?;
         paths.push(key.to_string());
+    }
+    Ok(())
+}
+
+fn validate_update_path(operator: &str, path: &str) -> std::result::Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{operator} contains empty update path"));
+    }
+    if path.starts_with('$') {
+        return Err(format!("{operator} contains unsupported path {path}"));
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err(format!("{operator} contains unsupported path {path}"));
+        }
+        if segment.contains('$') {
+            return Err(format!("{operator} contains positional path {path}"));
+        }
+    }
+    if path == "_id" || path.starts_with("_id.") {
+        return Err("update cannot change _id".to_string());
     }
     Ok(())
 }
@@ -3022,15 +3067,15 @@ fn apply_update_to_document(
             }
             Ok(document)
         }
-        UpdateSpec::Modifier { set, unset, inc } => {
+        UpdateSpec::Modifier(modifiers) => {
             let mut document = original.clone();
-            for (path, value) in set {
+            for (path, value) in &modifiers.set {
                 set_update_path(&mut document, path, value.clone())?;
             }
-            for path in unset.keys() {
+            for path in modifiers.unset.keys() {
                 unset_update_path(&mut document, path)?;
             }
-            for (path, operand) in inc {
+            for (path, operand) in &modifiers.inc {
                 inc_update_path(&mut document, path, operand)?;
             }
             Ok(document)
@@ -3052,7 +3097,7 @@ fn build_upsert_document(
             }
             Ok(document)
         }
-        UpdateSpec::Modifier { .. } => {
+        UpdateSpec::Modifier(_) => {
             let mut document = equality_document_from_filter(query)?;
             document = apply_update_to_document(&document, update)?;
             Ok(document)
@@ -7601,6 +7646,31 @@ mod tests {
         assert_eq!(unordered.get_i32("nModified").unwrap(), 1);
         assert_eq!(write_errors(&unordered)[0].get_i32("index").unwrap(), 0);
         assert_eq!(find_ids(&conn, doc! { "name": "Changed" }), vec!["u2"]);
+    }
+
+    #[test]
+    fn update_modifier_path_validation_rejects_protected_and_positional_paths() {
+        for update in [
+            doc! { "$set": { "": 1_i32 } },
+            doc! { "$set": { ".name": 1_i32 } },
+            doc! { "$set": { "name.": 1_i32 } },
+            doc! { "$set": { "$name": 1_i32 } },
+            doc! { "$set": { "items.$.name": 1_i32 } },
+            doc! { "$set": { "_id": "changed" } },
+            doc! { "$set": { "_id.value": "changed" } },
+            doc! { "$set": { "profile": {}, "profile.city": "Rome" } },
+        ] {
+            assert!(classify_update(&update).is_err(), "{update:?}");
+        }
+
+        for update in [
+            doc! { "$rename": { "name": "displayName" } },
+            doc! { "$push": { "tags": "logic" } },
+            doc! { "$pull": { "tags": "logic" } },
+        ] {
+            let err = classify_update(&update).unwrap_err();
+            assert!(err.contains("unsupported update operator"), "{err}");
+        }
     }
 
     #[test]
