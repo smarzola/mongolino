@@ -5599,6 +5599,37 @@ fn ensure_unique_constraints_tx(
     Ok(())
 }
 
+fn ensure_unique_constraints_for_replacements_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    replacements: &[(String, Document)],
+) -> std::result::Result<(), String> {
+    if replacements.len() < 2 {
+        return Ok(());
+    }
+    let indexes = unique_indexes_for_namespace_tx(tx, namespace).map_err(|err| err.to_string())?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    for index in indexes {
+        let mut seen = HashMap::new();
+        for (id_key, document) in replacements {
+            if !document_belongs_to_index(&index, document)? {
+                continue;
+            }
+            let key = unique_key_for_document(&index, document)?;
+            if let Some(existing_id) = seen.insert(key.clone(), id_key.clone()) {
+                return Err(format!(
+                    "duplicate key error collection: {namespace} index: {} dup key: {key} existing _id: {existing_id}",
+                    index.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn unique_conflict_check_with_index_entries_tx(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
@@ -7336,7 +7367,7 @@ fn apply_update_entry(
     }
 
     let matched = matches.len() as i32;
-    let mut modified = 0_i32;
+    let mut replacements = Vec::new();
     for stored in matches {
         let new_document = apply_update_to_document(&stored.document, &update, query, &collation)?;
         let new_id_key = id_key(&new_document).map_err(|err| err.to_string())?;
@@ -7346,12 +7377,17 @@ fn apply_update_entry(
         if new_document != stored.document {
             validate_document_with_options(options, &new_document)?;
             ensure_unique_constraints_tx(tx, namespace, &new_document, Some(&stored.id_key))?;
-            update_stored_document_tx(tx, namespace, &stored.id_key, &new_document)
-                .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
-            refresh_index_entries_for_document_tx(tx, namespace, &stored.id_key, &new_document)
-                .map_err(|err| err.to_string())?;
-            modified += 1;
+            replacements.push((stored.id_key, new_document));
         }
+    }
+    ensure_unique_constraints_for_replacements_tx(tx, namespace, &replacements)?;
+
+    let modified = replacements.len() as i32;
+    for (id_key, new_document) in replacements {
+        update_stored_document_tx(tx, namespace, &id_key, &new_document)
+            .map_err(|err| duplicate_or_sql_error(namespace, &new_document, err))?;
+        refresh_index_entries_for_document_tx(tx, namespace, &id_key, &new_document)
+            .map_err(|err| err.to_string())?;
     }
 
     Ok(UpdateOutcome {
@@ -22171,6 +22207,154 @@ mod tests {
             .get_array("items")
             .unwrap(),
             stored.get_array("items").unwrap()
+        );
+    }
+
+    #[test]
+    fn pipeline_and_positional_invariants_preserve_documents_indexes_validation_and_ttl() {
+        let conn = test_conn();
+        create_collection(
+            &conn,
+            &doc! {
+                "create": "users",
+                "$db": "app",
+                "validator": { "$jsonSchema": { "bsonType": "object", "properties": { "score": { "bsonType": "int" } } } },
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "email": "a@example.test", "score": 4_i32, "den": 2_i32, "items": [{ "kind": "open", "tag": "old" }] },
+                    { "_id": "u2", "email": "b@example.test", "score": 6_i32, "den": 0_i32, "items": [{ "kind": "open", "tag": "old" }] },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1", "unique": true },
+                    { "key": { "items.tag": 1_i32 }, "name": "tag_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let runtime_error = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": {},
+                    "u": [{ "$set": { "ratio": { "$divide": ["$score", "$den"] } } }],
+                    "multi": true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&runtime_error)[0].get_i32("index").unwrap(), 0);
+        assert!(find_ids(&conn, doc! { "ratio": { "$exists": true } }).is_empty());
+
+        let validation_error = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u1" }, "u": [{ "$set": { "score": "bad" } }] }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_errors(&validation_error)[0].get_i32("code").unwrap(),
+            DOCUMENT_VALIDATION_ERROR_CODE
+        );
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+                )
+                .unwrap()
+            )[0]
+            .get_i32("score")
+            .unwrap(),
+            4
+        );
+
+        let duplicate = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "u2" }, "u": [{ "$set": { "email": "a@example.test" } }] }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&duplicate)[0].get_i32("code").unwrap(), 11000);
+        assert_eq!(
+            find_ids(&conn, doc! { "email": "b@example.test" }),
+            vec!["u2"]
+        );
+
+        let positional = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "u1" },
+                    "u": { "$set": { "items.$[open].tag": "fresh" } },
+                    "arrayFilters": [{ "open.kind": "open" }],
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(positional.get_i32("nModified").unwrap(), 1);
+        assert_eq!(find_ids(&conn, doc! { "items.tag": "fresh" }), vec!["u1"]);
+        assert!(find_ids(&conn, doc! { "items.tag": "old" }).contains(&"u2".to_string()));
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "events",
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "expiresAt": bson::DateTime::from_millis(1_700_000_000_000_i64), "name": "old" },
+                    { "_id": "live", "expiresAt": bson::DateTime::now(), "name": "new" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "events",
+                "$db": "app",
+                "indexes": [{ "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 0_i32 }],
+            },
+        )
+        .unwrap();
+        let invalid = update_documents(
+            &conn,
+            &doc! {
+                "update": "events",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "live" }, "u": [{ "$lookup": { "from": "other" } }] }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&invalid)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            documents_for_namespace(&conn, "app.events").unwrap().len(),
+            2
         );
     }
 

@@ -171,7 +171,7 @@ When a milestone is complete:
 - [x] Milestone 1: Update pipeline subset
 - [x] Milestone 2: Positional `$` and `$[]`
 - [x] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
-- [ ] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
+- [x] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
 - [ ] Milestone 5: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
 - [ ] Milestone 6: Final verification and handoff
 
@@ -227,6 +227,23 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Hardened matched update application to stage all replacement
+  documents before writing any target, added batch unique-index collision checks,
+  and covered runtime pipeline failure, validation failure, duplicate unique
+  results, positional index-entry freshness, and TTL no-sweep preflight errors.
+  Verification passed with `cargo fmt -- --check`, `cargo test
+  pipeline_and_positional_invariants`, `cargo test update`, `cargo test
+  find_and_modify`, `cargo test validation`, `cargo test unique`, `cargo test
+  ttl`, `cargo test collation`, `cargo build`, and `cargo test` (183 main tests
+  and 185 bench-target tests passed). Sandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py
+  tests/e2e/test_validation.py tests/e2e/test_indexes.py` failed before test
+  execution on localhost bind permission; the same command passed unsandboxed
+  with 82 tests passed. Commit hash pending at checkpoint commit time.
 
 Status:
 
