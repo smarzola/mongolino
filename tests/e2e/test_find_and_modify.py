@@ -46,6 +46,35 @@ def test_find_one_and_update_after_and_sorted_selection(collection):
     assert collection.find_one({"_id": "j1"})["state"] == "queued"
 
 
+def test_find_one_and_update_pipeline_subset(collection):
+    collection.insert_one(
+        {"_id": "u1", "first": "Ada", "last": "Lovelace", "score": 4, "extra": True}
+    )
+
+    result = collection.find_one_and_update(
+        {"_id": "u1"},
+        [
+            {
+                "$set": {
+                    "full": {"$concat": ["$first", " ", "$last"]},
+                    "doubleScore": {"$multiply": ["$score", 2]},
+                }
+            },
+            {"$project": {"_id": 1, "full": 1, "doubleScore": 1}},
+        ],
+        return_document=ReturnDocument.AFTER,
+    )
+
+    assert result == {"_id": "u1", "full": "Ada Lovelace", "doubleScore": 8}
+    with pytest.raises(OperationFailure):
+        collection.find_one_and_update(
+            {"_id": "u1"},
+            [{"$replaceWith": {"_id": "changed", "full": "$full"}}],
+            return_document=ReturnDocument.AFTER,
+        )
+    assert collection.find_one({"_id": "u1"})["_id"] == "u1"
+
+
 def test_find_and_modify_targets_and_sorts_with_collation(collection):
     collection.insert_many(
         [
@@ -473,9 +502,9 @@ def test_find_and_modify_adversarial_errors_are_explicit(collection):
             {
                 "findAndModify": collection.name,
                 "query": {},
-                "update": [{"$set": {"state": "bad"}}],
+                "update": [{"$lookup": {"from": "other"}}],
             },
-            "pipeline updates are not supported",
+            "not supported",
         ),
         (
             {

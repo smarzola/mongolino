@@ -21953,6 +21953,228 @@ mod tests {
     }
 
     #[test]
+    fn update_pipeline_subset_supports_update_find_and_modify_and_upsert() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "active": true, "first": "Ada", "last": "Lovelace", "score": 2_i32 },
+                    { "_id": "u2", "active": true, "first": "Grace", "last": "Hopper", "score": 3_i32 },
+                ],
+            },
+        )
+        .unwrap();
+
+        let updated = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "active": true },
+                    "u": [
+                        { "$set": {
+                            "full": { "$concat": ["$first", " ", "$last"] },
+                            "doubleScore": { "$multiply": ["$score", 2_i32] }
+                        } },
+                        { "$unset": "last" }
+                    ],
+                    "multi": true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.get_i32("n").unwrap(), 2);
+        assert_eq!(updated.get_i32("nModified").unwrap(), 2);
+        let ada = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(ada.get_str("full").unwrap(), "Ada Lovelace");
+        assert_eq!(ada.get_i64("doubleScore").unwrap(), 4);
+        assert!(!ada.contains_key("last"));
+
+        let modified = find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "users",
+                "$db": "app",
+                "query": { "_id": "u1" },
+                "update": [
+                    { "$project": { "_id": 1_i32, "full": 1_i32, "score": 1_i32 } },
+                    { "$set": { "projected": true } }
+                ],
+                "new": true,
+            },
+        )
+        .unwrap();
+        let value = modified.get_document("value").unwrap();
+        assert_eq!(value.get_str("full").unwrap(), "Ada Lovelace");
+        assert!(value.get_bool("projected").unwrap());
+        assert!(!value.contains_key("first"));
+
+        let upsert = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "u3", "first": "Katherine" },
+                    "u": [
+                        { "$set": { "full": { "$concat": ["$first", " Johnson"] }, "score": 5_i32 } }
+                    ],
+                    "upsert": true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(upsert.get_i32("nUpserted").unwrap(), 1);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "filter": { "_id": "u3" } },
+                )
+                .unwrap()
+            )[0]
+            .get_str("full")
+            .unwrap(),
+            "Katherine Johnson"
+        );
+
+        let bad = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "u2" },
+                    "u": [{ "$set": { "_id": "changed" } }],
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad)[0].get_i32("code").unwrap(), 2);
+        assert_eq!(find_ids(&conn, doc! { "_id": "u2" }), vec!["u2"]);
+    }
+
+    #[test]
+    fn positional_update_subset_supports_first_all_and_array_filters() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "orders",
+                "$db": "app",
+                "documents": [{
+                    "_id": "o1",
+                    "items": [
+                        { "kind": "open", "status": "new", "score": 1_i32 },
+                        { "kind": "closed", "status": "done", "score": 5_i32 },
+                        { "kind": "open", "status": "new", "score": 3_i32 }
+                    ]
+                }],
+            },
+        )
+        .unwrap();
+
+        let first = update_documents(
+            &conn,
+            &doc! {
+                "update": "orders",
+                "$db": "app",
+                "updates": [{
+                    "q": { "items.kind": "open" },
+                    "u": { "$set": { "items.$.status": "working" }, "$inc": { "items.$.score": 2_i32 } },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(first.get_i32("nModified").unwrap(), 1);
+
+        let all = update_documents(
+            &conn,
+            &doc! {
+                "update": "orders",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "o1" },
+                    "u": { "$mul": { "items.$[].score": 2_i32 } },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(all.get_i32("nModified").unwrap(), 1);
+
+        let filtered = update_documents(
+            &conn,
+            &doc! {
+                "update": "orders",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "o1" },
+                    "u": { "$set": { "items.$[open].status": "closed" }, "$max": { "items.$[open].score": 10_i32 } },
+                    "arrayFilters": [{ "open.kind": "open" }],
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.get_i32("nModified").unwrap(), 1);
+
+        let stored = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "orders", "$db": "app", "filter": { "_id": "o1" } },
+            )
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(
+            stored.get_array("items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "open", "status": "closed", "score": 10_i32 },
+                doc! { "kind": "closed", "status": "done", "score": 10_i32 },
+                doc! { "kind": "open", "status": "closed", "score": 10_i32 },
+            ])
+        );
+
+        let bad = update_documents(
+            &conn,
+            &doc! {
+                "update": "orders",
+                "$db": "app",
+                "updates": [{
+                    "q": { "_id": "o1" },
+                    "u": { "$inc": { "items.$[open].status": 1_i32 } },
+                    "arrayFilters": [{ "open.kind": "open" }],
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "orders", "$db": "app", "filter": { "_id": "o1" } },
+                )
+                .unwrap()
+            )[0]
+            .get_array("items")
+            .unwrap(),
+            stored.get_array("items").unwrap()
+        );
+    }
+
+    #[test]
     fn update_duplicate_key_upsert_returns_write_error_and_preserves_existing_document() {
         let conn = test_conn();
         seed_find_documents(&conn);

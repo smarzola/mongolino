@@ -69,6 +69,59 @@ def test_set_on_insert_only_applies_to_upsert_inserts(collection):
     assert doc["count"] == 0
 
 
+def test_update_pipeline_subset_update_many_upsert_and_errors(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "u1",
+                "active": True,
+                "first": "Ada",
+                "last": "Lovelace",
+                "score": 2,
+            },
+            {
+                "_id": "u2",
+                "active": True,
+                "first": "Grace",
+                "last": "Hopper",
+                "score": 3,
+            },
+        ]
+    )
+
+    result = collection.update_many(
+        {"active": True},
+        [
+            {
+                "$set": {
+                    "full": {"$concat": ["$first", " ", "$last"]},
+                    "doubleScore": {"$multiply": ["$score", 2]},
+                }
+            },
+            {"$unset": "last"},
+        ],
+    )
+    assert result.matched_count == 2
+    assert result.modified_count == 2
+    assert collection.find_one({"_id": "u1"})["full"] == "Ada Lovelace"
+    assert collection.find_one({"_id": "u2"})["doubleScore"] == 6
+    assert "last" not in collection.find_one({"_id": "u1"})
+
+    upsert = collection.update_one(
+        {"_id": "u3", "first": "Katherine"},
+        [{"$set": {"full": {"$concat": ["$first", " Johnson"]}, "score": 5}}],
+        upsert=True,
+    )
+    assert upsert.upserted_id == "u3"
+    assert collection.find_one({"_id": "u3"})["full"] == "Katherine Johnson"
+
+    with pytest.raises(WriteError):
+        collection.update_one({"_id": "u2"}, [{"$set": {"_id": "changed"}}])
+    with pytest.raises(WriteError):
+        collection.update_one({"_id": "u2"}, [{"$lookup": {"from": "x"}}])
+    assert collection.find_one({"_id": "u2"})["_id"] == "u2"
+
+
 def test_scalar_update_operators_find_one_and_update(collection):
     collection.insert_one(
         {"_id": "u1", "age": 37, "score": 7, "profile": {"city": "Rome"}}

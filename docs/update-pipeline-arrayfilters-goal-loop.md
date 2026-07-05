@@ -168,7 +168,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Update spec architecture and preflight model
-- [ ] Milestone 1: Update pipeline subset
+- [x] Milestone 1: Update pipeline subset
 - [ ] Milestone 2: Positional `$` and `$[]`
 - [ ] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
 - [ ] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
@@ -227,6 +227,21 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Implemented and covered the update pipeline subset for `update`
+  and `findAndModify`: `$set`/`$addFields`, `$unset`, `$project`,
+  `$replaceRoot`, and `$replaceWith`, with Aggregation v2 expressions, upsert
+  base-document synthesis, `_id` immutability, unsupported-stage errors, and
+  no-mutation-on-error tests. Verification passed with `cargo fmt -- --check`,
+  `cargo test update`, `cargo test find_and_modify`, `cargo test validation`,
+  `cargo test`, and `cargo build`. Sandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py`
+  failed before test execution on localhost bind permission; the same command
+  passed unsandboxed with 32 tests passed. Commit hash pending at checkpoint
+  commit time.
 
 Status:
 
