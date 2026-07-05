@@ -192,7 +192,7 @@ When a milestone is complete:
 - [x] Milestone 2: Transaction rejection and no-mutation preflight
 - [x] Milestone 3: Retryable write skeleton and replay cache
 - [x] Milestone 4: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
-- [ ] Milestone 5: Final verification and handoff
+- [x] Milestone 5: Final verification and handoff
 
 ## Milestone 0: Driver Workflow Parser And Session Validation
 
@@ -597,6 +597,32 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 Status:
+
+2026-07-05:
+
+- Final verification passed for the complete driver workflow uplift.
+- Milestone implementation/docs/e2e/spec commit: `17c2954`.
+- Exact commands and results:
+  - `cargo fmt -- --check` -> passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+  - `cargo build` -> passed with existing dead-code warnings for unused helper
+    functions.
+  - `cargo run --bin mongolino-bench -- --profile ci --check-budget` -> passed
+    for git commit `17c2954`; benchmark budget passed for profile `ci`.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check` -> passed.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev` ->
+    passed.
+  - Sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+    failed on localhost bind with `PermissionError: [Errno 1] Operation not
+    permitted` at `sock.bind(("127.0.0.1", 0))`.
+  - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e`
+    -> 221 passed in 115.73s.
+- Final scorecard movement: driver workflow semantics 3% -> 7%; total
+  compatibility 82% -> 86%.
+- Residual unsupported driver workflow semantics: causal consistency, snapshot
+  reads, unacknowledged writes, distributed durability, durable retryable write
+  history across reconnects/restarts, stored/expired session catalog semantics,
+  and multi-operation transactions.
 
 ## Final Response Requirements
 
