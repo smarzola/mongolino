@@ -530,6 +530,17 @@ Status:
   --locked pytest tests/e2e/test_aggregation.py` passed. Smoke benchmark
   `aggregation_unwind_group`: 25 iterations, 76.46 ms elapsed, 326.98 ops/sec,
   3.058 ms latency. Commit hash reported after checkpoint commit.
+- 2026-07-05 adversarial fix: Existing databases are protected by an
+  idempotent `unwind_group_side_table_backfill_v1` initialization migration
+  that rebuilds stored index metadata through the existing index rebuild path,
+  repopulating occurrence rows and unsupported-value omissions before the
+  planner can use the side-table fast path. Optimized row order now follows the
+  executor's `created_at, rowid` collection scan order with occurrence order as
+  the per-document tie-break. Regression coverage was added for legacy
+  backfill, repeated init idempotence, unsupported-value fallback, and order
+  alignment. Verification run: final `cargo fmt -- --check` passed; `cargo
+  test unwind_group` passed; `cargo test aggregate` passed; `cargo test index`
+  passed; `cargo test` passed. Benchmarks were not rerun.
 
 ## Final Response Requirements
 

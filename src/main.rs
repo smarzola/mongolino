@@ -16,6 +16,7 @@ const OP_MSG: i32 = 2013;
 const MAX_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 const DOCUMENT_VALIDATION_ERROR_CODE: i32 = 121;
 const RETRYABLE_WRITE_CACHE_LIMIT: usize = 128;
+const UNWIND_GROUP_SIDE_TABLE_BACKFILL_MIGRATION: &str = "unwind_group_side_table_backfill_v1";
 
 static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -248,6 +249,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     init_migration_schema(conn)?;
     init_document_schema(conn)?;
     ensure_index_metadata_columns(conn)?;
+    backfill_unwind_group_side_tables(conn)?;
     Ok(())
 }
 
@@ -426,6 +428,43 @@ fn migrate_collection_options_column(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations(name) VALUES (?1)",
         params!["collection_options_bson"],
     )?;
+    Ok(())
+}
+
+fn backfill_unwind_group_side_tables(conn: &Connection) -> Result<()> {
+    let already_applied = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?1)",
+        params![UNWIND_GROUP_SIDE_TABLE_BACKFILL_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if already_applied {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let already_applied = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = ?1)",
+        params![UNWIND_GROUP_SIDE_TABLE_BACKFILL_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !already_applied {
+        let namespaces = {
+            let mut stmt =
+                tx.prepare("SELECT DISTINCT namespace FROM indexes ORDER BY namespace")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for namespace in namespaces {
+            for spec in indexes_for_namespace_tx(&tx, &namespace)? {
+                rebuild_index_entries_tx(&tx, &namespace, &spec)?;
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name) VALUES (?1)",
+            params![UNWIND_GROUP_SIDE_TABLE_BACKFILL_MIGRATION],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1866,7 +1905,7 @@ fn optimized_unwind_group_count(
            AND d.id_key = e.id_key
          WHERE e.namespace = ?1
            AND e.index_name = ?2
-         ORDER BY d.rowid, e.occurrence
+         ORDER BY d.created_at, d.rowid, e.occurrence
         "#,
     )?;
     let mut rows = stmt.query(params![namespace, index_name])?;
@@ -8352,8 +8391,9 @@ fn stored_documents_for_namespace_tx(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
 ) -> Result<Vec<StoredDocument>> {
-    let mut stmt =
-        tx.prepare("SELECT id_key, bson FROM documents WHERE namespace = ?1 ORDER BY created_at")?;
+    let mut stmt = tx.prepare(
+        "SELECT id_key, bson FROM documents WHERE namespace = ?1 ORDER BY created_at, rowid",
+    )?;
     stmt.query_map(params![namespace], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?
@@ -12567,6 +12607,15 @@ mod tests {
         }
     }
 
+    fn unwind_group_omission_count(conn: &Connection, namespace: &str, index_name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM unwind_group_omissions WHERE namespace = ?1 AND index_name = ?2",
+            params![namespace, index_name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn assert_unwind_group_counts(conn: &Connection, collection: &str, expected: Vec<Document>) {
         let response = aggregate_command(
             conn,
@@ -12607,6 +12656,98 @@ mod tests {
         let mut bytes = Vec::new();
         document.to_writer(&mut bytes).unwrap();
         bytes
+    }
+
+    fn old_style_unwind_group_conn(documents: Vec<Document>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE collections (
+                namespace TEXT PRIMARY KEY,
+                db TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX idx_collections_db_name
+                ON collections(db, name);
+
+            CREATE TABLE indexes (
+                namespace TEXT NOT NULL,
+                name TEXT NOT NULL,
+                key_bson BLOB NOT NULL,
+                unique_index INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, name)
+            );
+
+            CREATE INDEX idx_indexes_namespace
+                ON indexes(namespace);
+
+            CREATE TABLE index_entries (
+                namespace TEXT NOT NULL,
+                index_name TEXT NOT NULL,
+                key_value TEXT NOT NULL,
+                id_key TEXT NOT NULL,
+                PRIMARY KEY (namespace, index_name, key_value, id_key)
+            );
+
+            CREATE INDEX idx_index_entries_lookup
+                ON index_entries(namespace, index_name, key_value);
+
+            CREATE TABLE index_multikey_omissions (
+                namespace TEXT NOT NULL,
+                index_name TEXT NOT NULL,
+                id_key TEXT NOT NULL,
+                PRIMARY KEY (namespace, index_name, id_key)
+            );
+
+            CREATE INDEX idx_index_multikey_omissions_lookup
+                ON index_multikey_omissions(namespace, index_name);
+
+            CREATE TABLE documents (
+                namespace TEXT NOT NULL,
+                id_key TEXT NOT NULL,
+                bson BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id_key)
+            );
+
+            CREATE INDEX idx_documents_namespace_created
+                ON documents(namespace, created_at);
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO collections(namespace, db, name) VALUES (?1, ?2, ?3)",
+            params!["app.items", "app", "items"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO indexes(namespace, name, key_bson, unique_index) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "app.items",
+                "tags_1",
+                bson_bytes(&doc! { "tags": 1_i32 }),
+                0_i32
+            ],
+        )
+        .unwrap();
+        for (index, document) in documents.into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO documents(namespace, id_key, bson, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![
+                    "app.items",
+                    id_key(&document).unwrap(),
+                    bson_bytes(&document),
+                    format!("2026-07-05T00:00:{index:02}"),
+                ],
+            )
+            .unwrap();
+        }
+        conn
     }
 
     fn assert_command_error(response: &Document) {
@@ -18404,6 +18545,166 @@ mod tests {
                 doc! { "_id": 1_i32, "n": 3_i64, "m": 3_i64 },
             ]
         );
+    }
+
+    #[test]
+    fn init_connection_backfills_unwind_group_rows_for_existing_indexes() {
+        let conn = old_style_unwind_group_conn(vec![
+            doc! { "_id": "a", "tags": ["red", "red"] },
+            doc! { "_id": "b", "tags": "blue" },
+            doc! { "_id": "c", "tags": [] },
+            doc! { "_id": "d", "tags": Bson::Null },
+            doc! { "_id": "e" },
+        ]);
+
+        init_connection(&conn).unwrap();
+
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            3
+        );
+        assert_eq!(unwind_group_omission_count(&conn, "app.items", "tags_1"), 0);
+        assert_unwind_group_counts(
+            &conn,
+            "items",
+            vec![
+                doc! { "_id": "red", "n": 2_i64 },
+                doc! { "_id": "blue", "n": 1_i64 },
+            ],
+        );
+    }
+
+    #[test]
+    fn init_connection_unwind_group_backfill_is_idempotent() {
+        let conn = old_style_unwind_group_conn(vec![
+            doc! { "_id": "a", "tags": ["red", "blue"] },
+            doc! { "_id": "b", "tags": "blue" },
+        ]);
+
+        init_connection(&conn).unwrap();
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            3
+        );
+        init_connection(&conn).unwrap();
+
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            3
+        );
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                params![UNWIND_GROUP_SIDE_TABLE_BACKFILL_MIGRATION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 1);
+    }
+
+    #[test]
+    fn init_connection_backfill_records_unsupported_unwind_group_omissions() {
+        let conn = old_style_unwind_group_conn(vec![
+            doc! { "_id": "a", "tags": ["red"] },
+            doc! { "_id": "b", "tags": [{ "nested": true }] },
+            doc! { "_id": "c", "tags": ["blue", { "x": 1_i32 }] },
+        ]);
+
+        init_connection(&conn).unwrap();
+
+        assert_eq!(unwind_group_omission_count(&conn, "app.items", "tags_1"), 2);
+        assert!(!unwind_group_entries_safe_for_planner(&conn, "app.items", "tags_1").unwrap());
+        assert_unwind_group_counts(
+            &conn,
+            "items",
+            vec![
+                doc! { "_id": "red", "n": 1_i64 },
+                doc! { "_id": { "nested": true }, "n": 1_i64 },
+                doc! { "_id": "blue", "n": 1_i64 },
+                doc! { "_id": { "x": 1_i32 }, "n": 1_i64 },
+            ],
+        );
+    }
+
+    #[test]
+    fn aggregate_unwind_group_optimized_order_matches_executor_scan_order() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "late", "tags": ["late", "shared"] },
+                    { "_id": "early", "tags": ["early"] },
+                    { "_id": "middle", "tags": ["shared", "middle"] },
+                ],
+            },
+        )
+        .unwrap();
+        for (id, created_at) in [
+            ("early", "2026-07-05T00:00:01"),
+            ("middle", "2026-07-05T00:00:02"),
+            ("late", "2026-07-05T00:00:03"),
+        ] {
+            conn.execute(
+                "UPDATE documents SET created_at = ?1 WHERE namespace = ?2 AND id_key = ?3",
+                params![
+                    created_at,
+                    "app.items",
+                    id_key_from_bson(&Bson::String(id.to_string())),
+                ],
+            )
+            .unwrap();
+        }
+
+        let fallback = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&fallback),
+            vec![
+                doc! { "_id": "early", "n": 1_i64 },
+                doc! { "_id": "shared", "n": 2_i64 },
+                doc! { "_id": "middle", "n": 1_i64 },
+                doc! { "_id": "late", "n": 1_i64 },
+            ],
+        );
+
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "items",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        let optimized = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first_batch(&optimized), first_batch(&fallback));
     }
 
     #[test]

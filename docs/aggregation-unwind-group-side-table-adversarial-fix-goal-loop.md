@@ -100,7 +100,7 @@ When complete:
 
 ## Milestone Checklist
 
-- [ ] Fix side-table initialization/backfill and optimized ordering
+- [x] Fix side-table initialization/backfill and optimized ordering
 
 ## Milestone: Fix Side-Table Initialization/Backfill And Ordering
 
@@ -128,3 +128,23 @@ Final response requirements:
 - exact commands run and pass/fail;
 - summary of how existing databases are protected;
 - residual risks.
+
+Status:
+
+- 2026-07-05: Added an idempotent
+  `unwind_group_side_table_backfill_v1` schema migration that runs during
+  `init_connection` after index metadata migrations and rebuilds existing
+  index entries through the same rebuild path used by normal index creation,
+  which also repopulates `unwind_group_entries` and
+  `unwind_group_omissions`. The optimized aggregate query now orders
+  occurrence rows by `documents.created_at`, `documents.rowid`, and occurrence;
+  the Rust collection scan helper now uses the same deterministic
+  `created_at, rowid` tie-break. Added regressions for legacy databases with
+  pre-existing indexes but no side-table rows, repeated initialization
+  idempotence, unsupported legacy values creating omissions and forcing
+  fallback, and optimized order alignment with the Rust executor. Verification
+  run: initial `cargo fmt -- --check` failed only on formatting before
+  `cargo fmt`; final `cargo fmt -- --check` passed; `cargo test unwind_group`
+  passed; `cargo test aggregate` passed; `cargo test index` passed; `cargo
+  test` passed. Benchmarks were not rerun, so `docs/performance-baseline.md`
+  was unchanged. Commit hash reported after checkpoint commit.
