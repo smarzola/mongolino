@@ -475,6 +475,28 @@ not imply lookup has SQLite pushdown or indexed join planning. Future
 performance work can consider lookup-side candidate narrowing with maintained
 indexes once compatibility semantics have stabilized.
 
+## First-Stage Aggregation Match Candidate Narrowing
+
+Recorded on 2026-07-05 from a dirty working tree based on commit `db507d8`
+after adding first-stage aggregation `$match` candidate narrowing. Command:
+
+```bash
+cargo run --bin mongolino-bench -- --profile smoke --check-budget
+```
+
+Target aggregation rows:
+
+| Benchmark | Dataset | Iters | Elapsed ms | Ops/sec | Latency ms/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| aggregation_match_count | 400 | 25 | 2.20 | 11340.44 | 0.088 |
+| aggregation_expression_add_fields | 400 | 25 | 62.01 | 403.17 | 2.480 |
+| aggregation_lookup_single_document | 400 | 25 | 137.67 | 181.59 | 5.507 |
+
+- General aggregation pipelines whose first stage is a safe `$match` now reuse
+  shared candidate narrowing before the Rust matcher and downstream stages run.
+- The exact `$match` plus `$count` count-pushdown path remains separate.
+- Unsafe filters still fall back to full namespace loading and Rust matching.
+
 ## Scalar Multikey Index Uplift Results
 
 Recorded on 2026-07-04 after scalar multikey index entry maintenance and

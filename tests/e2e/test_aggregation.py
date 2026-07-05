@@ -48,6 +48,55 @@ def test_aggregate_match_sort_project(collection):
     ]
 
 
+def test_aggregate_first_match_indexed_and_id_candidates(collection):
+    collection.insert_many(
+        [
+            {"_id": "p1", "team": "red", "score": 7, "email": "ada@example.test"},
+            {"_id": "p2", "team": "blue", "score": 5, "email": "grace@example.test"},
+            {"_id": "p3", "team": "red", "score": 11, "email": "kat@example.test"},
+        ]
+    )
+    collection.create_index("team", name="team_1")
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"team": "red"}},
+                {"$addFields": {"label": {"$concat": ["$team", ":", "$email"]}}},
+                {"$sort": {"score": -1}},
+                {"$project": {"_id": 1, "label": 1}},
+            ]
+        )
+    ) == [
+        {"_id": "p3", "label": "red:kat@example.test"},
+        {"_id": "p1", "label": "red:ada@example.test"},
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$match": {"_id": "p2"}},
+                {
+                    "$lookup": {
+                        "from": collection.name,
+                        "localField": "team",
+                        "foreignField": "team",
+                        "as": "sameTeam",
+                    }
+                },
+                {"$project": {"_id": 1, "sameTeam": 1}},
+            ]
+        )
+    ) == [
+        {
+            "_id": "p2",
+            "sameTeam": [
+                {"_id": "p2", "team": "blue", "score": 5, "email": "grace@example.test"}
+            ],
+        }
+    ]
+
+
 def test_aggregate_computed_project_add_set_and_unset(collection):
     collection.insert_many(
         [

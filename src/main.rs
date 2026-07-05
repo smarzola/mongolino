@@ -1710,7 +1710,7 @@ fn aggregate_pipeline_documents(
     pipeline: &[Bson],
     collation: &Collation,
 ) -> Result<std::result::Result<Vec<Document>, Document>> {
-    let mut documents = documents_for_namespace(conn, namespace)?;
+    let mut documents = aggregate_initial_documents(conn, namespace, pipeline, collation)?;
 
     for stage in pipeline {
         let Bson::Document(stage) = stage else {
@@ -1890,6 +1890,35 @@ fn aggregate_pipeline_documents(
     }
 
     Ok(Ok(documents))
+}
+
+fn aggregate_initial_documents(
+    conn: &Connection,
+    namespace: &str,
+    pipeline: &[Bson],
+    collation: &Collation,
+) -> Result<Vec<Document>> {
+    if let Some(filter) = first_stage_match_filter(pipeline) {
+        return candidate_documents(conn, namespace, filter, collation);
+    }
+    documents_for_namespace(conn, namespace)
+}
+
+fn first_stage_match_filter(pipeline: &[Bson]) -> Option<&Document> {
+    let Bson::Document(stage) = pipeline.first()? else {
+        return None;
+    };
+    if stage.len() != 1 {
+        return None;
+    }
+    let (operator, operand) = stage.iter().next()?;
+    if operator != "$match" {
+        return None;
+    }
+    let Bson::Document(filter) = operand else {
+        return None;
+    };
+    Some(filter)
 }
 
 fn validate_aggregate_pipeline_shape(pipeline: &[Bson]) -> std::result::Result<(), Document> {
@@ -10542,6 +10571,15 @@ fn indexed_candidate_documents_with_collation(
     filter: &Document,
     collation: &Collation,
 ) -> Result<Option<Vec<Document>>> {
+    if let Some(value) = exact_equality_filter_value(filter, "_id")
+        && id_equality_safe_for_collation(value, collation)
+    {
+        return Ok(Some(
+            stored_document_by_id_key(conn, namespace, &id_key_from_bson(value))?
+                .into_iter()
+                .collect(),
+        ));
+    }
     for index in planner_indexes(indexes_for_namespace(conn, namespace)?) {
         if index.collation != *collation {
             continue;
@@ -16054,6 +16092,138 @@ mod tests {
             .unwrap();
             assert_eq!(first_batch(&response), vec![doc! { "total": 3_i64 }]);
         }
+    }
+
+    #[test]
+    fn aggregation_first_match_initial_source_uses_id_and_index_candidates() {
+        let conn = test_conn();
+        seed_find_documents(&conn);
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "users",
+                "$db": "app",
+                "indexes": [{ "key": { "active": 1_i32 }, "name": "active_1" }],
+            },
+        )
+        .unwrap();
+
+        let id_pipeline = vec![
+            Bson::Document(doc! { "$match": { "_id": "u2" } }),
+            Bson::Document(doc! { "$project": { "_id": 1_i32 } }),
+        ];
+        let id_candidates =
+            aggregate_initial_documents(&conn, "app.users", &id_pipeline, &Collation::Simple)
+                .unwrap();
+        assert_eq!(
+            id_candidates
+                .iter()
+                .map(|document| document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u2"]
+        );
+
+        let indexed_pipeline = vec![
+            Bson::Document(doc! { "$match": { "active": true } }),
+            Bson::Document(doc! { "$addFields": { "selected": true } }),
+        ];
+        let indexed_candidates =
+            aggregate_initial_documents(&conn, "app.users", &indexed_pipeline, &Collation::Simple)
+                .unwrap();
+        assert_eq!(
+            indexed_candidates
+                .iter()
+                .map(|document| document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u3"]
+        );
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "active": true } },
+                    { "$addFields": { "selected": "$active" } },
+                    { "$project": { "_id": 1_i32, "selected": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! { "_id": "u1", "selected": true },
+                doc! { "_id": "u3", "selected": true },
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregation_first_match_initial_source_falls_back_for_unsafe_filters() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "numbers",
+                "$db": "app",
+                "documents": [
+                    { "_id": "i32", "n": 1_i32 },
+                    { "_id": "i64", "n": 1_i64 },
+                    { "_id": "double", "n": 1.0 },
+                    { "_id": "other", "n": 2_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "numbers",
+                "$db": "app",
+                "indexes": [{ "key": { "n": 1_i32 }, "name": "n_1" }],
+            },
+        )
+        .unwrap();
+
+        let pipeline = vec![
+            Bson::Document(doc! { "$match": { "n": 1_i32 } }),
+            Bson::Document(doc! { "$addFields": { "matched": true } }),
+        ];
+        let candidates =
+            aggregate_initial_documents(&conn, "app.numbers", &pipeline, &Collation::Simple)
+                .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|document| document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["i32", "i64", "double", "other"]
+        );
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "numbers",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "n": 1_i32 } },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! { "_id": "i32" },
+                doc! { "_id": "i64" },
+                doc! { "_id": "double" },
+            ]
+        );
     }
 
     #[test]
