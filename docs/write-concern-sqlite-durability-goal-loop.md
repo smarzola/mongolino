@@ -130,7 +130,7 @@ normal-vs-journaled benchmark method. Verification run:
 `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py`.
 The first sandboxed PyMongo e2e attempt failed because the sandbox could not
 bind `127.0.0.1`; the same command passed outside the sandbox. Commit hash:
-pending final local commit.
+`eeb4549`.
 
 ## Milestone 0: Design The Local Durability Contract
 
@@ -160,7 +160,7 @@ cargo test write_concern
 ```
 
 Status 2026-07-05: Done. `cargo test write_concern` passed. Commit hash:
-pending final local commit.
+`eeb4549`.
 
 ## Milestone 1: Carry WriteConcern Durability Through Workflow Parsing
 
@@ -195,8 +195,7 @@ cargo test driver_workflow
 ```
 
 Status 2026-07-05: Done. `cargo fmt -- --check`, `cargo test write_concern`,
-and `cargo test driver_workflow` passed. Commit hash: pending final local
-commit.
+and `cargo test driver_workflow` passed. Commit hash: `eeb4549`.
 
 ## Milestone 2: Apply And Restore SQLite Synchronous Mode Around Writes
 
@@ -240,7 +239,7 @@ cargo test invalid_driver_workflow_options_do_not_mutate_or_sweep_ttl
 Status 2026-07-05: Done. `cargo fmt -- --check`, `cargo test synchronous`,
 `cargo test write_concern`, and the driver-workflow test containing
 `invalid_driver_workflow_options_do_not_mutate_or_sweep_ttl` passed. Commit
-hash: pending final local commit.
+hash: `eeb4549`.
 
 ## Milestone 3: Tests, Docs, And Targeted Verification
 
@@ -271,8 +270,7 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/te
 Status 2026-07-05: Done. `cargo fmt -- --check`, `cargo test`, and
 `cargo build` passed. The PyMongo driver workflow command first failed in the
 sandbox with `PermissionError: [Errno 1] Operation not permitted` while binding
-`127.0.0.1`, then passed outside the sandbox. Commit hash: pending final local
-commit.
+`127.0.0.1`, then passed outside the sandbox. Commit hash: `eeb4549`.
 
 ## Final Response Requirements
 
