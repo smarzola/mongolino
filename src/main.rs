@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use bson::{Bson, Document, doc, oid::ObjectId};
 use regex::RegexBuilder;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -2469,7 +2469,7 @@ fn apply_aggregate_lookup_stage(
 ) -> Result<std::result::Result<Vec<Document>, Document>> {
     let foreign_namespace = namespace(db, &spec.from);
     sweep_ttl_namespace(conn, &foreign_namespace)?;
-    let foreign_documents = documents_for_namespace(conn, &foreign_namespace)?;
+    let mut full_foreign_documents = None::<Vec<Document>>;
     let mut out = Vec::with_capacity(documents.len());
 
     for mut document in documents {
@@ -2480,8 +2480,29 @@ fn apply_aggregate_lookup_stage(
             )));
         }
         let local_values = lookup_values_at_path(&document, &spec.local_field);
+        let candidate_documents = match lookup_foreign_candidate_documents(
+            conn,
+            &foreign_namespace,
+            spec,
+            &document,
+            &local_values,
+            collation,
+        )? {
+            Some(documents) => LookupCandidateDocuments::Owned(documents),
+            None => {
+                if full_foreign_documents.is_none() {
+                    full_foreign_documents =
+                        Some(documents_for_namespace(conn, &foreign_namespace)?);
+                }
+                LookupCandidateDocuments::Borrowed(
+                    full_foreign_documents
+                        .as_deref()
+                        .expect("foreign documents loaded above"),
+                )
+            }
+        };
         let mut matches = Vec::new();
-        for foreign in &foreign_documents {
+        for foreign in candidate_documents.as_slice() {
             let foreign_values = lookup_values_at_path(foreign, &spec.foreign_field);
             if lookup_values_match(&local_values, &foreign_values, collation) {
                 matches.push(Bson::Document(foreign.clone()));
@@ -2492,6 +2513,166 @@ fn apply_aggregate_lookup_stage(
     }
 
     Ok(Ok(out))
+}
+
+enum LookupCandidateDocuments<'a> {
+    Borrowed(&'a [Document]),
+    Owned(Vec<Document>),
+}
+
+impl<'a> LookupCandidateDocuments<'a> {
+    fn as_slice(&'a self) -> &'a [Document] {
+        match self {
+            Self::Borrowed(documents) => documents,
+            Self::Owned(documents) => documents,
+        }
+    }
+}
+
+fn lookup_foreign_candidate_documents(
+    conn: &Connection,
+    foreign_namespace: &str,
+    spec: &AggregateLookupSpec,
+    local_document: &Document,
+    local_values: &[Bson],
+    collation: &Collation,
+) -> Result<Option<Vec<Document>>> {
+    if !lookup_local_values_safe_for_narrowing(local_document, &spec.local_field, local_values) {
+        return Ok(None);
+    }
+
+    if spec.foreign_field == "_id" {
+        if local_values
+            .iter()
+            .all(|value| id_equality_safe_for_collation(value, collation))
+        {
+            let id_keys = dedup_lookup_keys(
+                local_values
+                    .iter()
+                    .map(id_key_from_bson)
+                    .collect::<Vec<_>>(),
+            );
+            return lookup_documents_by_id_keys_ordered(conn, foreign_namespace, &id_keys)
+                .map(Some);
+        }
+        return Ok(None);
+    }
+
+    for index in planner_indexes(indexes_for_namespace(conn, foreign_namespace)?) {
+        if index.collation != *collation
+            || single_field_index_name(&index) != Some(spec.foreign_field.as_str())
+        {
+            continue;
+        }
+        if !index_entries_safe_for_planner(conn, foreign_namespace, &index.name)? {
+            continue;
+        }
+        if !local_values
+            .iter()
+            .all(|value| lookup_value_implies_index_membership(&index, &spec.foreign_field, value))
+        {
+            continue;
+        }
+        let key_values = dedup_lookup_keys(
+            local_values
+                .iter()
+                .map(|value| index.collation.id_key_from_bson(value))
+                .collect::<Vec<_>>(),
+        );
+        return lookup_documents_by_index_keys_ordered(
+            conn,
+            foreign_namespace,
+            &index.name,
+            &key_values,
+        )
+        .map(Some);
+    }
+
+    Ok(None)
+}
+
+fn lookup_local_values_safe_for_narrowing(
+    local_document: &Document,
+    local_field: &str,
+    local_values: &[Bson],
+) -> bool {
+    !indexed_path_contains_array(local_document, local_field)
+        && !local_values.is_empty()
+        && local_values.iter().all(lookup_value_safe_for_narrowing)
+}
+
+fn lookup_value_safe_for_narrowing(value: &Bson) -> bool {
+    numeric_value(value).is_none() && is_compound_planner_scalar(value)
+}
+
+fn lookup_value_implies_index_membership(
+    index: &IndexSpec,
+    foreign_field: &str,
+    value: &Bson,
+) -> bool {
+    let mut filter = Document::new();
+    filter.insert(foreign_field, value.clone());
+    filter_implies_index_membership(index, &filter)
+}
+
+fn dedup_lookup_keys(keys: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for key in keys {
+        if seen.insert(key.clone()) {
+            deduped.push(key);
+        }
+    }
+    deduped
+}
+
+fn lookup_documents_by_id_keys_ordered(
+    conn: &Connection,
+    namespace: &str,
+    id_keys: &[String],
+) -> Result<Vec<Document>> {
+    if id_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; id_keys.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT bson FROM documents WHERE namespace = ? AND id_key IN ({placeholders}) ORDER BY created_at"
+    ))?;
+    let params = std::iter::once(namespace).chain(id_keys.iter().map(String::as_str));
+    stmt.query_map(params_from_iter(params), |row| row.get::<_, Vec<u8>>(0))?
+        .map(|row| decode_document(row?))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn lookup_documents_by_index_keys_ordered(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    key_values: &[String],
+) -> Result<Vec<Document>> {
+    if key_values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; key_values.len()].join(", ");
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        SELECT DISTINCT d.id_key, d.bson, d.created_at
+          FROM index_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?
+           AND e.index_name = ?
+           AND e.key_value IN ({placeholders})
+         ORDER BY d.created_at
+        "#
+    ))?;
+    let params = std::iter::once(namespace)
+        .chain(std::iter::once(index_name))
+        .chain(key_values.iter().map(String::as_str));
+    stmt.query_map(params_from_iter(params), |row| row.get::<_, Vec<u8>>(1))?
+        .map(|row| decode_document(row?))
+        .collect::<Result<Vec<_>>>()
 }
 
 fn lookup_values_at_path(document: &Document, path: &str) -> Vec<Bson> {
@@ -17036,6 +17217,391 @@ mod tests {
             vec![
                 doc! { "_id": "o1", "self": [{ "_id": "o1", "profileId": "p1", "profileIds": ["p2", "missing"], "owner": "ADA" }] }
             ]
+        );
+    }
+
+    #[test]
+    fn aggregate_lookup_candidate_planner_narrows_safe_id_and_indexed_scalars() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_plan_profiles",
+                "$db": "app",
+                "documents": [
+                    { "_id": "p1", "email": "other@example.test", "owner": "ADA" },
+                    { "_id": "p2", "email": "target@example.test", "owner": "ada" },
+                    { "_id": "p3", "email": "target@example.test", "owner": "ADA" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "lookup_plan_profiles",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1" },
+                    {
+                        "key": { "owner": 1_i32 },
+                        "name": "owner_ci",
+                        "collation": { "locale": "en", "strength": 2_i32 },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let id_spec = AggregateLookupSpec {
+            from: "lookup_plan_profiles".to_string(),
+            local_field: "profileId".to_string(),
+            foreign_field: "_id".to_string(),
+            as_field: "profile".to_string(),
+        };
+        let id_source = doc! { "profileId": "p2" };
+        let id_values = lookup_values_at_path(&id_source, "profileId");
+        let id_candidates = lookup_foreign_candidate_documents(
+            &conn,
+            "app.lookup_plan_profiles",
+            &id_spec,
+            &id_source,
+            &id_values,
+            &Collation::Simple,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            id_candidates
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["p2"]
+        );
+
+        let indexed_spec = AggregateLookupSpec {
+            from: "lookup_plan_profiles".to_string(),
+            local_field: "email".to_string(),
+            foreign_field: "email".to_string(),
+            as_field: "profiles".to_string(),
+        };
+        let indexed_source = doc! { "email": "target@example.test" };
+        let indexed_values = lookup_values_at_path(&indexed_source, "email");
+        let indexed_candidates = lookup_foreign_candidate_documents(
+            &conn,
+            "app.lookup_plan_profiles",
+            &indexed_spec,
+            &indexed_source,
+            &indexed_values,
+            &Collation::Simple,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            indexed_candidates
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["p2", "p3"]
+        );
+
+        let collation_spec = AggregateLookupSpec {
+            from: "lookup_plan_profiles".to_string(),
+            local_field: "owner".to_string(),
+            foreign_field: "owner".to_string(),
+            as_field: "owners".to_string(),
+        };
+        let collation_source = doc! { "owner": "ada" };
+        let collation_values = lookup_values_at_path(&collation_source, "owner");
+        let collation_candidates = lookup_foreign_candidate_documents(
+            &conn,
+            "app.lookup_plan_profiles",
+            &collation_spec,
+            &collation_source,
+            &collation_values,
+            &Collation::EnglishCaseInsensitive,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            collation_candidates
+                .iter()
+                .map(|doc| doc.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2", "p3"]
+        );
+    }
+
+    #[test]
+    fn aggregate_lookup_candidate_planner_falls_back_for_semantic_risks() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_fallback_profiles",
+                "$db": "app",
+                "documents": [
+                    { "_id": "ADA", "email": "ada@example.test", "scores": [1_i32, { "bad": true }] },
+                    { "_id": "ada", "email": "other@example.test" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "lookup_fallback_profiles",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "email": 1_i32 }, "name": "email_1" },
+                    { "key": { "scores": 1_i32 }, "name": "scores_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let id_spec = AggregateLookupSpec {
+            from: "lookup_fallback_profiles".to_string(),
+            local_field: "value".to_string(),
+            foreign_field: "_id".to_string(),
+            as_field: "matches".to_string(),
+        };
+        for (source, collation) in [
+            (doc! {}, Collation::Simple),
+            (doc! { "value": Bson::Null }, Collation::Simple),
+            (doc! { "value": ["ADA", "ada"] }, Collation::Simple),
+            (doc! { "value": 1_i32 }, Collation::Simple),
+            (doc! { "value": "ada" }, Collation::EnglishCaseInsensitive),
+        ] {
+            let values = lookup_values_at_path(&source, "value");
+            assert!(
+                lookup_foreign_candidate_documents(
+                    &conn,
+                    "app.lookup_fallback_profiles",
+                    &id_spec,
+                    &source,
+                    &values,
+                    &collation,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        let unindexed_spec = AggregateLookupSpec {
+            from: "lookup_fallback_profiles".to_string(),
+            local_field: "owner".to_string(),
+            foreign_field: "owner".to_string(),
+            as_field: "owners".to_string(),
+        };
+        let owner_source = doc! { "owner": "ada" };
+        let owner_values = lookup_values_at_path(&owner_source, "owner");
+        assert!(
+            lookup_foreign_candidate_documents(
+                &conn,
+                "app.lookup_fallback_profiles",
+                &unindexed_spec,
+                &owner_source,
+                &owner_values,
+                &Collation::Simple,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let incompatible_collation_spec = AggregateLookupSpec {
+            from: "lookup_fallback_profiles".to_string(),
+            local_field: "email".to_string(),
+            foreign_field: "email".to_string(),
+            as_field: "emails".to_string(),
+        };
+        let email_source = doc! { "email": "ada@example.test" };
+        let email_values = lookup_values_at_path(&email_source, "email");
+        assert!(
+            lookup_foreign_candidate_documents(
+                &conn,
+                "app.lookup_fallback_profiles",
+                &incompatible_collation_spec,
+                &email_source,
+                &email_values,
+                &Collation::EnglishCaseInsensitive,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let unsafe_multikey_spec = AggregateLookupSpec {
+            from: "lookup_fallback_profiles".to_string(),
+            local_field: "score".to_string(),
+            foreign_field: "scores".to_string(),
+            as_field: "scores".to_string(),
+        };
+        let score_source = doc! { "score": "bad" };
+        let score_values = lookup_values_at_path(&score_source, "score");
+        assert!(
+            lookup_foreign_candidate_documents(
+                &conn,
+                "app.lookup_fallback_profiles",
+                &unsafe_multikey_spec,
+                &score_source,
+                &score_values,
+                &Collation::Simple,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn aggregate_lookup_candidate_narrowing_preserves_order_dedup_and_fallback_semantics() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_orders_pushdown",
+                "$db": "app",
+                "documents": [
+                    { "_id": "o1", "email": "target@example.test" },
+                    { "_id": "o2", "email": "none@example.test", "number": 1_i32 },
+                    { "_id": "o3", "email": "none@example.test", "owner": "ada" },
+                    { "_id": "o4", "email": "none@example.test", "profileIds": ["p2", "p2"] },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "lookup_profiles_pushdown",
+                "$db": "app",
+                "documents": [
+                    { "_id": "p1", "email": "other@example.test" },
+                    { "_id": "p2", "email": "target@example.test" },
+                    { "_id": "p3", "email": "target@example.test" },
+                    { "_id": 1_i32, "kind": "i32" },
+                    { "_id": 1_i64, "kind": "i64" },
+                    { "_id": 1.0, "kind": "double" },
+                    { "_id": "ADA", "kind": "upper" },
+                    { "_id": "ada", "kind": "lower" },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "lookup_profiles_pushdown",
+                "$db": "app",
+                "indexes": [{ "key": { "email": 1_i32 }, "name": "email_1" }],
+            },
+        )
+        .unwrap();
+
+        let simple = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "lookup_orders_pushdown",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "lookup_profiles_pushdown",
+                            "localField": "email",
+                            "foreignField": "email",
+                            "as": "emailMatches",
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "lookup_profiles_pushdown",
+                            "localField": "number",
+                            "foreignField": "_id",
+                            "as": "numericMatches",
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "lookup_profiles_pushdown",
+                            "localField": "profileIds",
+                            "foreignField": "_id",
+                            "as": "arrayMatches",
+                        }
+                    },
+                    { "$sort": { "_id": 1_i32 } },
+                    { "$project": { "_id": 1_i32, "emailMatches": 1_i32, "numericMatches": 1_i32, "arrayMatches": 1_i32 } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&simple),
+            vec![
+                doc! {
+                    "_id": "o1",
+                    "emailMatches": [
+                        { "_id": "p2", "email": "target@example.test" },
+                        { "_id": "p3", "email": "target@example.test" },
+                    ],
+                    "numericMatches": [],
+                    "arrayMatches": [],
+                },
+                doc! {
+                    "_id": "o2",
+                    "emailMatches": [],
+                    "numericMatches": [
+                        { "_id": 1_i32, "kind": "i32" },
+                        { "_id": 1_i64, "kind": "i64" },
+                        { "_id": 1.0, "kind": "double" },
+                    ],
+                    "arrayMatches": [],
+                },
+                doc! {
+                    "_id": "o3",
+                    "emailMatches": [],
+                    "numericMatches": [],
+                    "arrayMatches": [],
+                },
+                doc! {
+                    "_id": "o4",
+                    "emailMatches": [],
+                    "numericMatches": [],
+                    "arrayMatches": [{ "_id": "p2", "email": "target@example.test" }],
+                },
+            ]
+        );
+
+        let collation = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "lookup_orders_pushdown",
+                "$db": "app",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "lookup_profiles_pushdown",
+                            "localField": "owner",
+                            "foreignField": "_id",
+                            "as": "ownerIds",
+                        }
+                    },
+                    { "$match": { "_id": "o3" } },
+                    { "$project": { "_id": 1_i32, "ownerIds": 1_i32 } },
+                ],
+                "collation": { "locale": "en", "strength": 2_i32 },
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&collation),
+            vec![doc! {
+                "_id": "o3",
+                "ownerIds": [
+                    { "_id": "ADA", "kind": "upper" },
+                    { "_id": "ada", "kind": "lower" },
+                ],
+            }]
         );
     }
 

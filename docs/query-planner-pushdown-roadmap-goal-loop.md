@@ -196,7 +196,7 @@ When a milestone is complete:
 - [ ] Milestone 0: Confirm current planner state and rank remaining uplifts
 - [ ] Milestone 1: Select and specify the first implementation slice
 - [x] Milestone 2: Deliver first-stage aggregation `$match` candidate narrowing
-- [ ] Milestone 3: Deliver lookup-side candidate narrowing or write its
+- [x] Milestone 3: Deliver lookup-side candidate narrowing or write its
       separate executable goal prompt
 - [ ] Milestone 4: Benchmarks, docs, adversarial review, and fix loop
 
@@ -369,6 +369,35 @@ cargo fmt -- --check
 cargo test lookup
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py
 ```
+
+Status note 2026-07-05:
+
+- Delivered lookup-side candidate narrowing directly via
+  `docs/aggregation-lookup-pushdown-goal-loop.md` instead of only splitting a
+  prompt. Simple `$lookup` now attempts safe foreign candidate loading for
+  `_id` and compatible maintained single-field scalar indexes, then still runs
+  Rust lookup equality before returning matches.
+- Preserved full-scan fallback for null/missing/empty-array local values, local
+  arrays or array traversal, numeric local values, non-simple collation string
+  `_id`, unindexed fields, incompatible index collation, partial/sparse
+  membership not implied by the lookup value, and unsafe multikey omissions.
+- Added Rust and PyMongo lookup coverage plus benchmark row
+  `aggregation_lookup_indexed_foreign_equality`. Smoke budget passed with the
+  new row at 0.447 ms/op on 400 documents.
+- Verification run:
+  - `cargo fmt -- --check`: passed.
+  - `cargo test lookup`: passed.
+  - `cargo test aggregation`: passed.
+  - `cargo run --bin mongolino-bench -- --profile smoke --check-budget`:
+    passed.
+  - `cargo test`: passed.
+  - `cargo build`: passed with existing dead-code warnings for planner helper
+    functions that are only used by tests or benchmark-target compilation.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+    tests/e2e/test_aggregation.py`: sandbox run hit localhost bind
+    `PermissionError`; rerun outside the sandbox passed with 28 tests.
+- Milestone 4 remains open for parent adversarial review and any follow-up fix
+  loop.
 
 ## Milestone 4: Benchmarks, Docs, Review, And Fix Loop
 

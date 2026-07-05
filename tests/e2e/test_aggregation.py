@@ -400,6 +400,129 @@ def test_aggregate_lookup_simple_equality_arrays_null_collation_self_and_cursor(
     ]
 
 
+def test_aggregate_lookup_foreign_candidate_narrowing_preserves_fallbacks(collection):
+    profiles = collection.database[f"{collection.name}_lookup_profiles"]
+    collection.insert_many(
+        [
+            {"_id": "o1", "email": "target@example.test"},
+            {"_id": "o2", "email": "none@example.test", "number": 1},
+            {"_id": "o3", "email": "none@example.test", "owner": "ada"},
+            {"_id": "o4", "email": "none@example.test", "profileIds": ["p2", "p2"]},
+        ]
+    )
+    profiles.insert_many(
+        [
+            {"_id": "p1", "email": "other@example.test"},
+            {"_id": "p2", "email": "target@example.test"},
+            {"_id": "p3", "email": "target@example.test"},
+            {"_id": 1, "kind": "i32"},
+            {"_id": Int64(1), "kind": "i64"},
+            {"_id": 1.0, "kind": "double"},
+            {"_id": "ADA", "kind": "upper"},
+            {"_id": "ada", "kind": "lower"},
+        ]
+    )
+    profiles.create_index("email", name="email_1")
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "email",
+                        "foreignField": "email",
+                        "as": "emailMatches",
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "number",
+                        "foreignField": "_id",
+                        "as": "numericMatches",
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "profileIds",
+                        "foreignField": "_id",
+                        "as": "arrayMatches",
+                    }
+                },
+                {"$sort": {"_id": 1}},
+                {
+                    "$project": {
+                        "_id": 1,
+                        "emailMatches": 1,
+                        "numericMatches": 1,
+                        "arrayMatches": 1,
+                    }
+                },
+            ]
+        )
+    ) == [
+        {
+            "_id": "o1",
+            "emailMatches": [
+                {"_id": "p2", "email": "target@example.test"},
+                {"_id": "p3", "email": "target@example.test"},
+            ],
+            "numericMatches": [],
+            "arrayMatches": [],
+        },
+        {
+            "_id": "o2",
+            "emailMatches": [],
+            "numericMatches": [
+                {"_id": 1, "kind": "i32"},
+                {"_id": Int64(1), "kind": "i64"},
+                {"_id": 1.0, "kind": "double"},
+            ],
+            "arrayMatches": [],
+        },
+        {
+            "_id": "o3",
+            "emailMatches": [],
+            "numericMatches": [],
+            "arrayMatches": [],
+        },
+        {
+            "_id": "o4",
+            "emailMatches": [],
+            "numericMatches": [],
+            "arrayMatches": [{"_id": "p2", "email": "target@example.test"}],
+        },
+    ]
+
+    assert list(
+        collection.aggregate(
+            [
+                {
+                    "$lookup": {
+                        "from": profiles.name,
+                        "localField": "owner",
+                        "foreignField": "_id",
+                        "as": "ownerIds",
+                    }
+                },
+                {"$match": {"_id": "o3"}},
+                {"$project": {"_id": 1, "ownerIds": 1}},
+            ],
+            collation={"locale": "en", "strength": 2},
+        )
+    ) == [
+        {
+            "_id": "o3",
+            "ownerIds": [
+                {"_id": "ADA", "kind": "upper"},
+                {"_id": "ada", "kind": "lower"},
+            ],
+        }
+    ]
+
+
 def test_aggregate_lookup_sweeps_foreign_ttl_before_join(collection, mongolino_server):
     now = datetime.now(timezone.utc)
     past = now - timedelta(days=1)

@@ -498,6 +498,35 @@ Target aggregation rows:
 - The exact `$match` plus `$count` count-pushdown path remains separate.
 - Unsafe filters still fall back to full namespace loading and Rust matching.
 
+## Lookup-Side Candidate Narrowing Results
+
+Recorded on 2026-07-05 from the working tree based on commit `be70000` after
+adding lookup-side foreign candidate narrowing. Benchmarks used the debug
+`cargo run --bin mongolino-bench -- --profile smoke --check-budget` command.
+
+Delivered implementation:
+
+- Simple `$lookup` tries safe foreign candidate loading by `_id` or compatible
+  maintained single-field scalar index entries.
+- Narrowed lookup candidates still run the existing Rust lookup equality check
+  before they are appended to the result array.
+- Full-scan fallback remains intentional for null/missing/empty-array local
+  values, local arrays or array traversal, numeric local values, non-simple
+  collation string `_id`, unindexed fields, incompatible index collation,
+  partial/sparse membership not implied by the lookup value, and unsafe
+  multikey omissions.
+
+Smoke profile after lookup-side candidate narrowing:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| aggregation_lookup_single_document | 25 | 55.76 | 448.36 | 2.230 |
+| aggregation_lookup_indexed_foreign_equality | 25 | 11.18 | 2236.29 | 0.447 |
+
+The new `aggregation_lookup_indexed_foreign_equality` row isolates a selective
+source document joining through a selective indexed foreign field while still
+using the real `$lookup` command path.
+
 ## Scalar Multikey Index Uplift Results
 
 Recorded on 2026-07-04 after scalar multikey index entry maintenance and
