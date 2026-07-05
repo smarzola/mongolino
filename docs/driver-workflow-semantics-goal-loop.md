@@ -257,7 +257,7 @@ Status:
   - `cargo fmt`
   - `cargo test driver_workflow` -> 3 main tests and 3 bench-target tests passed.
   - `cargo test` -> 192 main tests and 194 bench-target tests passed.
-- Commit: pending milestone batch commit.
+- Commit: `17c2954`.
 
 ## Milestone 1: ReadConcern And WriteConcern Safe No-Op Subset
 
@@ -332,7 +332,7 @@ Status:
   - `cargo test` -> 192 main tests and 194 bench-target tests passed.
   - Sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` failed with `PermissionError: [Errno 1] Operation not permitted` at localhost bind.
   - Unsandboxed same command -> 6 passed.
-- Commit: pending milestone batch commit.
+- Commit: `17c2954`.
 
 ## Milestone 2: Transaction Rejection And No-Mutation Preflight
 
@@ -394,7 +394,7 @@ Status:
   - `cargo test transaction_fields` -> 1 main test and 1 bench-target test passed.
   - `cargo test` -> 192 main tests and 194 bench-target tests passed.
   - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
-- Commit: pending milestone batch commit.
+- Commit: `17c2954`.
 
 ## Milestone 3: Retryable Write Skeleton And Replay Cache
 
@@ -472,7 +472,7 @@ Status:
   - `cargo test retryable` -> 3 main tests and 3 bench-target tests passed.
   - `cargo test` -> 192 main tests and 194 bench-target tests passed.
   - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
-- Commit: pending milestone batch commit.
+- Commit: `17c2954`.
 
 ## Milestone 4: E2E, Spec Corpus, Docs, Scorecard, And Benchmarks
 
@@ -551,7 +551,7 @@ Status:
   - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
   - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_spec_corpus.py` -> 31 passed.
   - `cargo test` -> 192 main tests and 194 bench-target tests passed.
-- Commit: pending milestone batch commit.
+- Commit: `17c2954`.
 
 ## Milestone 5: Final Verification And Handoff
 
@@ -623,6 +623,30 @@ Status:
   reads, unacknowledged writes, distributed durability, durable retryable write
   history across reconnects/restarts, stored/expired session catalog semantics,
   and multi-operation transactions.
+
+Parent adversarial review 2026-07-05:
+
+- Reviewed implementation commits `17c2954` and `55c2570` against the goal.
+  Accepted the uplift without a blocking fix loop. The shared workflow parser
+  runs before command dispatch, so malformed `lsid`, unsupported
+  read/writeConcern, transaction fields, and malformed retry metadata fail
+  before command-specific TTL sweeps or mutations.
+- Reviewed retryable write replay behavior. Exact duplicate `insert`, `update`,
+  `delete`, and `findAndModify` commands with the same `lsid + txnNumber` are
+  served from the per-connection cache, conflicting command bodies return an
+  explicit command error, and the bounded FIFO cache is covered by tests.
+- Parent verification passed: `cargo fmt -- --check`; `cargo test
+  driver_workflow`; `cargo test retryable`; `cargo test transaction`; `cargo
+  test` with 192 main tests and 194 bench-target tests; `cargo build` with
+  existing dead-code warnings; `cargo run --bin mongolino-bench -- --profile ci
+  --check-budget` for git commit `55c2570`; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv lock --check`; and `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
+  --locked --dev`.
+- Sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_driver_workflow.py` failed before test execution on localhost
+  bind permission; the same command passed unsandboxed with 6 tests in 3.19s.
+  Full unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+  --locked pytest tests/e2e` passed with 221 tests in 115.15s.
 
 ## Final Response Requirements
 
