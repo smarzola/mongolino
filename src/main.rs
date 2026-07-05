@@ -371,6 +371,29 @@ fn init_document_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_index_multikey_omissions_lookup
             ON index_multikey_omissions(namespace, index_name);
 
+        CREATE TABLE IF NOT EXISTS unwind_group_entries (
+            namespace TEXT NOT NULL,
+            index_name TEXT NOT NULL,
+            id_key TEXT NOT NULL,
+            occurrence INTEGER NOT NULL,
+            group_key TEXT NOT NULL,
+            value_bson BLOB NOT NULL,
+            PRIMARY KEY (namespace, index_name, id_key, occurrence)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_unwind_group_entries_lookup
+            ON unwind_group_entries(namespace, index_name);
+
+        CREATE TABLE IF NOT EXISTS unwind_group_omissions (
+            namespace TEXT NOT NULL,
+            index_name TEXT NOT NULL,
+            id_key TEXT NOT NULL,
+            PRIMARY KEY (namespace, index_name, id_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_unwind_group_omissions_lookup
+            ON unwind_group_omissions(namespace, index_name);
+
         CREATE TABLE IF NOT EXISTS documents (
             namespace TEXT NOT NULL,
             id_key TEXT NOT NULL,
@@ -1313,6 +1336,14 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
         "DELETE FROM index_multikey_omissions WHERE namespace = ?1",
         params![ns],
     )?;
+    tx.execute(
+        "DELETE FROM unwind_group_entries WHERE namespace = ?1",
+        params![ns],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_omissions WHERE namespace = ?1",
+        params![ns],
+    )?;
     tx.commit()?;
 
     Ok(doc! {
@@ -1348,6 +1379,14 @@ fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
     )?;
     tx.execute(
         "DELETE FROM index_multikey_omissions WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_entries WHERE namespace LIKE ?1",
+        params![prefix],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_omissions WHERE namespace LIKE ?1",
         params![prefix],
     )?;
     tx.commit()?;
@@ -1602,6 +1641,21 @@ fn aggregate_command_with_state(
             false,
         ));
     }
+    if let Some(documents) = aggregate_unwind_group_pushdown(conn, &ns, pipeline, &collation)? {
+        let documents = match documents {
+            Ok(documents) => documents,
+            Err(response) => return Ok(response),
+        };
+        return Ok(cursor_response_for_documents(
+            client_state,
+            db,
+            collection,
+            &ns,
+            documents,
+            batch_size,
+            false,
+        ));
+    }
     let documents = match aggregate_pipeline_documents(conn, db, &ns, pipeline, &collation)? {
         Ok(documents) => documents,
         Err(response) => return Ok(response),
@@ -1701,6 +1755,142 @@ fn parse_match_count_pipeline<'a>(pipeline: &'a [Bson]) -> Option<(&'a Document,
         return None;
     }
     Some((filter, field.as_str()))
+}
+
+fn aggregate_unwind_group_pushdown(
+    conn: &Connection,
+    namespace: &str,
+    pipeline: &[Bson],
+    collation: &Collation,
+) -> Result<Option<std::result::Result<Vec<Document>, Document>>> {
+    let Some(plan) = parse_unwind_group_count_pipeline(pipeline, collation) else {
+        return Ok(None);
+    };
+    let Some(index) = unwind_group_index_for_path(conn, namespace, &plan.path)? else {
+        return Ok(None);
+    };
+    if !unwind_group_entries_safe_for_planner(conn, namespace, &index.name)? {
+        return Ok(None);
+    }
+    optimized_unwind_group_count(conn, namespace, &index.name, &plan).map(Some)
+}
+
+#[derive(Debug, PartialEq)]
+struct UnwindGroupCountPlan {
+    path: String,
+    accumulator_fields: Vec<String>,
+}
+
+fn parse_unwind_group_count_pipeline(
+    pipeline: &[Bson],
+    collation: &Collation,
+) -> Option<UnwindGroupCountPlan> {
+    if !collation.is_simple() || pipeline.len() != 2 {
+        return None;
+    }
+
+    let Bson::Document(unwind_stage) = &pipeline[0] else {
+        return None;
+    };
+    if unwind_stage.len() != 1 {
+        return None;
+    }
+    let (unwind_operator, unwind_operand) = unwind_stage.iter().next()?;
+    if unwind_operator != "$unwind" {
+        return None;
+    }
+    let unwind = parse_unwind_stage(unwind_operand).ok()?;
+    if unwind.preserve_null_and_empty_arrays || unwind.include_array_index.is_some() {
+        return None;
+    }
+
+    let Bson::Document(group_stage) = &pipeline[1] else {
+        return None;
+    };
+    if group_stage.len() != 1 {
+        return None;
+    }
+    let (group_operator, group_operand) = group_stage.iter().next()?;
+    if group_operator != "$group" {
+        return None;
+    }
+    let Bson::Document(group) = group_operand else {
+        return None;
+    };
+    let group = parse_group_stage(group).ok()?;
+    if group.id != AggregationExpression::FieldPath(unwind.path.clone()) {
+        return None;
+    }
+    if group.accumulators.is_empty() {
+        return None;
+    }
+    let mut accumulator_fields = Vec::new();
+    for accumulator in group.accumulators {
+        let is_count_one = matches!(
+            accumulator.expression,
+            AggregationExpression::Literal(Bson::Int32(1) | Bson::Int64(1))
+        );
+        if accumulator.op != AccumulatorOp::Sum || !is_count_one {
+            return None;
+        }
+        accumulator_fields.push(accumulator.field);
+    }
+    Some(UnwindGroupCountPlan {
+        path: unwind.path,
+        accumulator_fields,
+    })
+}
+
+fn unwind_group_index_for_path(
+    conn: &Connection,
+    namespace: &str,
+    path: &str,
+) -> Result<Option<IndexSpec>> {
+    Ok(planner_indexes(indexes_for_namespace(conn, namespace)?)
+        .into_iter()
+        .find(|index| unwind_group_index_field(index).is_some_and(|field| field == path)))
+}
+
+fn optimized_unwind_group_count(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+    plan: &UnwindGroupCountPlan,
+) -> Result<std::result::Result<Vec<Document>, Document>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.group_key, e.value_bson
+          FROM unwind_group_entries e
+          JOIN documents d
+            ON d.namespace = e.namespace
+           AND d.id_key = e.id_key
+         WHERE e.namespace = ?1
+           AND e.index_name = ?2
+         ORDER BY d.rowid, e.occurrence
+        "#,
+    )?;
+    let mut rows = stmt.query(params![namespace, index_name])?;
+    let mut groups = Vec::<(String, Bson, i64)>::new();
+    while let Some(row) = rows.next()? {
+        let group_key = row.get::<_, String>(0)?;
+        let value = decode_bson_value_sql(row.get::<_, Vec<u8>>(1)?)?;
+        match groups.iter_mut().find(|(key, _, _)| key == &group_key) {
+            Some((_, _, count)) => *count += 1,
+            None => groups.push((group_key, value, 1)),
+        }
+    }
+
+    let documents = groups
+        .into_iter()
+        .map(|(_, id, count)| {
+            let mut document = doc! { "_id": id };
+            for field in &plan.accumulator_fields {
+                document.insert(field, count);
+            }
+            document
+        })
+        .collect();
+    Ok(Ok(documents))
 }
 
 fn aggregate_pipeline_documents(
@@ -5685,6 +5875,14 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
             "DELETE FROM index_multikey_omissions WHERE namespace = ?1",
             params![ns],
         )?;
+        tx.execute(
+            "DELETE FROM unwind_group_entries WHERE namespace = ?1",
+            params![ns],
+        )?;
+        tx.execute(
+            "DELETE FROM unwind_group_omissions WHERE namespace = ?1",
+            params![ns],
+        )?;
         tx.execute("DELETE FROM indexes WHERE namespace = ?1", params![ns])?
     } else {
         tx.execute(
@@ -5693,6 +5891,14 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         )?;
         tx.execute(
             "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2",
+            params![ns, index],
+        )?;
+        tx.execute(
+            "DELETE FROM unwind_group_entries WHERE namespace = ?1 AND index_name = ?2",
+            params![ns, index],
+        )?;
+        tx.execute(
+            "DELETE FROM unwind_group_omissions WHERE namespace = ?1 AND index_name = ?2",
             params![ns, index],
         )?;
         tx.execute(
@@ -6371,6 +6577,14 @@ fn rebuild_index_entries_tx(
         "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND index_name = ?2",
         params![namespace, spec.name],
     )?;
+    tx.execute(
+        "DELETE FROM unwind_group_entries WHERE namespace = ?1 AND index_name = ?2",
+        params![namespace, spec.name],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_omissions WHERE namespace = ?1 AND index_name = ?2",
+        params![namespace, spec.name],
+    )?;
     for stored in stored_documents_for_namespace_tx(tx, namespace).map_err(sql_string_error)? {
         insert_index_entry_for_document_tx(tx, namespace, spec, &stored.id_key, &stored.document)?;
     }
@@ -6391,6 +6605,14 @@ fn refresh_index_entries_for_document_tx(
         "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
     )?;
+    tx.execute(
+        "DELETE FROM unwind_group_entries WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_omissions WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
     let indexes = indexes_for_namespace_tx(tx, namespace).map_err(sql_string_error)?;
     for spec in indexes {
         insert_index_entry_for_document_tx(tx, namespace, &spec, id_key, document)?;
@@ -6409,6 +6631,14 @@ fn delete_index_entries_for_document_tx(
     )?;
     tx.execute(
         "DELETE FROM index_multikey_omissions WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_entries WHERE namespace = ?1 AND id_key = ?2",
+        params![namespace, id_key],
+    )?;
+    tx.execute(
+        "DELETE FROM unwind_group_omissions WHERE namespace = ?1 AND id_key = ?2",
         params![namespace, id_key],
     )?;
     Ok(())
@@ -6436,7 +6666,120 @@ fn insert_index_entry_for_document_tx(
             params![namespace, spec.name, key_value, id_key],
         )?;
     }
+    insert_unwind_group_entries_for_document_tx(tx, namespace, spec, id_key, document)?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+struct UnwindGroupOccurrence {
+    group_key: String,
+    value: Bson,
+}
+
+#[derive(Debug, PartialEq)]
+struct UnwindGroupExtraction {
+    occurrences: Vec<UnwindGroupOccurrence>,
+    omitted: bool,
+}
+
+fn insert_unwind_group_entries_for_document_tx(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    spec: &IndexSpec,
+    id_key: &str,
+    document: &Document,
+) -> std::result::Result<(), rusqlite::Error> {
+    let Some(field) = unwind_group_index_field(spec) else {
+        return Ok(());
+    };
+    let extraction = unwind_group_occurrences_for_document(document, field);
+    if extraction.omitted {
+        tx.execute(
+            "INSERT OR IGNORE INTO unwind_group_omissions(namespace, index_name, id_key) VALUES (?1, ?2, ?3)",
+            params![namespace, spec.name, id_key],
+        )?;
+    }
+    for (occurrence, entry) in extraction.occurrences.into_iter().enumerate() {
+        tx.execute(
+            "INSERT INTO unwind_group_entries(namespace, index_name, id_key, occurrence, group_key, value_bson)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                namespace,
+                spec.name,
+                id_key,
+                occurrence as i64,
+                entry.group_key,
+                encode_bson_value_sql(&entry.value)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn unwind_group_index_field(spec: &IndexSpec) -> Option<&str> {
+    if spec.collation.is_simple() && spec.partial_filter.is_none() {
+        single_field_index_name(spec)
+    } else {
+        None
+    }
+}
+
+fn unwind_group_occurrences_for_document(document: &Document, path: &str) -> UnwindGroupExtraction {
+    let mut extraction = UnwindGroupExtraction {
+        occurrences: Vec::new(),
+        omitted: false,
+    };
+    match get_document_path(document, path) {
+        Some(Bson::Array(values)) => {
+            for value in values {
+                match unwind_group_key_for_value(value) {
+                    Some(group_key) => extraction.occurrences.push(UnwindGroupOccurrence {
+                        group_key,
+                        value: value.clone(),
+                    }),
+                    None => extraction.omitted = true,
+                }
+            }
+        }
+        Some(Bson::Null) | None => {}
+        Some(value) => match unwind_group_key_for_value(value) {
+            Some(group_key) => extraction.occurrences.push(UnwindGroupOccurrence {
+                group_key,
+                value: value.clone(),
+            }),
+            None => extraction.omitted = true,
+        },
+    }
+    extraction
+}
+
+fn unwind_group_key_for_value(value: &Bson) -> Option<String> {
+    if let Some(number) = numeric_value(value) {
+        if !number.is_finite() {
+            return None;
+        }
+        let normalized = if number == 0.0 { 0.0 } else { number };
+        return Some(format!("num:{:016x}", normalized.to_bits()));
+    }
+    match value {
+        Bson::Null | Bson::String(_) | Bson::Boolean(_) | Bson::DateTime(_) | Bson::ObjectId(_) => {
+            Some(format!("bson:{}", id_key_from_bson(value)))
+        }
+        Bson::Array(_) | Bson::Document(_) => None,
+        _ => None,
+    }
+}
+
+fn unwind_group_entries_safe_for_planner(
+    conn: &Connection,
+    namespace: &str,
+    index_name: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM unwind_group_omissions WHERE namespace = ?1 AND index_name = ?2)",
+        params![namespace, index_name],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn index_has_multikey_omission(spec: &IndexSpec, document: &Document) -> bool {
@@ -12050,10 +12393,18 @@ fn encode_document(document: &Document) -> std::result::Result<Vec<u8>, rusqlite
     Ok(encoded)
 }
 
+fn encode_bson_value_sql(value: &Bson) -> std::result::Result<Vec<u8>, rusqlite::Error> {
+    encode_document(&doc! { "v": value.clone() })
+}
+
 fn decode_document_sql(bytes: Vec<u8>) -> std::result::Result<Document, rusqlite::Error> {
     Document::from_reader(&mut Cursor::new(bytes)).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(err))
     })
+}
+
+fn decode_bson_value_sql(bytes: Vec<u8>) -> std::result::Result<Bson, rusqlite::Error> {
+    decode_document_sql(bytes).map(|mut document| document.remove("v").unwrap_or(Bson::Null))
 }
 
 fn decode_collation_sql(bytes: Option<Vec<u8>>) -> std::result::Result<Collation, rusqlite::Error> {
@@ -12190,6 +12541,47 @@ mod tests {
 
     fn next_batch(response: &Document) -> Vec<Document> {
         batch(response, "nextBatch")
+    }
+
+    fn unwind_group_entry_count(
+        conn: &Connection,
+        namespace: &str,
+        index_name: &str,
+        id_key: Option<&str>,
+    ) -> i64 {
+        match id_key {
+            Some(id_key) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM unwind_group_entries WHERE namespace = ?1 AND index_name = ?2 AND id_key = ?3",
+                    params![namespace, index_name, id_key],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM unwind_group_entries WHERE namespace = ?1 AND index_name = ?2",
+                    params![namespace, index_name],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        }
+    }
+
+    fn assert_unwind_group_counts(conn: &Connection, collection: &str, expected: Vec<Document>) {
+        let response = aggregate_command(
+            conn,
+            &doc! {
+                "aggregate": collection,
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&response), expected);
     }
 
     fn batch(response: &Document, field: &str) -> Vec<Document> {
@@ -17885,6 +18277,474 @@ mod tests {
                 doc! { "_id": "d", "tags": Bson::Null, "idx": Bson::Null },
                 doc! { "_id": "e", "tags": "green", "idx": Bson::Null },
             ]
+        );
+    }
+
+    #[test]
+    fn unwind_group_occurrence_extraction_matches_default_unwind_counts() {
+        let duplicate =
+            unwind_group_occurrences_for_document(&doc! { "tags": ["red", "red", "blue"] }, "tags");
+        assert_eq!(
+            duplicate
+                .occurrences
+                .iter()
+                .map(|entry| entry.value.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Bson::String("red".to_string()),
+                Bson::String("red".to_string()),
+                Bson::String("blue".to_string()),
+            ]
+        );
+        assert!(!duplicate.omitted);
+
+        let scalar = unwind_group_occurrences_for_document(&doc! { "tags": "green" }, "tags");
+        assert_eq!(
+            scalar.occurrences,
+            vec![UnwindGroupOccurrence {
+                group_key: "bson:str:green".to_string(),
+                value: Bson::String("green".to_string()),
+            }]
+        );
+        assert!(!scalar.omitted);
+
+        for document in [
+            doc! {},
+            doc! { "tags": Bson::Null },
+            doc! { "tags": [] },
+            doc! { "profile": { "tags": ["nested"] } },
+        ] {
+            let extraction = unwind_group_occurrences_for_document(&document, "tags");
+            assert!(extraction.occurrences.is_empty(), "{document:?}");
+            assert!(!extraction.omitted, "{document:?}");
+        }
+
+        let nested = unwind_group_occurrences_for_document(
+            &doc! { "profile": { "tags": ["logic", "math"] } },
+            "profile.tags",
+        );
+        assert_eq!(
+            nested
+                .occurrences
+                .into_iter()
+                .map(|entry| entry.value)
+                .collect::<Vec<_>>(),
+            vec![
+                Bson::String("logic".to_string()),
+                Bson::String("math".to_string()),
+            ]
+        );
+
+        let unsafe_shape = unwind_group_occurrences_for_document(
+            &doc! { "tags": ["red", { "nested": true }] },
+            "tags",
+        );
+        assert_eq!(unsafe_shape.occurrences.len(), 1);
+        assert!(unsafe_shape.omitted);
+    }
+
+    #[test]
+    fn aggregate_unwind_group_count_uses_occurrence_rows_for_indexed_path() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "a", "tags": ["red", "red", "blue"], "score": 1_i32 },
+                    { "_id": "b", "tags": "red", "score": 2_i64 },
+                    { "_id": "c", "tags": [] },
+                    { "_id": "d", "tags": Bson::Null },
+                    { "_id": "e" },
+                    { "_id": "f", "tags": [1_i32, 1_i64, 1.0] },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "items",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let entry_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM unwind_group_entries WHERE namespace = 'app.items' AND index_name = 'tags_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entry_count, 7);
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 }, "m": { "$sum": 1_i64 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! { "_id": "red", "n": 3_i64, "m": 3_i64 },
+                doc! { "_id": "blue", "n": 1_i64, "m": 1_i64 },
+                doc! { "_id": 1_i32, "n": 3_i64, "m": 3_i64 },
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_unwind_group_count_falls_back_for_unsafe_shapes_and_collation() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "a", "tags": ["red", "blue"], "other": "red" },
+                    { "_id": "b", "tags": [{ "nested": true }] },
+                    { "_id": "c", "tags": Bson::Null },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "items",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        assert!(!unwind_group_entries_safe_for_planner(&conn, "app.items", "tags_1").unwrap());
+
+        for pipeline in [
+            vec![
+                doc! { "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": true } },
+                doc! { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+            ],
+            vec![
+                doc! { "$unwind": { "path": "$tags", "includeArrayIndex": "idx" } },
+                doc! { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+            ],
+            vec![
+                doc! { "$unwind": "$tags" },
+                doc! { "$group": { "_id": "$other", "n": { "$sum": 1_i32 } } },
+            ],
+            vec![
+                doc! { "$unwind": "$tags" },
+                doc! { "$group": { "_id": "$tags", "ids": { "$push": "$_id" } } },
+            ],
+        ] {
+            assert!(
+                parse_unwind_group_count_pipeline(
+                    &pipeline.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+                    &Collation::Simple,
+                )
+                .is_none()
+            );
+        }
+
+        let collation_pipeline = vec![
+            Bson::Document(doc! { "$unwind": "$tags" }),
+            Bson::Document(doc! { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } }),
+        ];
+        assert!(
+            parse_unwind_group_count_pipeline(
+                &collation_pipeline,
+                &Collation::EnglishCaseInsensitive,
+            )
+            .is_none()
+        );
+
+        let response = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "items",
+                "$db": "app",
+                "pipeline": [
+                    { "$unwind": "$tags" },
+                    { "$group": { "_id": "$tags", "n": { "$sum": 1_i32 } } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&response),
+            vec![
+                doc! { "_id": "red", "n": 1_i64 },
+                doc! { "_id": "blue", "n": 1_i64 },
+                doc! { "_id": { "nested": true }, "n": 1_i64 },
+            ]
+        );
+    }
+
+    #[test]
+    fn unwind_group_entries_stay_fresh_across_mutations_and_drops() {
+        let conn = test_conn();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "items",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                ],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "a", "tags": ["red"] },
+                    { "_id": "keep", "tags": ["old"] },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            2
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "items",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "a" }, "u": { "$set": { "tags": "blue" } } }],
+            },
+        )
+        .unwrap();
+        assert_unwind_group_counts(
+            &conn,
+            "items",
+            vec![
+                doc! { "_id": "blue", "n": 1_i64 },
+                doc! { "_id": "old", "n": 1_i64 },
+            ],
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "items",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "a" }, "u": { "$set": { "tags": ["blue"] } } }],
+            },
+        )
+        .unwrap();
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "items",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "a" }, "u": { "$push": { "tags": "blue" } } }],
+            },
+        )
+        .unwrap();
+        assert_unwind_group_counts(
+            &conn,
+            "items",
+            vec![
+                doc! { "_id": "blue", "n": 2_i64 },
+                doc! { "_id": "old", "n": 1_i64 },
+            ],
+        );
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "items",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "a" }, "u": { "$pull": { "tags": "blue" } } }],
+            },
+        )
+        .unwrap();
+        assert_unwind_group_counts(&conn, "items", vec![doc! { "_id": "old", "n": 1_i64 }]);
+
+        update_documents(
+            &conn,
+            &doc! {
+                "update": "items",
+                "$db": "app",
+                "updates": [{ "q": { "_id": "a" }, "u": { "_id": "a", "tags": ["green", "green"] } }],
+            },
+        )
+        .unwrap();
+        assert_unwind_group_counts(
+            &conn,
+            "items",
+            vec![
+                doc! { "_id": "green", "n": 2_i64 },
+                doc! { "_id": "old", "n": 1_i64 },
+            ],
+        );
+
+        find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "items",
+                "$db": "app",
+                "query": { "_id": "a" },
+                "update": { "$unset": { "tags": "" } },
+            },
+        )
+        .unwrap();
+        assert_unwind_group_counts(&conn, "items", vec![doc! { "_id": "old", "n": 1_i64 }]);
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "items",
+                "$db": "app",
+                "documents": [{ "_id": "remove-me", "tags": ["gone"], "expiresAt": bson::DateTime::from_millis(1_700_000_000_001_i64) }],
+            },
+        )
+        .unwrap();
+        find_and_modify(
+            &conn,
+            "findAndModify",
+            &doc! {
+                "findAndModify": "items",
+                "$db": "app",
+                "query": { "_id": "remove-me" },
+                "remove": true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unwind_group_entry_count(
+                &conn,
+                "app.items",
+                "tags_1",
+                Some(&id_key_from_bson(&Bson::String("remove-me".to_string()))),
+            ),
+            0
+        );
+
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            1
+        );
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "ttl_items",
+                "$db": "app",
+                "documents": [
+                    { "_id": "expired", "tags": ["old"], "expiresAt": bson::DateTime::from_millis(1_699_999_900_000_i64) },
+                    { "_id": "future", "tags": ["new"], "expiresAt": bson::DateTime::from_millis(1_700_000_000_001_i64) },
+                ],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "ttl_items",
+                "$db": "app",
+                "indexes": [
+                    { "key": { "tags": 1_i32 }, "name": "tags_1" },
+                    { "key": { "expiresAt": 1_i32 }, "name": "expires_ttl", "expireAfterSeconds": 60_i32 },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sweep_ttl_namespace_at(
+                &conn,
+                "app.ttl_items",
+                bson::DateTime::from_millis(1_700_000_000_000_i64),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            unwind_group_entry_count(
+                &conn,
+                "app.ttl_items",
+                "tags_1",
+                Some(&id_key_from_bson(&Bson::String("expired".to_string()))),
+            ),
+            0
+        );
+
+        drop_indexes(
+            &conn,
+            &doc! { "dropIndexes": "items", "$db": "app", "index": "tags_1" },
+        )
+        .unwrap();
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            0
+        );
+
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "items",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "other",
+                "$db": "app",
+                "documents": [{ "_id": "o1", "tags": ["other"] }],
+            },
+        )
+        .unwrap();
+        create_indexes(
+            &conn,
+            &doc! {
+                "createIndexes": "other",
+                "$db": "app",
+                "indexes": [{ "key": { "tags": 1_i32 }, "name": "tags_1" }],
+            },
+        )
+        .unwrap();
+        drop_collection(&conn, &doc! { "drop": "items", "$db": "app" }).unwrap();
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.items", "tags_1", None),
+            0
+        );
+        assert_eq!(
+            unwind_group_entry_count(&conn, "app.other", "tags_1", None),
+            1
+        );
+        drop_database(&conn, &doc! { "dropDatabase": 1_i32, "$db": "app" }).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM unwind_group_entries WHERE namespace LIKE 'app.%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
         );
     }
 

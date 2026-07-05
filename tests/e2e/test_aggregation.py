@@ -791,6 +791,76 @@ def test_aggregate_unwind_default_and_preserve_behavior(collection):
     ]
 
 
+def test_aggregate_unwind_group_count_indexed_fast_path_counts_occurrences(collection):
+    collection.insert_many(
+        [
+            {"_id": "a", "tags": ["red", "red", "blue"]},
+            {"_id": "b", "tags": "red"},
+            {"_id": "c", "tags": []},
+            {"_id": "d", "tags": None},
+            {"_id": "e"},
+        ]
+    )
+    collection.create_index("tags", name="tags_1")
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$unwind": "$tags"},
+                {"$group": {"_id": "$tags", "n": {"$sum": 1}, "m": {"$sum": Int64(1)}}},
+            ]
+        )
+    ) == [
+        {"_id": "red", "n": 3, "m": 3},
+        {"_id": "blue", "n": 1, "m": 1},
+    ]
+
+
+def test_aggregate_unwind_group_count_scalar_array_numeric_and_cursor(collection):
+    collection.insert_many(
+        [
+            {"_id": "a", "tags": [1, Int64(1), 1.0]},
+            {"_id": "b", "tags": "red"},
+            {"_id": "c", "tags": ["blue"]},
+            {"_id": "d", "tags": ["red"]},
+        ]
+    )
+    collection.create_index("tags", name="tags_1")
+
+    cursor = collection.aggregate(
+        [
+            {"$unwind": "$tags"},
+            {"$group": {"_id": "$tags", "n": {"$sum": 1}}},
+        ],
+        batchSize=1,
+    )
+
+    assert list(cursor) == [
+        {"_id": 1, "n": 3},
+        {"_id": "red", "n": 2},
+        {"_id": "blue", "n": 1},
+    ]
+
+
+def test_aggregate_unwind_group_count_fallback_preserves_null_and_empty(collection):
+    seed_tagged_items(collection)
+    collection.create_index("tags", name="tags_1")
+
+    assert list(
+        collection.aggregate(
+            [
+                {"$unwind": {"path": "$tags", "preserveNullAndEmptyArrays": True}},
+                {"$group": {"_id": "$tags", "n": {"$sum": 1}}},
+            ]
+        )
+    ) == [
+        {"_id": "red", "n": 1},
+        {"_id": "blue", "n": 1},
+        {"_id": None, "n": 3},
+        {"_id": "green", "n": 1},
+    ]
+
+
 def test_aggregate_group_scalar_accumulators(collection):
     collection.insert_many(
         [

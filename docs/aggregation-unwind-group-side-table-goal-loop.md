@@ -197,11 +197,11 @@ When a milestone is complete:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Design the occurrence metadata and safety model
-- [ ] Milestone 1: Maintain occurrence metadata through write/index lifecycle
-- [ ] Milestone 2: Add the safe aggregation fast path
-- [ ] Milestone 3: Add adversarial Rust and PyMongo coverage
-- [ ] Milestone 4: Benchmark, document, verify, and record residual risks
+- [x] Milestone 0: Design the occurrence metadata and safety model
+- [x] Milestone 1: Maintain occurrence metadata through write/index lifecycle
+- [x] Milestone 2: Add the safe aggregation fast path
+- [x] Milestone 3: Add adversarial Rust and PyMongo coverage
+- [x] Milestone 4: Benchmark, document, verify, and record residual risks
 
 ## Milestone 0: Design The Occurrence Metadata And Safety Model
 
@@ -252,6 +252,18 @@ cargo test aggregate
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Completed a SQLite-backed `unwind_group_entries` occurrence table
+  plus `unwind_group_omissions` safety table scoped to simple single-field index
+  sources. Extraction mirrors default `$unwind`: duplicate array elements emit
+  duplicate rows, scalar present values emit once, missing/null/empty arrays
+  emit zero rows, null array elements are counted, finite numeric values use a
+  canonical grouping key, and document/array/unsupported occurrences mark the
+  source unsafe for pushdown. Verification run: `cargo fmt -- --check` passed;
+  `cargo test unwind_group` passed; `cargo test aggregate` passed. Commit hash
+  reported after checkpoint commit.
 
 ## Milestone 1: Maintain Occurrence Metadata Through Write/Index Lifecycle
 
@@ -304,6 +316,17 @@ Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
 
+Status:
+
+- 2026-07-05: Wired occurrence maintenance through the existing index-entry
+  lifecycle: create/rebuild, insert, replacement and modifier updates,
+  findAndModify update/delete, delete, TTL delete, dropIndexes, collection drop,
+  and database drop. Added Rust lifecycle coverage for insert, `$set`, `$push`,
+  `$pull`, replacement, findAndModify update/delete, TTL cleanup, dropIndexes,
+  drop, and dropDatabase. Verification run: `cargo fmt -- --check` passed;
+  `cargo test index` passed; `cargo test update` passed; `cargo test ttl`
+  passed. Commit hash reported after checkpoint commit.
+
 ## Milestone 2: Add The Safe Aggregation Fast Path
 
 Problem:
@@ -347,6 +370,17 @@ cargo test unwind
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Added a bounded aggregate detector for exactly `$unwind` followed
+  by `$group` on the same path with one or more `$sum: 1` count accumulators and
+  simple command collation. The optimized path reads ordered occurrence rows,
+  returns normal BSON `_id` values, keeps count fields as `Int64`, and feeds the
+  existing aggregate cursor response path. Unsafe shapes fall back to the Rust
+  executor. Verification run: `cargo fmt -- --check` passed; `cargo test
+  aggregate` passed; `cargo test unwind_group` passed. Commit hash reported
+  after checkpoint commit.
 
 ## Milestone 3: Add Adversarial Rust And PyMongo Coverage
 
@@ -402,6 +436,21 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/te
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Added Rust adversarial coverage for duplicate array values, scalar
+  values, missing/null/empty arrays, numeric cross-type grouping, fallback for
+  preserve-null unwind, include-array-index, different group path, non-count
+  accumulator, non-simple collation, unsupported unwound document values, and
+  lifecycle freshness. Added PyMongo e2e coverage for indexed happy path,
+  duplicate counts, scalar plus array grouping, numeric grouping, preserve-null
+  fallback, and cursor batching. Verification run: `cargo fmt -- --check`
+  passed; `cargo test aggregate` passed; sandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_aggregation.py` failed with `PermissionError: [Errno 1]
+  Operation not permitted` on `sock.bind(("127.0.0.1", 0))`; unsandboxed same
+  command passed with 31 tests. Commit hash reported after checkpoint commit.
 
 ## Milestone 4: Benchmark, Document, Verify, And Record Residual Risks
 
@@ -463,6 +512,24 @@ UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/te
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Updated the benchmark harness so the existing
+  `aggregation_unwind_group` row uses a maintained `tags_1` source on the main
+  benchmark collection. Updated `docs/performance-baseline.md` with the smoke
+  benchmark result and `docs/query-planner-pushdown-roadmap-goal-loop.md` with
+  the delivered bounded slice and residual fallback scope. Final verification
+  run: `cargo fmt -- --check` passed; `cargo test aggregate` passed;
+  `cargo test index` passed; `cargo test update` passed; `cargo test ttl`
+  passed; `cargo test` passed; `cargo build` passed with existing dead-code
+  warnings; `cargo run --bin mongolino-bench -- --profile smoke --check-budget`
+  passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`
+  passed; `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`
+  passed; unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+  --locked pytest tests/e2e/test_aggregation.py` passed. Smoke benchmark
+  `aggregation_unwind_group`: 25 iterations, 76.46 ms elapsed, 326.98 ops/sec,
+  3.058 ms latency. Commit hash reported after checkpoint commit.
 
 ## Final Response Requirements
 

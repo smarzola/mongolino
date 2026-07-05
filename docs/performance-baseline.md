@@ -662,3 +662,39 @@ Interpretation:
   guards against gross regressions without claiming broad sort pushdown.
 - Unsafe non-simple collation range planning is intentionally absent; those
   shapes return command/write errors and are covered by Rust and PyMongo tests.
+
+## Aggregation Unwind/Group Side-Table Results
+
+Recorded on 2026-07-05 from the working tree before committing this slice.
+Benchmarks used the debug
+`cargo run --bin mongolino-bench -- --profile smoke --check-budget` command.
+
+Delivered implementation:
+
+- Maintains `unwind_group_entries` for simple single-field indexed paths, with
+  one row per default `$unwind` occurrence instead of one row per distinct
+  document value.
+- Stores decoded BSON group `_id` values and a grouping key that preserves
+  current numeric cross-type `$group` equality for finite numeric values.
+- Uses the side table only for the bounded two-stage shape:
+  `$unwind` on an indexed path followed by `$group` on the same path with one
+  or more `$sum: 1` count accumulators.
+- Falls back for preserve-null unwind, include-array-index, different group
+  paths, non-count accumulators, non-simple command collation, unsupported
+  occurrence values such as unwound documents/arrays, and all broader
+  aggregation shapes.
+
+Smoke profile budget check passed with:
+
+| Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
+| --- | ---: | ---: | ---: | ---: |
+| aggregation_unwind_group | 25 | 76.46 | 326.98 | 3.058 |
+
+Interpretation:
+
+- The benchmark row now creates a maintained `tags_1` source for the main
+  `users` collection, so `aggregation_unwind_group` exercises the bounded side
+  table path.
+- This is not general SQL aggregation. It is a conservative count-by-unwound
+  field shortcut that leaves the existing Rust executor as the semantic
+  fallback for everything outside the proven shape.

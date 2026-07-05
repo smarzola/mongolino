@@ -518,6 +518,7 @@ impl Harness {
                 { "key": { "team": 1_i32 }, "name": "team_1" },
                 { "key": { "active": 1_i32 }, "name": "active_1" },
                 { "key": { "createdAt": 1_i32 }, "name": "createdAt_1" },
+                { "key": { "tags": 1_i32 }, "name": "tags_1" },
                 { "key": { "team": 1_i32, "email": 1_i32 }, "name": "team_email_1" },
                 { "key": { "team": 1_i32, "createdAt": 1_i32 }, "name": "team_createdAt_1" },
             ],

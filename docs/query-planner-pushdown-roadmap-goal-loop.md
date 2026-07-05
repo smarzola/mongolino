@@ -143,7 +143,7 @@ Potential value:
 - Improves `$match` + `$project`, `$match` + `$addFields`, `$match` + `$lookup`,
   and other common pipelines without implementing SQL aggregation.
 
-### Uplift D: Bounded `$unwind`/`$group` Side-Table Investigation
+### Uplift D: Bounded `$unwind`/`$group` Side-Table
 
 Hypothesis:
 
@@ -152,14 +152,21 @@ Hypothesis:
 
 Behavior fence:
 
-- This is not a first implementation slice. `$unwind` preserve-null,
-  include-array-index, accumulator ordering, full BSON equality, and array
-  mutation freshness are subtle enough to require a separate design spike.
+- Delivered on 2026-07-05 as a bounded optimized shape for simple single-field
+  indexed paths: default `$unwind` followed by `$group` on the same field with
+  `$sum: 1` count accumulators.
+- The side table stores one row per default unwind occurrence and keeps
+  duplicate array values, scalar values, null array elements, and finite
+  numeric cross-type grouping aligned with the Rust executor.
+- Preserve-null unwind, include-array-index, different group paths, non-count
+  accumulators, non-simple command collation, unwound document/array values,
+  partial index sources, and broader aggregation pipelines remain Rust
+  fallbacks.
 
 Potential value:
 
-- `aggregation_unwind_group` remains one of the slowest benchmark rows, but the
-  complexity is higher than lookup-side and first-stage `$match` narrowing.
+- `aggregation_unwind_group` now exercises the maintained side-table source in
+  the smoke benchmark and is covered by Rust plus PyMongo tests.
 
 ## Definition Of Done
 
