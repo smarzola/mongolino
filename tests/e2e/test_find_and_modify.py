@@ -121,6 +121,26 @@ def test_find_one_and_update_positional_and_array_filters(collection):
     assert collection.find_one({"_id": "o1"}) == before
 
 
+def test_find_one_and_update_positional_scalar_elem_match(collection):
+    collection.insert_one({"_id": "u1", "scores": [1, 5, 7, 11]})
+
+    updated = collection.find_one_and_update(
+        {"scores": {"$elemMatch": {"$gte": 5, "$lt": 10}}},
+        {"$set": {"scores.$": 99}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    assert updated["scores"] == [1, 99, 7, 11]
+
+    before = collection.find_one({"_id": "u1"})
+    with pytest.raises(OperationFailure):
+        collection.find_one_and_update(
+            {"scores": {"$elemMatch": {"$where": "bad"}}},
+            {"$set": {"scores.$": 42}},
+        )
+    assert collection.find_one({"_id": "u1"}) == before
+
+
 def test_find_and_modify_targets_and_sorts_with_collation(collection):
     collection.insert_many(
         [

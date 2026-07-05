@@ -8764,7 +8764,7 @@ fn first_matching_array_index(
 fn positional_query_predicates(
     array_path: &str,
     query: &Document,
-) -> std::result::Result<Vec<ArrayFilterPredicate>, String> {
+) -> std::result::Result<Vec<PositionalQueryPredicate>, String> {
     if query.keys().any(|key| key.starts_with('$')) {
         return Err("positional $ requires a direct array predicate".to_string());
     }
@@ -8774,28 +8774,29 @@ fn positional_query_predicates(
             if let Bson::Document(document) = condition
                 && let Some(elem_match) = document.get("$elemMatch")
             {
-                let Bson::Document(filter) = elem_match else {
+                if !matches!(elem_match, Bson::Document(_)) {
                     return Err("$elemMatch requires a document".to_string());
-                };
-                validate_filter_shape(filter).map_err(|err| err.errmsg)?;
-                predicates.push(ArrayFilterPredicate {
-                    document: filter.clone(),
-                    root: None,
-                });
+                }
+                validate_elem_match_shape(elem_match).map_err(|err| err.errmsg)?;
+                predicates.push(PositionalQueryPredicate::ElemMatch(elem_match.clone()));
                 continue;
             }
             validate_array_filter_condition(condition)?;
-            predicates.push(ArrayFilterPredicate {
-                document: Document::new(),
-                root: Some(condition.clone()),
-            });
+            predicates.push(PositionalQueryPredicate::ArrayFilter(
+                ArrayFilterPredicate {
+                    document: Document::new(),
+                    root: Some(condition.clone()),
+                },
+            ));
         } else if let Some(rest) = field.strip_prefix(&format!("{array_path}.")) {
             validate_filter_shape(&doc! { rest.to_string(): condition.clone() })
                 .map_err(|err| err.errmsg)?;
-            predicates.push(ArrayFilterPredicate {
-                document: doc! { rest.to_string(): condition.clone() },
-                root: None,
-            });
+            predicates.push(PositionalQueryPredicate::ArrayFilter(
+                ArrayFilterPredicate {
+                    document: doc! { rest.to_string(): condition.clone() },
+                    root: None,
+                },
+            ));
         }
     }
     if predicates.is_empty() {
@@ -8804,13 +8805,27 @@ fn positional_query_predicates(
     Ok(predicates)
 }
 
+#[derive(Clone, Debug)]
+enum PositionalQueryPredicate {
+    ArrayFilter(ArrayFilterPredicate),
+    ElemMatch(Bson),
+}
+
 fn positional_element_matches(
     value: &Bson,
-    predicates: &[ArrayFilterPredicate],
+    predicates: &[PositionalQueryPredicate],
     collation: &Collation,
 ) -> std::result::Result<bool, String> {
     for predicate in predicates {
-        if !array_filter_predicate_matches(value, predicate, collation)? {
+        let matched = match predicate {
+            PositionalQueryPredicate::ArrayFilter(predicate) => {
+                array_filter_predicate_matches(value, predicate, collation)?
+            }
+            PositionalQueryPredicate::ElemMatch(operand) => {
+                matches_elem_match_value(value, operand, collation).map_err(|err| err.errmsg)?
+            }
+        };
+        if !matched {
             return Ok(false);
         }
     }
@@ -22207,6 +22222,189 @@ mod tests {
             .get_array("items")
             .unwrap(),
             stored.get_array("items").unwrap()
+        );
+    }
+
+    #[test]
+    fn positional_update_binds_scalar_elem_match_predicates() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [{
+                    "_id": "u1",
+                    "scores": [1_i32, 5_i32, 7_i32, 11_i32],
+                    "tags": ["Alpha", "BETA", "beta"],
+                    "items": [
+                        { "kind": "closed", "score": 9_i32, "status": "old" },
+                        { "kind": "open", "score": 6_i32, "status": "new" },
+                        { "kind": "open", "score": 3_i32, "status": "old" }
+                    ]
+                }],
+            },
+        )
+        .unwrap();
+
+        let numeric = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "scores": { "$elemMatch": { "$gte": 5_i32, "$lt": 10_i32 } } },
+                    "u": { "$set": { "scores.$": 99_i32 } },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(numeric.get_i32("nModified").unwrap(), 1);
+
+        let collated = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "tags": { "$elemMatch": { "$eq": "beta" } } },
+                    "u": { "$set": { "tags.$": "MATCH" } },
+                    "collation": { "locale": "en", "strength": 2_i32 },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(collated.get_i32("nModified").unwrap(), 1);
+
+        let document = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "items": { "$elemMatch": { "kind": "open", "score": { "$gte": 5_i32 } } } },
+                    "u": { "$set": { "items.$.status": "working" } },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(document.get_i32("nModified").unwrap(), 1);
+
+        let stored = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        )
+        .remove(0);
+        assert_eq!(
+            stored.get_array("scores").unwrap(),
+            &bson_ints(&[1, 99, 7, 11])
+        );
+        assert_eq!(
+            stored.get_array("tags").unwrap(),
+            &bson_strings(&["Alpha", "MATCH", "beta"])
+        );
+        assert_eq!(
+            stored.get_array("items").unwrap(),
+            &bson_documents(vec![
+                doc! { "kind": "closed", "score": 9_i32, "status": "old" },
+                doc! { "kind": "open", "score": 6_i32, "status": "working" },
+                doc! { "kind": "open", "score": 3_i32, "status": "old" },
+            ])
+        );
+    }
+
+    #[test]
+    fn positional_scalar_elem_match_errors_preserve_documents() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "scores": [1_i32, 5_i32, 7_i32] },
+                    { "_id": "u2", "scores": [2_i32, 6_i32, 8_i32] },
+                ],
+            },
+        )
+        .unwrap();
+
+        let before = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 } },
+            )
+            .unwrap(),
+        );
+        let bad_operator = update_documents(
+            &conn,
+            &doc! {
+                "update": "users",
+                "$db": "app",
+                "updates": [{
+                    "q": { "scores": { "$elemMatch": { "$where": "bad" } } },
+                    "u": { "$set": { "scores.$": 99_i32 } },
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&bad_operator)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "users", "$db": "app", "sort": { "_id": 1_i32 } },
+                )
+                .unwrap()
+            ),
+            before
+        );
+
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "orders",
+                "$db": "app",
+                "documents": [
+                    { "_id": "o1", "active": true, "items": [{ "status": "new" }] },
+                    { "_id": "o2", "active": true, "items": ["scalar"] },
+                ],
+            },
+        )
+        .unwrap();
+        let partial_before = first_batch(
+            &find_documents(
+                &conn,
+                &doc! { "find": "orders", "$db": "app", "sort": { "_id": 1_i32 } },
+            )
+            .unwrap(),
+        );
+        let failed_multi = update_documents(
+            &conn,
+            &doc! {
+                "update": "orders",
+                "$db": "app",
+                "updates": [{
+                    "q": { "active": true, "items": { "$exists": true } },
+                    "u": { "$set": { "items.$.status": "done" } },
+                    "multi": true,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(write_errors(&failed_multi)[0].get_i32("index").unwrap(), 0);
+        assert_eq!(
+            first_batch(
+                &find_documents(
+                    &conn,
+                    &doc! { "find": "orders", "$db": "app", "sort": { "_id": 1_i32 } },
+                )
+                .unwrap()
+            ),
+            partial_before
         );
     }
 

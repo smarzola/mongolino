@@ -121,11 +121,38 @@ cargo build
 
 ## Completion
 
-- [ ] Fix positional scalar `$elemMatch` binding.
-- [ ] Add happy-path, not-happy-path, and adversarial Rust coverage.
-- [ ] Add PyMongo e2e coverage.
-- [ ] Run verification and record exact commands/results below.
-- [ ] Commit the completed fix.
+- [x] Fix positional scalar `$elemMatch` binding.
+- [x] Add happy-path, not-happy-path, and adversarial Rust coverage.
+- [x] Add PyMongo e2e coverage.
+- [x] Run verification and record exact commands/results below.
+- [x] Commit the completed fix.
 
 ## Status Notes
 
+2026-07-05:
+
+- Fixed first-positional `$` predicate extraction so direct `$elemMatch`
+  predicates are represented separately from arrayFilters and matched through
+  the existing query matcher `matches_elem_match_value` split. Scalar/operator
+  `$elemMatch` predicates now bind scalar array elements, while document-array
+  `$elemMatch` predicates continue to bind document elements.
+- Added Rust coverage for numeric scalar `$elemMatch`, collation-aware string
+  scalar `$elemMatch`, document-array `$elemMatch` regression, unsupported
+  `$elemMatch` operator errors preserving documents, and multi-document
+  positional update failure preserving all matched documents.
+- Added PyMongo coverage for `update_one` scalar-array `$elemMatch` with
+  `"scores.$"`, no-mutation invalid scalar `$elemMatch`, and
+  `find_one_and_update` scalar-array `$elemMatch`.
+- Verification:
+  - `cargo fmt -- --check` passed.
+  - `cargo test positional` passed: 5 main tests and 5 bench-target tests.
+  - `cargo test update` passed: 24 main tests and 24 bench-target tests.
+  - `cargo test find_and_modify` passed: 13 main tests and 13 bench-target
+    tests.
+  - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py`
+    failed in the sandbox with `PermissionError: [Errno 1] Operation not
+    permitted` from `sock.bind(("127.0.0.1", 0))`.
+  - `cargo build` passed with existing dead-code warnings.
+  - The same PyMongo command rerun unsandboxed after rebuilding passed:
+    38 passed in 20.23s.
+  - `cargo test` passed: 185 main tests and 187 bench-target tests.

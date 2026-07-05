@@ -313,6 +313,49 @@ def test_positional_first_and_all_update_subset(collection):
     assert collection.find_one({"_id": "o1"}) == before
 
 
+def test_positional_first_scalar_elem_match_update_subset(collection):
+    collection.insert_one(
+        {
+            "_id": "u1",
+            "scores": [1, 5, 7, 11],
+            "tags": ["Alpha", "BETA", "beta"],
+        }
+    )
+
+    numeric = collection.update_one(
+        {"scores": {"$elemMatch": {"$gte": 5, "$lt": 10}}},
+        {"$set": {"scores.$": 99}},
+    )
+    assert numeric.matched_count == 1
+    assert numeric.modified_count == 1
+
+    collated = collection.update_one(
+        {"tags": {"$elemMatch": {"$eq": "beta"}}},
+        {"$set": {"tags.$": "MATCH"}},
+        collation={"locale": "en", "strength": 2},
+    )
+    assert collated.modified_count == 1
+
+    assert collection.find_one({"_id": "u1"}) == {
+        "_id": "u1",
+        "scores": [1, 99, 7, 11],
+        "tags": ["Alpha", "MATCH", "beta"],
+    }
+
+
+def test_positional_first_scalar_elem_match_errors_do_not_mutate(collection):
+    collection.insert_one({"_id": "u1", "scores": [1, 5, 7]})
+    before = collection.find_one({"_id": "u1"})
+
+    with pytest.raises(WriteError):
+        collection.update_one(
+            {"scores": {"$elemMatch": {"$where": "bad"}}},
+            {"$set": {"scores.$": 99}},
+        )
+
+    assert collection.find_one({"_id": "u1"}) == before
+
+
 def test_array_filters_update_subset_and_errors(collection):
     collection.insert_one(
         {
