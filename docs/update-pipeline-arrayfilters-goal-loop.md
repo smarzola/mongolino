@@ -172,7 +172,7 @@ When a milestone is complete:
 - [x] Milestone 2: Positional `$` and `$[]`
 - [x] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
 - [x] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
-- [ ] Milestone 5: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
+- [x] Milestone 5: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
 - [ ] Milestone 6: Final verification and handoff
 
 ## Milestone 0: Update Spec Architecture And Preflight Model
@@ -590,6 +590,26 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Extended PyMongo e2e/spec coverage for update pipelines,
+  positional `$`, `$[]`, `$[identifier]`, `arrayFilters`, findAndModify, and
+  representative unsupported/error paths; updated the README compatibility
+  notes, roadmap scorecard, and performance baseline rationale for the existing
+  write-targeting budget. Verification passed with `jq empty
+  tests/spec_corpus/find_and_modify.json tests/spec_corpus/update_operators.json
+  tests/spec_corpus/update_array_operators.json`, `cargo fmt -- --check`,
+  `cargo test update`, `cargo test find_and_modify`, `cargo run --bin
+  mongolino-bench -- --profile ci --check-budget`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache
+  uv lock --check`, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
+  --locked --dev`, and `cargo test` (183 main tests and 185 bench-target tests
+  passed). Sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+  --locked pytest tests/e2e/test_update_operators.py
+  tests/e2e/test_find_and_modify.py tests/e2e/test_spec_corpus.py` failed
+  before server startup on localhost bind permission; the same command passed
+  unsandboxed with 65 tests passed. Commit hash pending at checkpoint commit
+  time.
 
 ## Milestone 6: Final Verification And Handoff
 

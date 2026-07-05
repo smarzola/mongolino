@@ -72,6 +72,26 @@
           "score": 2
         }
       ]
+    },
+    {
+      "_id": "u3",
+      "items": [
+        {
+          "kind": "open",
+          "status": "new",
+          "score": 1
+        },
+        {
+          "kind": "closed",
+          "status": "done",
+          "score": 5
+        },
+        {
+          "kind": "open",
+          "status": "new",
+          "score": 3
+        }
+      ]
     }
   ],
   "operations": [
@@ -225,6 +245,77 @@
     {
       "name": "update_one",
       "filter": {
+        "items.kind": "open"
+      },
+      "update": {
+        "$set": {
+          "items.$.status": "working"
+        },
+        "$inc": {
+          "items.$.score": 2
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u3"
+      },
+      "update": {
+        "$mul": {
+          "items.$[].score": 2
+        }
+      },
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u3"
+      },
+      "update": {
+        "$set": {
+          "items.$[open].status": "closed"
+        },
+        "$max": {
+          "items.$[open].score": 10
+        }
+      },
+      "arrayFilters": [
+        {
+          "open.kind": "open"
+        }
+      ],
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u3"
+      },
+      "update": {
+        "$set": {
+          "items.$[open].status": "bad"
+        }
+      },
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "arrayFilters"
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
         "_id": "u1"
       },
       "update": {
@@ -347,6 +438,26 @@
       "docs": [],
       "events": [
         "seen"
+      ]
+    },
+    {
+      "_id": "u3",
+      "items": [
+        {
+          "kind": "open",
+          "status": "closed",
+          "score": 10
+        },
+        {
+          "kind": "closed",
+          "status": "done",
+          "score": 10
+        },
+        {
+          "kind": "open",
+          "status": "closed",
+          "score": 10
+        }
       ]
     }
   ]

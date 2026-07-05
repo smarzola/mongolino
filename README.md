@@ -61,10 +61,10 @@ Compatibility flags:
 | `distinct` | Partial | Returns unique scalar, dotted-path, and array-expanded values for documents matching the supported filter subset, ordered deterministically by BSON sort order or supported collation order; de-duplicates strings under the supported collation subset; runs deterministic namespace-scoped TTL sweeps before reading. | No hint, read concern, maxTimeMS, or complex array semantics beyond the documented matcher behavior. Non-simple collation range filters are rejected. |
 | `insert` | Partial | Accepts `documents`, assigns `_id` when missing, preserves existing documents on duplicate `_id`, reports duplicate key and validation `writeErrors`, supports ordered/unordered batches, and honors `bypassDocumentValidation: true`. | No write concern, retryable writes, or sessions beyond accepting `lsid`. |
 | `find` | Partial | Returns `firstBatch` and creates a per-client server-side cursor when more shaped results remain. Supports exact matches, dotted paths, limited array traversal, `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$type`, `$size`, `$all`, `$elemMatch`, `$and`, `$or`, `$nor`, `$not`, projection, sort, skip, limit, capped batch size, supported collation, `hint`, `explain: true`, conservative exact/prefix/range index narrowing, sort-aware reads for unique fully covered bool/ObjectId/date scalar index keys, and deterministic namespace-scoped TTL sweeps before non-explain reads. | No `$where`, geospatial/text search, read concern, tailable cursors, text/geospatial/hashed/wildcard index planning, broad sort pushdown, or non-simple collation range filters. Unsupported operators and unsupported predicate shapes return command errors. |
-| `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, supported collation for target matching/sort, `fields`/`projection`, pre-image or post-image return, update/replacement upsert, supported update modifiers, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, unique-index enforcement, maintained index entries, supported `hint`, and deterministic namespace-scoped TTL sweeps before target selection. | No array filters, pipeline updates, positional updates, write concern, maxTimeMS, `let`, retryable writes, transaction semantics, explain behavior, or non-simple collation range filters. Unsupported shapes return command errors. |
+| `findAndModify` / `findandmodify` | Partial | Supports PyMongo `find_one_and_update`, `find_one_and_replace`, and `find_one_and_delete` for one document, with filter, deterministic sort, supported collation for target matching/sort, `fields`/`projection`, pre-image or post-image return, update/replacement/pipeline upsert, supported update modifiers, the bounded update pipeline subset, conservative positional `$`, `$[]`, and `$[identifier]` with `arrayFilters`, `_id` immutability, validator enforcement, `bypassDocumentValidation: true`, unique-index enforcement, maintained index entries, supported `hint`, and deterministic namespace-scoped TTL sweeps before target selection. | No nested multi-array positional traversal, array modifiers through positional paths, unsupported update pipeline stages, write concern, maxTimeMS, `let`, retryable writes, transaction semantics, explain behavior, or non-simple collation range filters. Unsupported shapes return command errors. |
 | `getMore` | Partial | Returns `nextBatch` for live per-client cursors and closes cursors on exhaustion. | Cursor state is in memory, per connection, and snapshot-at-find-time. No cursor timeout, awaitData, or cross-connection cursor lookup. |
 | `killCursors` | Partial | Removes live per-client cursors and reports `cursorsKilled` or `cursorsNotFound`. | No cross-connection cursor lookup. Malformed cursor ids return command errors. |
-| `update` | Partial | Supports replacement updates; `$set`, `$unset`, `$inc`, `$rename`, `$min`, `$max`, `$mul`, `$setOnInsert`; array modifiers `$push`, `$addToSet`, `$pop`, `$pull`, and `$pullAll` for the documented subset; upsert; single-update; multi-update; ordered/unordered batches; supported per-entry collation; supported `hint`; `_id` immutability; validator enforcement; `bypassDocumentValidation: true`; and duplicate-key write errors. | No array filters, positional operators, update pipelines, `$push` `$position`/`$slice`/`$sort`, write concern, retryable writes, transactions, explain behavior, or non-simple collation range filters. |
+| `update` | Partial | Supports replacement updates; update pipelines with `$set`/`$addFields`, `$unset`, `$project`, `$replaceRoot`, and `$replaceWith`; `$set`, `$unset`, `$inc`, `$rename`, `$min`, `$max`, `$mul`, `$setOnInsert`; array modifiers `$push`, `$addToSet`, `$pop`, `$pull`, and `$pullAll` for the documented subset; conservative positional `$`, `$[]`, and `$[identifier]` with `arrayFilters` for supported scalar modifiers; upsert; single-update; multi-update; ordered/unordered batches; supported per-entry collation; supported `hint`; `_id` immutability; validator enforcement; `bypassDocumentValidation: true`; and duplicate-key write errors. | No nested multi-array positional traversal, array modifiers through positional paths, unsupported update pipeline stages, `$push` `$position`/`$slice`/`$sort`, write concern, retryable writes, transactions, explain behavior, or non-simple collation range filters. |
 | `delete` | Partial | Supports batch deletes with `q`, `limit`, supported per-entry collation, and supported `hint`; `limit: 1` deletes one deterministic match and `limit: 0` deletes all matches. | No write concern, retryable writes, explain behavior, or non-simple collation range filters. |
 | Cursors | Partial | `find` and `aggregate` store remaining results under a positive cursor id, PyMongo can iterate across multiple batches, exhausted cursors close with `id: 0`, and `killCursors` explicitly closes live cursors. | No cursor timeout. Cursor state is not durable and is scoped to one client connection. Invalid or exhausted cursor ids return explicit command errors for `getMore`. |
 | BSON storage | Partial | Stores BSON blobs in SQLite, derives a stable primary key from `_id`, maintains exact, compound-prefix, range, scalar multikey, sparse, partial, TTL, and supported collation-aware index metadata/entries for supported planner shapes, stores durable collection validator metadata, and enforces the supported validator subset on document-producing writes. Inserts with operator-shaped field names store those names as data. | No document size enforcement beyond message size. Unsupported planner shapes fall back or error as documented instead of weakening matcher semantics. |
@@ -123,19 +123,30 @@ Projection supports inclusion or exclusion mode, with `_id` as the only allowed
 mode override. Sort supports top-level or dotted fields with `1` or `-1`; missing
 fields sort deterministically before present fields in ascending order.
 
-Update paths support dotted document fields. Dotted updates through scalar
-parents, conflicting paths such as `{ a: 1, "a.b": 2 }`, positional path
-segments, attempts to change `_id`, and unsupported update operators are
-rejected with write errors.
+Update paths support dotted document fields and a conservative single-array
+positional subset. Dotted updates through scalar parents, conflicting paths such
+as `{ a: 1, "a.b": 2 }`, nested/multiple positional segments, attempts to
+change `_id`, and unsupported update operators are rejected with write errors.
 
 Supported update modifiers are intentionally bounded. Scalar modifiers include
 `$set`, `$unset`, `$inc`, `$rename`, `$min`, `$max`, `$mul`, and `$setOnInsert`.
 Array modifiers include `$push` with scalar values or `$each`, `$addToSet` with
 scalar values or `$each`, `$pop` with `1` or `-1`, `$pull` with equality or the
 supported matcher predicate subset, and `$pullAll` with scalar/document equality.
-`$setOnInsert` applies only to inserted upserts. `$push` option documents using
-`$position`, `$slice`, `$sort`, or unknown options are rejected explicitly, as
-are update pipelines, array filters, and positional operators.
+`$setOnInsert` applies only to inserted upserts. Supported scalar modifiers
+through positional paths are `$set`, `$unset`, `$inc`, `$min`, `$max`, and
+`$mul`; `$` selects the first matching element from a supported query predicate,
+`$[]` applies to every element of one array path, and `$[identifier]` uses
+`arrayFilters` documents with one lowercase identifier and the supported matcher
+subset. `$push` option documents using `$position`, `$slice`, `$sort`, or
+unknown options are rejected explicitly, as are array modifiers through
+positional paths.
+
+Update pipelines are supported for `$set`/`$addFields`, `$unset`, `$project`,
+`$replaceRoot`, and `$replaceWith` using the bounded aggregation expression
+subset. Pipeline updates preserve `_id`, can synthesize conservative upsert base
+documents from equality query fields, and reject unsupported stages such as
+`$lookup`, `$group`, `$unwind`, `$out`, `$merge`, and `$facet`.
 
 `findAndModify` uses the same matcher, sort, projection, update application,
 duplicate-key checks, and maintained index entries as `find`, `update`, and

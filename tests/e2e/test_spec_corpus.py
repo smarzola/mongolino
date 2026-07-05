@@ -146,6 +146,8 @@ def execute_operation(operation, collection):
         kwargs = {"upsert": operation.get("upsert", False)}
         if "collation" in operation:
             kwargs["collation"] = operation["collation"]
+        if "arrayFilters" in operation:
+            kwargs["array_filters"] = operation["arrayFilters"]
         return collection.update_one(
             operation.get("filter", {}),
             operation["update"],
@@ -155,6 +157,8 @@ def execute_operation(operation, collection):
         kwargs = {}
         if "collation" in operation:
             kwargs["collation"] = operation["collation"]
+        if "arrayFilters" in operation:
+            kwargs["array_filters"] = operation["arrayFilters"]
         return collection.update_many(operation.get("filter", {}), operation["update"], **kwargs)
     if name == "find_one_and_update":
         kwargs = {
@@ -165,6 +169,8 @@ def execute_operation(operation, collection):
         }
         if "collation" in operation:
             kwargs["collation"] = operation["collation"]
+        if "arrayFilters" in operation:
+            kwargs["array_filters"] = operation["arrayFilters"]
         return collection.find_one_and_update(
             operation.get("filter", {}),
             operation["update"],

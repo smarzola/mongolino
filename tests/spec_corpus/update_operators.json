@@ -104,6 +104,45 @@
       "filter": {
         "_id": "u1"
       },
+      "update": [
+        {
+          "$set": {
+            "summary": {
+              "$concat": [
+                "$location",
+                "-updated"
+              ]
+            }
+          }
+        }
+      ],
+      "expect_result": {
+        "matched_count": 1,
+        "modified_count": 1
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
+      "update": [
+        {
+          "$lookup": {
+            "from": "other"
+          }
+        }
+      ],
+      "expect_error": {
+        "type": "WriteError",
+        "contains": "not supported"
+      }
+    },
+    {
+      "name": "update_one",
+      "filter": {
+        "_id": "u1"
+      },
       "update": {
         "$rename": {
           "location": "_id"
@@ -123,6 +162,7 @@
       "multiplier": 12,
       "profile": {},
       "location": "Rome",
+      "summary": "Rome-updated",
       "floor": 4,
       "ceiling": 8,
       "missingProduct": 0

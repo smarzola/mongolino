@@ -24,6 +24,21 @@ unrelated scans would regress the existing find/count/update/aggregation
 command-handler benchmarks, while focused Rust and PyMongo tests verify the TTL
 namespace scoping and index-entry cleanup behavior directly.
 
+## Update Pipeline And Positional Coverage
+
+Update pipelines and positional array filters reuse the existing transaction
+candidate planning, validation, unique-index enforcement, and index-entry
+refresh path. The primary performance risk is accidentally falling back from
+indexed write targeting to broad scans or adding extra index refreshes per
+matched document. The existing `update_index_refresh`, `update_compound_target`,
+and hinted/indexed write-targeting test coverage exercise that budget directly,
+while the new Rust and PyMongo tests cover positional `$`, `$[]`, `$[identifier]`
+with `arrayFilters`, pipeline upserts, validation failures, TTL preflight, and
+index-entry freshness. No dedicated positional benchmark is recorded yet; the CI
+budget remains the guardrail for this uplift because supported positional and
+pipeline updates are intentionally one-array/document-local transformations
+after target selection.
+
 ## Commands
 
 ```sh

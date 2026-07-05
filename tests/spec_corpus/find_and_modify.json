@@ -201,7 +201,7 @@
       },
       "expect_error": {
         "type": "OperationFailure",
-        "code": 72,
+        "code": 2,
         "contains": "arrayFilters"
       }
     }

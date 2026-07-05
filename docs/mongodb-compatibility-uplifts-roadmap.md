@@ -30,7 +30,10 @@ intentionally conservative:
 - Aggregation now has a bounded expression language, computed shaping stages,
   root replacement, computed group operands, and simple same-database equality
   `$lookup`; advanced stages and full expression parity remain unsupported.
-- Update pipelines, positional operators, and `arrayFilters` are unsupported.
+- Update pipelines, positional `$`, `$[]`, and filtered `$[identifier]` with
+  `arrayFilters` now support a conservative single-array scalar-modifier subset;
+  nested multi-array traversal, array modifiers through positional paths, and
+  unsupported pipeline stages remain explicit errors.
 - Sessions/retryable write/readConcern/writeConcern behavior is only minimally
   accepted or explicitly rejected.
 
@@ -45,10 +48,10 @@ claim of full MongoDB parity.
 | Index planning and diagnostics | 15% | 15% | 15% |
 | Index lifecycle/TTL/collation behavior | 15% | 13% | 13% |
 | Aggregation compatibility | 20% | 15% | 15% |
-| Update language compatibility | 15% | 8% | 13% |
+| Update language compatibility | 15% | 13% | 13% |
 | Driver workflow semantics | 10% | 3% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 77% | 86% |
+| Total | 100% | 82% | 86% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -99,10 +102,17 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt: `docs/aggregation-v2-goal-loop.md`.
 
 6. Update Pipeline And Array Filters
-   - Add update pipelines, positional `$`, `$[]`, `$[id]`, and `arrayFilters`
-     for a conservative subset.
-   - Prompt to write after Aggregation v2:
-     `docs/update-pipeline-arrayfilters-goal-loop.md`.
+   - Complete in uplift 6. Added update pipelines with `$set`/`$addFields`,
+     `$unset`, `$project`, `$replaceRoot`, and `$replaceWith`; conservative
+     positional `$`, `$[]`, and `$[identifier]` with `arrayFilters`; staged
+     no-mutation-on-error preflight for matched updates; and invariant coverage
+     across validation, unique indexes, maintained index entries, TTL preflight,
+     and findAndModify images.
+   - Nested multi-array traversal, array modifiers through positional paths,
+     command `let`, unsupported pipeline stages, full aggregation expression
+     parity, write concern, retryable writes, transactions, and explain behavior
+     remain unsupported.
+   - Prompt: `docs/update-pipeline-arrayfilters-goal-loop.md`.
 
 7. Driver Workflow Semantics
    - Add practical `readConcern`, `writeConcern`, session, and retryable write
