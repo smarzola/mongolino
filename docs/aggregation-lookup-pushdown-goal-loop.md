@@ -195,7 +195,7 @@ Status note 2026-07-05:
     tests/e2e/test_aggregation.py`: sandbox run failed before server startup
     because `127.0.0.1:0` bind returned `PermissionError: [Errno 1] Operation
     not permitted`; the same command passed outside the sandbox with 28 tests.
-- Commit hash: pending local commit after this status note.
+- Commit hash: `d9c2715`.
 
 ## Milestone 0: Planner Design And Adversarial Tests
 
