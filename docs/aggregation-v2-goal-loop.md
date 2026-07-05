@@ -673,6 +673,60 @@ Status note (2026-07-05):
   - Aggregation execution remains in Rust over materialized documents; lookup
     and computed expressions are not pushed down into SQLite query plans.
 
+## Parent Adversarial Review
+
+Status 2026-07-05: Initial parent review found two blocking TTL/preflight
+consistency gaps in the completed Aggregation v2 uplift:
+
+- `$lookup` loaded foreign namespace documents without first running the
+  deterministic TTL sweep for that foreign namespace, so expired foreign
+  documents could leak through joins even though direct reads would hide/delete
+  them.
+- Constant-only expression errors such as `{ "$divide": [10, 0] }` were detected
+  during execution after the source namespace TTL sweep, so a command that
+  returned an error could still delete expired source documents.
+
+Fix prompt: `docs/aggregation-v2-adversarial-fix-goal-loop.md`.
+
+Fix commits:
+
+- `0be8fd8` - Fix aggregation TTL preflight adversarial gaps.
+- `ffa583d` - Record aggregation adversarial final verification.
+- `7a93609` - Record aggregation adversarial fix commit hashes.
+
+Parent re-review accepted the fix. `$lookup` now sweeps the foreign namespace
+after pipeline shape/collation preflight and before loading foreign documents.
+Static expression validation now evaluates only expressions proven constant,
+with no field paths or `$$ROOT`/`$$CURRENT`, so literal division-by-zero,
+nonnumeric numeric operators, nonstring string operators, and constant
+non-document root replacement errors are rejected before TTL sweep. Data-
+dependent expression errors remain runtime errors by design.
+
+Parent verification passed:
+
+```bash
+cargo fmt -- --check
+cargo test lookup
+cargo test aggregation_expression
+cargo test aggregate_shaping
+cargo test aggregate
+cargo test ttl
+cargo test collation
+cargo test
+cargo build
+cargo run --bin mongolino-bench -- --profile ci --check-budget
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev
+UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e
+```
+
+Results: `cargo test` passed with 180 main tests and 182 bench-target tests.
+`cargo build` passed with existing dead-code warnings. The CI benchmark budget
+passed, including `aggregation_expression_add_fields` and
+`aggregation_lookup_single_document`. The sandboxed PyMongo e2e run was blocked
+by localhost bind permission, then the same unsandboxed command passed with 206
+tests in 107.15 seconds.
+
 ## Final Response Requirements
 
 When the goal is complete, report:
