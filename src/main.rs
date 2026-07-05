@@ -15,6 +15,7 @@ const OP_QUERY: i32 = 2004;
 const OP_MSG: i32 = 2013;
 const MAX_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
 const DOCUMENT_VALIDATION_ERROR_CODE: i32 = 121;
+const RETRYABLE_WRITE_CACHE_LIMIT: usize = 128;
 
 static NEXT_REQUEST_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -84,6 +85,7 @@ struct WireMessage {
 pub(crate) struct ClientState {
     cursors: HashMap<i64, CursorState>,
     next_cursor_id: i64,
+    retryable_writes: VecDeque<RetryableWriteEntry>,
 }
 
 impl Default for ClientState {
@@ -91,8 +93,23 @@ impl Default for ClientState {
         Self {
             cursors: HashMap::new(),
             next_cursor_id: 1,
+            retryable_writes: VecDeque::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetryableWriteKey {
+    session_id: String,
+    txn_number: i64,
+}
+
+#[derive(Clone, Debug)]
+struct RetryableWriteEntry {
+    key: RetryableWriteKey,
+    command_name: String,
+    command_body: Vec<u8>,
+    response: Document,
 }
 
 #[derive(Debug)]
@@ -113,6 +130,50 @@ impl ClientState {
             },
         );
         id
+    }
+
+    fn retryable_write_response(
+        &self,
+        key: &RetryableWriteKey,
+        command_name: &str,
+        command_body: &[u8],
+    ) -> std::result::Result<Option<Document>, Document> {
+        let Some(entry) = self.retryable_writes.iter().find(|entry| &entry.key == key) else {
+            return Ok(None);
+        };
+        if entry.command_name == command_name && entry.command_body == command_body {
+            Ok(Some(entry.response.clone()))
+        } else {
+            Err(command_error(
+                72,
+                "retryable write txnNumber was already used for a different command",
+            ))
+        }
+    }
+
+    fn record_retryable_write(
+        &mut self,
+        key: RetryableWriteKey,
+        command_name: String,
+        command_body: Vec<u8>,
+        response: Document,
+    ) {
+        if self
+            .retryable_writes
+            .iter()
+            .any(|entry| entry.key == key && entry.command_name == command_name)
+        {
+            return;
+        }
+        self.retryable_writes.push_back(RetryableWriteEntry {
+            key,
+            command_name,
+            command_body,
+            response,
+        });
+        while self.retryable_writes.len() > RETRYABLE_WRITE_CACHE_LIMIT {
+            self.retryable_writes.pop_front();
+        }
     }
 }
 
@@ -544,7 +605,23 @@ pub(crate) fn handle_command_with_state(
         return Ok(command_error(59, "empty command document"));
     };
 
-    match command_name.as_str() {
+    let workflow = match parse_driver_workflow_options(command_name.as_str(), command) {
+        Ok(workflow) => workflow,
+        Err(response) => return Ok(response),
+    };
+    let retryable_body = match workflow.retryable_key.as_ref() {
+        Some(key) => {
+            let command_body = encode_document(command)?;
+            match client_state.retryable_write_response(key, &command_name, &command_body) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => Some(command_body),
+                Err(response) => return Ok(response),
+            }
+        }
+        None => None,
+    };
+
+    let response = match command_name.as_str() {
         "hello" | "isMaster" | "ismaster" => Ok(hello_response()),
         "ping" => Ok(doc! { "ok": 1.0 }),
         "buildInfo" | "buildinfo" => Ok(doc! {
@@ -559,7 +636,7 @@ pub(crate) fn handle_command_with_state(
             "ok": 1.0,
         }),
         "listDatabases" => list_databases(conn),
-        "endSessions" => Ok(doc! { "ok": 1.0 }),
+        "endSessions" => end_sessions(command),
         "create" => create_collection(conn, command),
         "listCollections" => list_collections(conn, command),
         "collMod" => coll_mod(conn, command),
@@ -578,11 +655,21 @@ pub(crate) fn handle_command_with_state(
         "killCursors" => kill_cursors(client_state, command),
         "update" => update_documents(conn, command),
         "delete" => delete_documents(conn, command),
+        "commitTransaction" | "abortTransaction" | "prepareTransaction" => Ok(command_error(
+            263,
+            "transactions are not supported by mongolino",
+        )),
         other => Ok(command_error(
             59,
             &format!("command '{other}' is not supported yet"),
         )),
+    }?;
+
+    if let (Some(key), Some(command_body)) = (workflow.retryable_key, retryable_body) {
+        client_state.record_retryable_write(key, command_name, command_body, response.clone());
     }
+
+    Ok(response)
 }
 
 fn command_name(command: &Document) -> Option<String> {
@@ -605,6 +692,241 @@ fn hello_response() -> Document {
         "readOnly": false,
         "ok": 1.0,
     }
+}
+
+#[derive(Clone, Debug)]
+struct DriverWorkflowOptions {
+    retryable_key: Option<RetryableWriteKey>,
+}
+
+fn parse_driver_workflow_options(
+    command_name: &str,
+    command: &Document,
+) -> std::result::Result<DriverWorkflowOptions, Document> {
+    if let Err(errmsg) = validate_driver_workflow_options(command_name, command) {
+        return Err(command_error(72, &errmsg));
+    }
+
+    let session_id = match command.get("lsid") {
+        Some(value) => Some(validate_lsid(value).map_err(|errmsg| command_error(72, &errmsg))?),
+        None => None,
+    };
+    let txn_number = match command.get("txnNumber") {
+        Some(value) => Some(parse_txn_number(value).map_err(|errmsg| command_error(72, &errmsg))?),
+        None => None,
+    };
+
+    if let Some(txn_number) = txn_number {
+        let Some(session_id) = session_id else {
+            return Err(command_error(72, "txnNumber requires a valid lsid"));
+        };
+        if !supports_retryable_write(command_name) {
+            return Err(command_error(
+                72,
+                "txnNumber is only supported for retryable write commands",
+            ));
+        }
+        return Ok(DriverWorkflowOptions {
+            retryable_key: Some(RetryableWriteKey {
+                session_id,
+                txn_number,
+            }),
+        });
+    }
+
+    Ok(DriverWorkflowOptions {
+        retryable_key: None,
+    })
+}
+
+fn validate_driver_workflow_options(
+    command_name: &str,
+    command: &Document,
+) -> std::result::Result<(), String> {
+    if transaction_command_name(command_name) {
+        return Err("transactions are not supported by mongolino".to_string());
+    }
+    for key in ["startTransaction", "autocommit"] {
+        if command.contains_key(key) {
+            return Err(format!(
+                "{key} is not supported; transactions are not supported"
+            ));
+        }
+    }
+    if command_name == "endSessions" {
+        validate_end_sessions_command(command)?;
+        return Ok(());
+    }
+    if let Some(value) = command.get("readConcern") {
+        if !supports_read_concern(command_name) {
+            return Err(format!("readConcern is not supported for {command_name}"));
+        }
+        validate_read_concern(value)?;
+    }
+    if let Some(value) = command.get("writeConcern") {
+        if !supports_write_concern(command_name) {
+            return Err(format!("writeConcern is not supported for {command_name}"));
+        }
+        validate_write_concern(value)?;
+    }
+    Ok(())
+}
+
+fn supports_read_concern(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "find" | "aggregate" | "count" | "distinct" | "listCollections" | "listDatabases"
+    )
+}
+
+fn supports_write_concern(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "create"
+            | "collMod"
+            | "drop"
+            | "dropDatabase"
+            | "createIndexes"
+            | "dropIndexes"
+    )
+}
+
+fn supports_retryable_write(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "insert" | "update" | "delete" | "findAndModify" | "findandmodify"
+    )
+}
+
+fn transaction_command_name(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "commitTransaction" | "abortTransaction" | "prepareTransaction"
+    )
+}
+
+fn validate_lsid(value: &Bson) -> std::result::Result<String, String> {
+    let Bson::Document(session) = value else {
+        return Err("lsid must be a document".to_string());
+    };
+    if session.len() != 1 || !session.contains_key("id") {
+        return Err("lsid must contain only an id field".to_string());
+    }
+    let Some(Bson::Binary(binary)) = session.get("id") else {
+        return Err("lsid.id must be BSON binary UUID data".to_string());
+    };
+    if binary.bytes.len() != 16 {
+        return Err("lsid.id UUID data must be 16 bytes".to_string());
+    }
+    Ok(hex_bytes(&binary.bytes))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_txn_number(value: &Bson) -> std::result::Result<i64, String> {
+    let txn_number = match value {
+        Bson::Int64(value) => *value,
+        Bson::Int32(value) => *value as i64,
+        _ => return Err("txnNumber must be an integer".to_string()),
+    };
+    if txn_number < 0 {
+        return Err("txnNumber must be non-negative".to_string());
+    }
+    Ok(txn_number)
+}
+
+fn validate_read_concern(value: &Bson) -> std::result::Result<(), String> {
+    let Bson::Document(read_concern) = value else {
+        return Err("readConcern must be a document".to_string());
+    };
+    for key in read_concern.keys() {
+        if key != "level" {
+            return Err(format!("readConcern field {key} is not supported"));
+        }
+    }
+    match read_concern.get("level") {
+        None => Ok(()),
+        Some(Bson::String(level)) if matches!(level.as_str(), "local" | "available") => Ok(()),
+        Some(Bson::String(level)) => Err(format!("readConcern level {level} is not supported")),
+        Some(_) => Err("readConcern level must be a string".to_string()),
+    }
+}
+
+fn validate_write_concern(value: &Bson) -> std::result::Result<(), String> {
+    let Bson::Document(write_concern) = value else {
+        return Err("writeConcern must be a document".to_string());
+    };
+    for key in write_concern.keys() {
+        if !matches!(key.as_str(), "w" | "j" | "wtimeout" | "wtimeoutMS") {
+            return Err(format!("writeConcern field {key} is not supported"));
+        }
+    }
+    match write_concern.get("w") {
+        None => {}
+        Some(Bson::Int32(1)) | Some(Bson::Int64(1)) => {}
+        Some(Bson::String(value)) if value == "majority" => {}
+        Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => {
+            return Err("writeConcern w:0 is not supported".to_string());
+        }
+        Some(Bson::Int32(_)) | Some(Bson::Int64(_)) | Some(Bson::String(_)) => {
+            return Err("writeConcern w value is not supported".to_string());
+        }
+        Some(_) => return Err("writeConcern w must be an integer or string".to_string()),
+    }
+    match write_concern.get("j") {
+        None | Some(Bson::Boolean(_)) => {}
+        Some(_) => return Err("writeConcern j must be a boolean".to_string()),
+    }
+    if write_concern.contains_key("wtimeout") && write_concern.contains_key("wtimeoutMS") {
+        return Err("writeConcern cannot include both wtimeout and wtimeoutMS".to_string());
+    }
+    for key in ["wtimeout", "wtimeoutMS"] {
+        match write_concern.get(key) {
+            None => {}
+            Some(Bson::Int32(value)) if *value >= 0 => {}
+            Some(Bson::Int64(value)) if *value >= 0 => {}
+            Some(Bson::Int32(_)) | Some(Bson::Int64(_)) => {
+                return Err(format!("writeConcern {key} must be non-negative"));
+            }
+            Some(_) => return Err(format!("writeConcern {key} must be an integer")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_end_sessions_command(command: &Document) -> std::result::Result<(), String> {
+    for key in command.keys() {
+        if !matches!(key.as_str(), "endSessions" | "$db" | "lsid") {
+            return Err(format!("{key} is not supported for endSessions"));
+        }
+    }
+    let sessions = command
+        .get_array("endSessions")
+        .map_err(|_| "endSessions must be an array".to_string())?;
+    for session in sessions {
+        validate_lsid(session)?;
+    }
+    Ok(())
+}
+
+fn end_sessions(command: &Document) -> Result<Document> {
+    if let Err(errmsg) = validate_end_sessions_command(command) {
+        return Ok(command_error(72, &errmsg));
+    }
+    Ok(doc! { "ok": 1.0 })
 }
 
 fn list_databases(conn: &Connection) -> Result<Document> {
@@ -651,6 +973,7 @@ fn create_collection(conn: &Connection, command: &Document) -> Result<Document> 
             "validationLevel",
             "validationAction",
             "index",
+            "writeConcern",
             "$db",
             "lsid",
         ],
@@ -682,6 +1005,7 @@ fn list_collections(conn: &Connection, command: &Document) -> Result<Document> {
             "authorizedCollections",
             "filter",
             "cursor",
+            "readConcern",
             "$db",
             "lsid",
         ],
@@ -783,6 +1107,7 @@ fn coll_mod(conn: &Connection, command: &Document) -> Result<Document> {
             "validationLevel",
             "validationAction",
             "index",
+            "writeConcern",
             "$db",
             "lsid",
         ],
@@ -923,7 +1248,9 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(collection) if !collection.is_empty() => collection,
         _ => return Ok(command_error(9, "drop command requires a collection name")),
     };
-    if let Some(errmsg) = reject_unsupported_command_keys(command, &["drop", "$db", "lsid"]) {
+    if let Some(errmsg) =
+        reject_unsupported_command_keys(command, &["drop", "writeConcern", "$db", "lsid"])
+    {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -951,9 +1278,10 @@ fn drop_collection(conn: &Connection, command: &Document) -> Result<Document> {
 
 fn drop_database(conn: &Connection, command: &Document) -> Result<Document> {
     let db = command.get_str("$db").unwrap_or("test");
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["dropDatabase", "comment", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["dropDatabase", "comment", "writeConcern", "$db", "lsid"],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -999,6 +1327,7 @@ fn count_documents_command(conn: &Connection, command: &Document) -> Result<Docu
             "limit",
             "hint",
             "explain",
+            "readConcern",
             "$db",
             "lsid",
             "collation",
@@ -1107,7 +1436,15 @@ fn distinct_command(conn: &Connection, command: &Document) -> Result<Document> {
     };
     if let Some(errmsg) = reject_unsupported_command_keys(
         command,
-        &["distinct", "key", "query", "collation", "$db", "lsid"],
+        &[
+            "distinct",
+            "key",
+            "query",
+            "collation",
+            "readConcern",
+            "$db",
+            "lsid",
+        ],
     ) {
         return Ok(command_error(72, &errmsg));
     }
@@ -1177,6 +1514,7 @@ fn aggregate_command_with_state(
             "pipeline",
             "cursor",
             "collation",
+            "readConcern",
             "$db",
             "lsid",
         ],
@@ -2609,6 +2947,8 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "hint",
             "collation",
             "arrayFilters",
+            "writeConcern",
+            "txnNumber",
             "$db",
             "lsid",
         ],
@@ -4929,9 +5269,10 @@ fn create_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         }
         Err(_) => return Ok(command_error(9, "createIndexes requires an indexes array")),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["createIndexes", "indexes", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["createIndexes", "indexes", "writeConcern", "$db", "lsid"],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -5056,9 +5397,10 @@ fn drop_indexes(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(collection) if !collection.is_empty() => collection,
         _ => return Ok(command_error(9, "dropIndexes requires a collection name")),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["dropIndexes", "index", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &["dropIndexes", "index", "writeConcern", "$db", "lsid"],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
     let index = match command.get("index") {
@@ -6967,6 +7309,8 @@ fn insert_documents(conn: &Connection, command: &Document) -> Result<Document> {
             "documents",
             "ordered",
             "bypassDocumentValidation",
+            "writeConcern",
+            "txnNumber",
             "$db",
             "lsid",
         ],
@@ -7144,6 +7488,8 @@ fn update_documents(conn: &Connection, command: &Document) -> Result<Document> {
             "updates",
             "ordered",
             "bypassDocumentValidation",
+            "writeConcern",
+            "txnNumber",
             "$db",
             "lsid",
         ],
@@ -9342,9 +9688,18 @@ fn delete_documents(conn: &Connection, command: &Document) -> Result<Document> {
         Ok(value) => value.unwrap_or(true),
         Err(errmsg) => return Ok(command_error(9, &errmsg)),
     };
-    if let Some(errmsg) =
-        reject_unsupported_command_keys(command, &["delete", "deletes", "ordered", "$db", "lsid"])
-    {
+    if let Some(errmsg) = reject_unsupported_command_keys(
+        command,
+        &[
+            "delete",
+            "deletes",
+            "ordered",
+            "writeConcern",
+            "txnNumber",
+            "$db",
+            "lsid",
+        ],
+    ) {
         return Ok(command_error(72, &errmsg));
     }
 
@@ -9512,6 +9867,7 @@ fn find_documents_with_state(
             "hint",
             "explain",
             "collation",
+            "readConcern",
             "$db",
             "lsid",
         ],
@@ -11606,8 +11962,398 @@ mod tests {
         values.iter().copied().map(Bson::Int32).collect()
     }
 
+    fn session_doc(seed: u8) -> Document {
+        doc! {
+            "id": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Uuid,
+                bytes: vec![seed; 16],
+            })
+        }
+    }
+
     fn bson_documents(values: Vec<Document>) -> Vec<Bson> {
         values.into_iter().map(Bson::Document).collect()
+    }
+
+    #[test]
+    fn driver_workflow_validates_sessions_and_end_sessions() {
+        let conn = test_conn();
+        let valid_session = Bson::Document(session_doc(7));
+        let insert = handle_command(
+            &conn,
+            &doc! {
+                "insert": "sessions",
+                "$db": "app",
+                "lsid": valid_session.clone(),
+                "documents": [{ "_id": "ok" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(insert.get_i32("n").unwrap(), 1);
+
+        let malformed = handle_command(
+            &conn,
+            &doc! {
+                "insert": "sessions",
+                "$db": "app",
+                "lsid": { "id": "not-binary" },
+                "documents": [{ "_id": "bad" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.sessions"),
+            vec!["ok".to_string()]
+        );
+
+        let ended = handle_command(
+            &conn,
+            &doc! {
+                "endSessions": [valid_session],
+                "$db": "admin",
+            },
+        )
+        .unwrap();
+        assert_eq!(ended.get_f64("ok").unwrap(), 1.0);
+
+        let bad_end = handle_command(
+            &conn,
+            &doc! {
+                "endSessions": [{ "id": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: vec![1; 15],
+                }) }],
+                "$db": "admin",
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_end);
+    }
+
+    #[test]
+    fn driver_workflow_accepts_safe_read_and_write_concern_shapes() {
+        let conn = test_conn();
+        let inserted = handle_command(
+            &conn,
+            &doc! {
+                "insert": "concerns",
+                "$db": "app",
+                "writeConcern": { "w": "majority", "j": true, "wtimeoutMS": 0_i32 },
+                "documents": [{ "_id": "c1", "name": "Ada" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted.get_i32("n").unwrap(), 1);
+
+        let found = handle_command(
+            &conn,
+            &doc! {
+                "find": "concerns",
+                "$db": "app",
+                "readConcern": { "level": "local" },
+                "filter": { "_id": "c1" },
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&found).len(), 1);
+
+        let found_available = handle_command(
+            &conn,
+            &doc! {
+                "find": "concerns",
+                "$db": "app",
+                "readConcern": { "level": "available" },
+                "filter": {},
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&found_available).len(), 1);
+    }
+
+    #[test]
+    fn invalid_driver_workflow_options_do_not_mutate_or_sweep_ttl() {
+        let conn = test_conn();
+
+        seed_ttl_command_fixture(&conn, "bad_read_concern");
+        let bad_read_concern = handle_command(
+            &conn,
+            &doc! {
+                "find": "bad_read_concern",
+                "$db": "app",
+                "readConcern": { "level": "snapshot" },
+                "filter": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(&conn, "bad_read_concern", bad_read_concern);
+
+        seed_ttl_command_fixture(&conn, "bad_write_concern");
+        let bad_write_concern = handle_command(
+            &conn,
+            &doc! {
+                "insert": "bad_write_concern",
+                "$db": "app",
+                "writeConcern": { "w": 0_i32 },
+                "documents": [{ "_id": "bad" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_write_concern);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_write_concern"),
+            vec!["expired".to_string(), "future".to_string()]
+        );
+    }
+
+    #[test]
+    fn transaction_fields_are_rejected_before_mutation() {
+        let conn = test_conn();
+        let response = handle_command(
+            &conn,
+            &doc! {
+                "insert": "transactions",
+                "$db": "app",
+                "lsid": session_doc(8),
+                "startTransaction": true,
+                "documents": [{ "_id": "bad" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&response);
+        assert!(
+            documents_for_namespace(&conn, "app.transactions")
+                .unwrap()
+                .is_empty()
+        );
+
+        let commit = handle_command(
+            &conn,
+            &doc! {
+                "commitTransaction": 1_i32,
+                "$db": "admin",
+                "lsid": session_doc(8),
+            },
+        )
+        .unwrap();
+        assert_command_error(&commit);
+    }
+
+    #[test]
+    fn retryable_writes_replay_exact_response_and_reject_conflicts() {
+        let conn = test_conn();
+        let mut state = ClientState::default();
+        let lsid = Bson::Document(session_doc(9));
+        let command = doc! {
+            "insert": "retryable",
+            "$db": "app",
+            "lsid": lsid.clone(),
+            "txnNumber": 1_i64,
+            "documents": [{ "_id": "r1" }],
+        };
+
+        let first = handle_command_with_state(&conn, &mut state, &command).unwrap();
+        assert_eq!(first.get_i32("n").unwrap(), 1);
+        let second = handle_command_with_state(&conn, &mut state, &command).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.retryable"),
+            vec!["r1".to_string()]
+        );
+
+        let conflict = handle_command_with_state(
+            &conn,
+            &mut state,
+            &doc! {
+                "insert": "retryable",
+                "$db": "app",
+                "lsid": lsid,
+                "txnNumber": 1_i64,
+                "documents": [{ "_id": "r2" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&conflict);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.retryable"),
+            vec!["r1".to_string()]
+        );
+
+        handle_command(
+            &conn,
+            &doc! {
+                "insert": "retryable",
+                "$db": "app",
+                "documents": [
+                    { "_id": "u1", "score": 1_i32 },
+                    { "_id": "d1", "gone": false },
+                    { "_id": "f1", "score": 10_i32 },
+                ],
+            },
+        )
+        .unwrap();
+
+        let update = doc! {
+            "update": "retryable",
+            "$db": "app",
+            "lsid": Bson::Document(session_doc(9)),
+            "txnNumber": 2_i64,
+            "updates": [{ "q": { "_id": "u1" }, "u": { "$inc": { "score": 1_i32 } } }],
+        };
+        let first_update = handle_command_with_state(&conn, &mut state, &update).unwrap();
+        assert_eq!(first_update.get_i32("nModified").unwrap(), 1);
+        let second_update = handle_command_with_state(&conn, &mut state, &update).unwrap();
+        assert_eq!(second_update, first_update);
+        let updated = first_batch(
+            &handle_command(
+                &conn,
+                &doc! { "find": "retryable", "$db": "app", "filter": { "_id": "u1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(updated[0].get_i32("score").unwrap(), 2);
+
+        let delete = doc! {
+            "delete": "retryable",
+            "$db": "app",
+            "lsid": Bson::Document(session_doc(9)),
+            "txnNumber": 3_i64,
+            "deletes": [{ "q": { "_id": "d1" }, "limit": 1_i32 }],
+        };
+        let first_delete = handle_command_with_state(&conn, &mut state, &delete).unwrap();
+        assert_eq!(first_delete.get_i32("n").unwrap(), 1);
+        let second_delete = handle_command_with_state(&conn, &mut state, &delete).unwrap();
+        assert_eq!(second_delete, first_delete);
+        let deleted = first_batch(
+            &handle_command(
+                &conn,
+                &doc! { "find": "retryable", "$db": "app", "filter": { "_id": "d1" } },
+            )
+            .unwrap(),
+        );
+        assert!(deleted.is_empty());
+
+        let find_and_modify = doc! {
+            "findAndModify": "retryable",
+            "$db": "app",
+            "lsid": Bson::Document(session_doc(9)),
+            "txnNumber": 4_i64,
+            "query": { "_id": "f1" },
+            "update": { "$inc": { "score": 5_i32 } },
+            "new": true,
+        };
+        let first_fam = handle_command_with_state(&conn, &mut state, &find_and_modify).unwrap();
+        assert_eq!(
+            first_fam
+                .get_document("value")
+                .unwrap()
+                .get_i32("score")
+                .unwrap(),
+            15
+        );
+        let second_fam = handle_command_with_state(&conn, &mut state, &find_and_modify).unwrap();
+        assert_eq!(second_fam, first_fam);
+        let modified = first_batch(
+            &handle_command(
+                &conn,
+                &doc! { "find": "retryable", "$db": "app", "filter": { "_id": "f1" } },
+            )
+            .unwrap(),
+        );
+        assert_eq!(modified[0].get_i32("score").unwrap(), 15);
+    }
+
+    #[test]
+    fn retryable_write_cache_is_bounded_and_fifo() {
+        let conn = test_conn();
+        let mut state = ClientState::default();
+        let lsid = Bson::Document(session_doc(10));
+        for txn_number in 0..(RETRYABLE_WRITE_CACHE_LIMIT as i64 + 1) {
+            let response = handle_command_with_state(
+                &conn,
+                &mut state,
+                &doc! {
+                    "insert": "retry_bounds",
+                    "$db": "app",
+                    "lsid": lsid.clone(),
+                    "txnNumber": txn_number,
+                    "documents": [{ "_id": format!("r{txn_number}") }],
+                },
+            )
+            .unwrap();
+            assert_eq!(response.get_i32("n").unwrap(), 1);
+        }
+        assert_eq!(state.retryable_writes.len(), RETRYABLE_WRITE_CACHE_LIMIT);
+
+        let replay_evicted = handle_command_with_state(
+            &conn,
+            &mut state,
+            &doc! {
+                "insert": "retry_bounds",
+                "$db": "app",
+                "lsid": lsid,
+                "txnNumber": 0_i64,
+                "documents": [{ "_id": "r0" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(replay_evicted.get_i32("n").unwrap(), 0);
+        assert_eq!(
+            write_errors(&replay_evicted)[0].get_i32("code").unwrap(),
+            11000
+        );
+    }
+
+    #[test]
+    fn retryable_write_metadata_errors_happen_before_mutation() {
+        let conn = test_conn();
+        let mut state = ClientState::default();
+
+        let missing_lsid = handle_command_with_state(
+            &conn,
+            &mut state,
+            &doc! {
+                "insert": "retry_errors",
+                "$db": "app",
+                "txnNumber": 1_i64,
+                "documents": [{ "_id": "missing_lsid" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&missing_lsid);
+
+        let malformed_txn = handle_command_with_state(
+            &conn,
+            &mut state,
+            &doc! {
+                "insert": "retry_errors",
+                "$db": "app",
+                "lsid": session_doc(11),
+                "txnNumber": -1_i64,
+                "documents": [{ "_id": "malformed_txn" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&malformed_txn);
+
+        let read_txn = handle_command_with_state(
+            &conn,
+            &mut state,
+            &doc! {
+                "find": "retry_errors",
+                "$db": "app",
+                "lsid": session_doc(11),
+                "txnNumber": 2_i64,
+                "filter": {},
+            },
+        )
+        .unwrap();
+        assert_command_error(&read_txn);
+        assert!(
+            documents_for_namespace(&conn, "app.retry_errors")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -13622,9 +14368,9 @@ mod tests {
             .unwrap(),
             drop_collection(&conn, &doc! { "drop": "users", "$db": "app", "comment": "nope" })
                 .unwrap(),
-            drop_database(
+            handle_command(
                 &conn,
-                &doc! { "dropDatabase": 1_i32, "$db": "app", "writeConcern": { "w": 1_i32 } },
+                &doc! { "dropDatabase": 1_i32, "$db": "app", "writeConcern": { "w": 0_i32 } },
             )
             .unwrap(),
         ] {
@@ -16456,7 +17202,6 @@ mod tests {
             doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "comment": "nope" },
             doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "maxTimeMS": 1_i32 },
             doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "bypassDocumentValidation": true },
-            doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "readConcern": {} },
             doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "writeConcern": {} },
             doc! { "aggregate": "users", "$db": "app", "pipeline": [], "cursor": {}, "let": {} },
         ] {
@@ -18652,7 +19397,7 @@ mod tests {
             doc! { "findAndModify": "users", "$db": "app", "arrayFilters": [], "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "collation": {}, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "hint": "_id_", "update": { "$set": { "name": "x" } } },
-            doc! { "findAndModify": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "update": { "$set": { "name": "x" } } },
+            doc! { "findAndModify": "users", "$db": "app", "writeConcern": { "w": 0_i32 }, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "maxTimeMS": 1_i32, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "let": {}, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "remove": true, "upsert": true },
@@ -20299,7 +21044,6 @@ mod tests {
             doc! { "insert": "users", "$db": "app", "documents": [] },
             doc! { "insert": "users", "$db": "app", "documents": [1_i32] },
             doc! { "insert": "users", "$db": "app", "ordered": "yes", "documents": [{ "_id": "u1" }] },
-            doc! { "insert": "users", "$db": "app", "writeConcern": { "w": 1_i32 }, "documents": [{ "_id": "u1" }] },
         ] {
             let response = insert_documents(&conn, &command).unwrap();
             assert_command_error(&response);

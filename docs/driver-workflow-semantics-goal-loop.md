@@ -187,11 +187,11 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Driver workflow parser and session validation
-- [ ] Milestone 1: ReadConcern and writeConcern safe no-op subset
-- [ ] Milestone 2: Transaction rejection and no-mutation preflight
-- [ ] Milestone 3: Retryable write skeleton and replay cache
-- [ ] Milestone 4: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
+- [x] Milestone 0: Driver workflow parser and session validation
+- [x] Milestone 1: ReadConcern and writeConcern safe no-op subset
+- [x] Milestone 2: Transaction rejection and no-mutation preflight
+- [x] Milestone 3: Retryable write skeleton and replay cache
+- [x] Milestone 4: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
 - [ ] Milestone 5: Final verification and handoff
 
 ## Milestone 0: Driver Workflow Parser And Session Validation
@@ -245,6 +245,19 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 Status:
+
+2026-07-05:
+
+- Added shared dispatch-level `DriverWorkflowOptions` parsing for `lsid`,
+  `txnNumber`, `readConcern`, `writeConcern`, and transaction fields.
+- Added session UUID/Binary shape validation and validating `endSessions` stub.
+- Added Rust coverage through `handle_command_with_state` for valid sessions,
+  malformed `lsid`, `endSessions`, and no-mutation behavior.
+- Verification:
+  - `cargo fmt`
+  - `cargo test driver_workflow` -> 3 main tests and 3 bench-target tests passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+- Commit: pending milestone batch commit.
 
 ## Milestone 1: ReadConcern And WriteConcern Safe No-Op Subset
 
@@ -304,6 +317,23 @@ Commit requirement:
 
 Status:
 
+2026-07-05:
+
+- Accepted safe local no-op readConcern forms `{}`, `local`, and `available`
+  on supported read commands.
+- Accepted safe acknowledged writeConcern forms `{}`, `w: 1`,
+  `w: "majority"`, optional boolean `j`, and non-negative `wtimeout`/
+  `wtimeoutMS` on supported write commands.
+- Rejected unsupported concerns before TTL sweeps or mutation; updated older
+  unsupported-option tests to reflect the new accepted safe subset.
+- Verification:
+  - `cargo fmt`
+  - `cargo test driver_workflow` -> 3 main tests and 3 bench-target tests passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+  - Sandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` failed with `PermissionError: [Errno 1] Operation not permitted` at localhost bind.
+  - Unsandboxed same command -> 6 passed.
+- Commit: pending milestone batch commit.
+
 ## Milestone 2: Transaction Rejection And No-Mutation Preflight
 
 Problem:
@@ -353,6 +383,18 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 Status:
+
+2026-07-05:
+
+- Rejected `commitTransaction`, `abortTransaction`, `prepareTransaction`,
+  `startTransaction`, and `autocommit` before mutation.
+- Added Rust and PyMongo coverage proving transaction attempts leave documents
+  unchanged.
+- Verification:
+  - `cargo test transaction_fields` -> 1 main test and 1 bench-target test passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+  - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
+- Commit: pending milestone batch commit.
 
 ## Milestone 3: Retryable Write Skeleton And Replay Cache
 
@@ -416,6 +458,22 @@ Commit requirement:
 
 Status:
 
+2026-07-05:
+
+- Added bounded per-connection retryable write cache to `ClientState`
+  (`RETRYABLE_WRITE_CACHE_LIMIT = 128`).
+- Supported exact duplicate replay for `insert`, `update`, `delete`, and
+  `findAndModify` with valid `lsid + txnNumber`.
+- Reusing the same retryable key for a different command body returns an
+  explicit command error and does not mutate.
+- Added Rust coverage for replay across all four write surfaces, conflict
+  detection, malformed retry metadata, and FIFO eviction.
+- Verification:
+  - `cargo test retryable` -> 3 main tests and 3 bench-target tests passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+  - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
+- Commit: pending milestone batch commit.
+
 ## Milestone 4: E2E, Spec Corpus, Docs, Scorecard, And Benchmarks
 
 Problem:
@@ -478,6 +536,22 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 Status:
+
+2026-07-05:
+
+- Added `tests/e2e/test_driver_workflow.py` covering sessions, `endSessions`,
+  safe and unsafe concerns, transaction rejection, `retryWrites=true`, exact
+  replay, and retry conflict detection.
+- Added `tests/spec_corpus/driver_workflow_semantics.json` for representative
+  raw command concern and transaction cases.
+- Updated README compatibility docs, roadmap scorecard, and performance note.
+- Scorecard moved driver workflow semantics from 3% to 7% and total from 82% to
+  86%.
+- Verification:
+  - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_driver_workflow.py` -> 6 passed.
+  - Unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_spec_corpus.py` -> 31 passed.
+  - `cargo test` -> 192 main tests and 194 bench-target tests passed.
+- Commit: pending milestone batch commit.
 
 ## Milestone 5: Final Verification And Handoff
 

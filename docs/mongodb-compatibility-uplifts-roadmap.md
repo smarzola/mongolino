@@ -34,8 +34,10 @@ intentionally conservative:
   `arrayFilters` now support a conservative single-array scalar-modifier subset;
   nested multi-array traversal, array modifiers through positional paths, and
   unsupported pipeline stages remain explicit errors.
-- Sessions/retryable write/readConcern/writeConcern behavior is only minimally
-  accepted or explicitly rejected.
+- Driver workflow behavior now validates session ids, accepts safe single-node
+  readConcern/writeConcern no-ops, rejects transaction fields before mutation,
+  and provides bounded per-connection retryable write replay for supported
+  one-shot writes.
 
 ## Compatibility Scorecard
 
@@ -49,9 +51,9 @@ claim of full MongoDB parity.
 | Index lifecycle/TTL/collation behavior | 15% | 13% | 13% |
 | Aggregation compatibility | 20% | 15% | 15% |
 | Update language compatibility | 15% | 13% | 13% |
-| Driver workflow semantics | 10% | 3% | 7% |
+| Driver workflow semantics | 10% | 7% | 7% |
 | Explicit unsupported behavior and tests | 5% | 5% | 5% |
-| Total | 100% | 82% | 86% |
+| Total | 100% | 86% | 86% |
 
 Completion target for this seven-uplift goal: reach at least **80%** on this
 repo-local scorecard while preserving explicit errors for unsupported features.
@@ -115,10 +117,16 @@ repo-local scorecard while preserving explicit errors for unsupported features.
    - Prompt: `docs/update-pipeline-arrayfilters-goal-loop.md`.
 
 7. Driver Workflow Semantics
-   - Add practical `readConcern`, `writeConcern`, session, and retryable write
-     skeleton behavior for single-node compatibility.
-   - Prompt to write after Update Pipeline:
-     `docs/driver-workflow-semantics-goal-loop.md`.
+   - Complete in uplift 7. Added shared driver workflow preflight for `lsid`,
+     `readConcern`, `writeConcern`, transaction fields, and `txnNumber`; a
+     validating `endSessions` stub; safe local no-op read/write concern subsets;
+     explicit transaction rejection before mutation; and bounded per-connection
+     retryable write replay for exact duplicate `insert`, `update`, `delete`,
+     and `findAndModify` attempts.
+   - Causal consistency, snapshot reads, unacknowledged writes, distributed
+     durability, durable retry history across reconnects/restarts, and
+     multi-operation transactions remain unsupported.
+   - Prompt: `docs/driver-workflow-semantics-goal-loop.md`.
 
 ## Goal Completion Requirements
 

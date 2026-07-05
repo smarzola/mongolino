@@ -1,0 +1,102 @@
+{
+  "name": "driver workflow semantics",
+  "source": "driver-workflow-local",
+  "status": "supported",
+  "setup": [
+    {
+      "_id": "stable",
+      "name": "Ada"
+    }
+  ],
+  "operations": [
+    {
+      "name": "command",
+      "command": {
+        "find": "$$collection",
+        "filter": {
+          "_id": "stable"
+        },
+        "readConcern": {
+          "level": "local"
+        }
+      },
+      "expect_result": {
+        "ok": 1.0
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "insert": "$$collection",
+        "documents": [
+          {
+            "_id": "wc",
+            "name": "Grace"
+          }
+        ],
+        "writeConcern": {
+          "w": "majority",
+          "j": true,
+          "wtimeoutMS": 0
+        }
+      },
+      "expect_result": {
+        "ok": 1.0,
+        "n": 1
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "find": "$$collection",
+        "filter": {},
+        "readConcern": {
+          "level": "snapshot"
+        }
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "contains": "readConcern level snapshot is not supported"
+      }
+    },
+    {
+      "name": "command",
+      "command": {
+        "insert": "$$collection",
+        "documents": [
+          {
+            "_id": "bad_wc"
+          }
+        ],
+        "writeConcern": {
+          "w": 0
+        }
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "contains": "writeConcern w:0 is not supported"
+      }
+    },
+    {
+      "name": "command",
+      "database": "admin",
+      "command": {
+        "commitTransaction": 1
+      },
+      "expect_error": {
+        "type": "OperationFailure",
+        "contains": "transactions are not supported"
+      }
+    }
+  ],
+  "expect_final_documents": [
+    {
+      "_id": "stable",
+      "name": "Ada"
+    },
+    {
+      "_id": "wc",
+      "name": "Grace"
+    }
+  ]
+}

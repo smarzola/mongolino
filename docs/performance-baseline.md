@@ -39,6 +39,19 @@ budget remains the guardrail for this uplift because supported positional and
 pipeline updates are intentionally one-array/document-local transformations
 after target selection.
 
+## Driver Workflow Semantics Coverage
+
+Driver workflow parsing runs once at command dispatch before command-specific
+TTL sweeps or mutation paths. The retryable-write skeleton stores exact command
+bytes and responses in a bounded per-connection FIFO cache
+(`RETRYABLE_WRITE_CACHE_LIMIT = 128`). This adds small fixed memory overhead per
+active connection and no cross-connection or durable lookup. No dedicated
+benchmark row is recorded because the hot path remains the existing
+insert/update/delete/findAndModify command handler plus a short in-memory cache
+scan. The CI benchmark budget remains the guardrail for accidental broad
+regressions, while Rust and PyMongo tests cover replay, conflict detection, and
+cache eviction behavior directly.
+
 ## Commands
 
 ```sh
