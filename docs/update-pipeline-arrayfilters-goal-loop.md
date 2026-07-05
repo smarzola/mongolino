@@ -679,6 +679,27 @@ Status:
   unsupported modifiers return command/write errors instead of silently
   succeeding.
 
+Parent adversarial review 2026-07-05:
+
+- Found one compatibility gap after the initial handoff: first-positional `$`
+  did not bind scalar-array `$elemMatch` predicates such as
+  `{ scores: { $elemMatch: { $gte: 5, $lt: 10 } } }` even though the query
+  matcher supported them.
+- Dispatched `docs/update-pipeline-arrayfilters-adversarial-fix-goal-loop.md`
+  and accepted fix commit `407038a`, which routes direct positional
+  `$elemMatch` predicates through the existing matcher split while preserving
+  document-array `$elemMatch` and arrayFilters behavior.
+- Parent re-verification at `407038a` passed: `cargo fmt -- --check`, `cargo
+  test positional`, `cargo test update`, `cargo test find_and_modify`, `cargo
+  test` (185 main tests and 187 bench-target tests), `cargo build`, `cargo run
+  --bin mongolino-bench -- --profile ci --check-budget`,
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`, and
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`.
+- Sandboxed focused PyMongo e2e failed before test execution on localhost bind
+  permission; the same focused command passed unsandboxed with 38 tests in
+  20.25s. Full unsandboxed `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run
+  --locked pytest tests/e2e` passed with 214 tests in 111.44s.
+
 ## Final Response Requirements
 
 When the goal is complete, report:

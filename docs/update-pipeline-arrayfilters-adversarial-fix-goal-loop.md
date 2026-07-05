@@ -156,3 +156,25 @@ cargo build
   - The same PyMongo command rerun unsandboxed after rebuilding passed:
     38 passed in 20.23s.
   - `cargo test` passed: 185 main tests and 187 bench-target tests.
+
+Parent review 2026-07-05:
+
+- Reviewed commit `407038a` and accepted the fix. The new
+  `PositionalQueryPredicate::ElemMatch` path preserves arrayFilters behavior
+  while delegating `$elemMatch` element matching to the existing query matcher
+  split, so scalar/operator and document predicates follow the same semantics as
+  reads.
+- Re-ran focused verification: `cargo fmt -- --check`, `cargo test
+  positional`, `cargo test update`, and `cargo test find_and_modify` all
+  passed.
+- Confirmed the sandboxed focused PyMongo command still fails before test
+  execution on localhost bind permission; the same command passed unsandboxed
+  with 38 tests passed in 20.25s.
+- Re-ran broad verification from the parent context: `cargo test` passed with
+  185 main tests and 187 bench-target tests, `cargo build` passed with existing
+  dead-code warnings, `cargo run --bin mongolino-bench -- --profile ci
+  --check-budget` passed, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock
+  --check` passed, `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync
+  --locked --dev` passed, and full unsandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e` passed with 214 tests in 111.44s.
