@@ -132,4 +132,4 @@ Status note 2026-07-05:
     via the bench target.
   - `cargo test collation`: passed, 14 tests in `src/main.rs` and 14 tests
     via the bench target.
-- Commit hash: pending local commit.
+- Commit hash: `fc377a3`.
