@@ -477,8 +477,9 @@ indexes once compatibility semantics have stabilized.
 
 ## First-Stage Aggregation Match Candidate Narrowing
 
-Recorded on 2026-07-05 from a dirty working tree based on commit `db507d8`
-after adding first-stage aggregation `$match` candidate narrowing. Command:
+Recorded on 2026-07-05 during the first-stage aggregation `$match` candidate
+narrowing integration, before the final local commit was cut from the working
+tree based on `db507d8`. Command:
 
 ```bash
 cargo run --bin mongolino-bench -- --profile smoke --check-budget

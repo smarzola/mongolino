@@ -12843,6 +12843,82 @@ mod tests {
     }
 
     #[test]
+    fn aggregation_first_match_id_collation_falls_back_for_string_ids() {
+        let conn = test_conn();
+        insert_documents(
+            &conn,
+            &doc! {
+                "insert": "users",
+                "$db": "app",
+                "documents": [
+                    { "_id": "Ada", "role": "engineer" },
+                    { "_id": "ada", "role": "mathematician" },
+                    { "_id": "ADA", "role": "programmer" },
+                    { "_id": "Grace", "role": "admiral" },
+                ],
+            },
+        )
+        .unwrap();
+
+        let pipeline = vec![
+            Bson::Document(doc! { "$match": { "_id": "ada" } }),
+            Bson::Document(doc! { "$project": { "_id": 1_i32 } }),
+        ];
+        let candidates = aggregate_initial_documents(
+            &conn,
+            "app.users",
+            &pipeline,
+            &Collation::EnglishCaseInsensitive,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|document| document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["Ada", "ada", "ADA", "Grace"]
+        );
+
+        let aggregate = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "ada" } },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+                "collation": { "locale": "en", "strength": 2_i32 },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_batch(&aggregate)
+                .iter()
+                .map(|document| document.get_str("_id").unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["Ada", "ada", "ADA"]
+        );
+
+        let simple = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "users",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "ada" } },
+                    { "$project": { "_id": 1_i32 } },
+                ],
+                "cursor": {},
+                "collation": { "locale": "simple" },
+            },
+        )
+        .unwrap();
+        assert_eq!(first_batch(&simple), vec![doc! { "_id": "ada" }]);
+    }
+
+    #[test]
     fn invalid_read_collation_returns_error_before_ttl_sweep() {
         let conn = test_conn();
         insert_documents(
@@ -17682,6 +17758,49 @@ mod tests {
             .unwrap();
             assert_command_error(&response);
         }
+    }
+
+    #[test]
+    fn aggregation_first_match_preserves_later_stage_command_errors() {
+        let conn = test_conn();
+        seed_ttl_command_fixture(&conn, "bad_aggregate_later_stage");
+
+        let baseline = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_aggregate_later_stage",
+                "$db": "app",
+                "pipeline": [{ "$lookup": { "from": "other" } }],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(
+            &conn,
+            "bad_aggregate_later_stage",
+            baseline.clone(),
+        );
+
+        let narrowed = aggregate_command(
+            &conn,
+            &doc! {
+                "aggregate": "bad_aggregate_later_stage",
+                "$db": "app",
+                "pipeline": [
+                    { "$match": { "_id": "future" } },
+                    { "$lookup": { "from": "other" } },
+                ],
+                "cursor": {},
+            },
+        )
+        .unwrap();
+        assert_invalid_ttl_read_preserves_expired(
+            &conn,
+            "bad_aggregate_later_stage",
+            narrowed.clone(),
+        );
+        assert_eq!(narrowed.get_i32("code"), baseline.get_i32("code"));
+        assert_eq!(narrowed.get_str("errmsg"), baseline.get_str("errmsg"));
     }
 
     #[test]

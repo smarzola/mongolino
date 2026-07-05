@@ -327,6 +327,16 @@ Status note 2026-07-05:
     because `127.0.0.1:0` bind returned `PermissionError: [Errno 1] Operation
     not permitted`; the same command passed outside the sandbox with 27 tests.
 
+Parent review fix-loop status 2026-07-05:
+
+- Parent adversarial review of commit `9c38ef2` found two missing regression
+  tests and two stale status/documentation notes, tracked in
+  `docs/aggregation-match-pushdown-adversarial-fix-goal-loop.md`.
+- Fix loop scope is intentionally tests/docs only: pin later-stage aggregation
+  command-error ordering after a safe first `$match`, pin non-simple collation
+  string `_id` fallback for first-stage aggregation `$match`, clarify the
+  benchmark note, and preserve the existing planner semantics.
+
 ## Milestone 3: Deliver Lookup-Side Candidate Narrowing Or Split Prompt
 
 Problem:
