@@ -541,6 +541,10 @@ Status:
   alignment. Verification run: final `cargo fmt -- --check` passed; `cargo
   test unwind_group` passed; `cargo test aggregate` passed; `cargo test index`
   passed; `cargo test` passed. Benchmarks were not rerun.
+- 2026-07-05 parent verification after adversarial fix: reran
+  `cargo run --bin mongolino-bench -- --profile smoke --check-budget` on commit
+  `0adcbe1`; the budget passed and `aggregation_unwind_group` measured 25
+  iterations, 80.27 ms elapsed, 311.46 ops/sec, and 3.211 ms latency.
 
 ## Final Response Requirements
 

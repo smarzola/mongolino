@@ -665,8 +665,7 @@ Interpretation:
 
 ## Aggregation Unwind/Group Side-Table Results
 
-Recorded on 2026-07-05 from the working tree before committing this slice.
-Benchmarks used the debug
+Recorded on 2026-07-05 from commit `0adcbe1`. Benchmarks used the debug
 `cargo run --bin mongolino-bench -- --profile smoke --check-budget` command.
 
 Delivered implementation:
@@ -688,7 +687,7 @@ Smoke profile budget check passed with:
 
 | Benchmark | Iterations | Elapsed ms | Ops/sec | Latency ms |
 | --- | ---: | ---: | ---: | ---: |
-| aggregation_unwind_group | 25 | 76.46 | 326.98 | 3.058 |
+| aggregation_unwind_group | 25 | 80.27 | 311.46 | 3.211 |
 
 Interpretation:
 
