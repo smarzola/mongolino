@@ -169,7 +169,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Update spec architecture and preflight model
 - [x] Milestone 1: Update pipeline subset
-- [ ] Milestone 2: Positional `$` and `$[]`
+- [x] Milestone 2: Positional `$` and `$[]`
 - [ ] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
 - [ ] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
 - [ ] Milestone 5: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
@@ -227,6 +227,21 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Added conservative single-array positional `$` and `$[]`
+  coverage through Rust and PyMongo, including first matching element selection
+  from query predicates, all-element scalar modifier application,
+  `find_one_and_update`, and no-mutation-on-error checks. Verification passed
+  with `cargo fmt -- --check`, `cargo test positional`, `cargo test update`,
+  `cargo test find_and_modify`, and `cargo test` (182 main tests and 184
+  bench-target tests passed). Sandboxed
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e/test_update_operators.py tests/e2e/test_find_and_modify.py`
+  failed before test execution on localhost bind permission; the same command
+  passed unsandboxed with 35 tests passed. Commit hash pending at checkpoint
+  commit time.
 
 Status:
 

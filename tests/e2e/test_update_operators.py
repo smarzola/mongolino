@@ -257,6 +257,109 @@ def test_array_update_operators_happy_path_and_update_many(collection):
     }
 
 
+def test_positional_first_and_all_update_subset(collection):
+    collection.insert_many(
+        [
+            {
+                "_id": "o1",
+                "active": True,
+                "items": [
+                    {"kind": "open", "status": "new", "score": 1},
+                    {"kind": "closed", "status": "done", "score": 5},
+                    {"kind": "open", "status": "new", "score": 3},
+                ],
+            },
+            {
+                "_id": "o2",
+                "active": True,
+                "items": [
+                    {"kind": "open", "status": "new", "score": 2},
+                    {"kind": "closed", "status": "done", "score": 4},
+                ],
+            },
+        ]
+    )
+
+    first = collection.update_one(
+        {"items.kind": "open"},
+        {"$set": {"items.$.status": "working"}, "$inc": {"items.$.score": 2}},
+    )
+    assert first.matched_count == 1
+    assert first.modified_count == 1
+
+    all_result = collection.update_many(
+        {"active": True},
+        {"$mul": {"items.$[].score": 2}},
+    )
+    assert all_result.matched_count == 2
+    assert all_result.modified_count == 2
+
+    assert collection.find_one({"_id": "o1"})["items"] == [
+        {"kind": "open", "status": "working", "score": 6},
+        {"kind": "closed", "status": "done", "score": 10},
+        {"kind": "open", "status": "new", "score": 6},
+    ]
+    assert collection.find_one({"_id": "o2"})["items"] == [
+        {"kind": "open", "status": "new", "score": 4},
+        {"kind": "closed", "status": "done", "score": 8},
+    ]
+
+    before = collection.find_one({"_id": "o1"})
+    with pytest.raises(WriteError):
+        collection.update_one(
+            {"_id": "o1"},
+            {"$inc": {"items.$[].status": 1}},
+        )
+    assert collection.find_one({"_id": "o1"}) == before
+
+
+def test_array_filters_update_subset_and_errors(collection):
+    collection.insert_one(
+        {
+            "_id": "o1",
+            "items": [
+                {"kind": "open", "status": "new", "score": 1},
+                {"kind": "closed", "status": "done", "score": 5},
+                {"kind": "open", "status": "new", "score": 3},
+            ],
+        }
+    )
+
+    result = collection.update_one(
+        {"_id": "o1"},
+        {
+            "$set": {"items.$[open].status": "closed"},
+            "$max": {"items.$[open].score": 10},
+        },
+        array_filters=[{"open.kind": "open"}],
+    )
+    assert result.modified_count == 1
+    assert collection.find_one({"_id": "o1"})["items"] == [
+        {"kind": "open", "status": "closed", "score": 10},
+        {"kind": "closed", "status": "done", "score": 5},
+        {"kind": "open", "status": "closed", "score": 10},
+    ]
+
+    before = collection.find_one({"_id": "o1"})
+    for kwargs in [
+        {"array_filters": [{"open.kind": "open"}, {"open.score": {"$gte": 1}}]},
+        {"array_filters": [{"unused.kind": "open"}]},
+        {"array_filters": [{"Open.kind": "open"}]},
+    ]:
+        with pytest.raises(WriteError):
+            collection.update_one(
+                {"_id": "o1"},
+                {"$set": {"items.$[open].status": "bad"}},
+                **kwargs,
+            )
+    with pytest.raises(WriteError):
+        collection.update_one(
+            {"_id": "o1"},
+            {"$set": {"items.$[open].status": "bad"}},
+        )
+    assert collection.find_one({"_id": "o1"}) == before
+
+
 def test_pull_document_arrays_supports_logical_predicates(collection):
     collection.insert_many(
         [

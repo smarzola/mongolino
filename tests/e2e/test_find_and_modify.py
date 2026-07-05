@@ -75,6 +75,52 @@ def test_find_one_and_update_pipeline_subset(collection):
     assert collection.find_one({"_id": "u1"})["_id"] == "u1"
 
 
+def test_find_one_and_update_positional_and_array_filters(collection):
+    collection.insert_one(
+        {
+            "_id": "o1",
+            "items": [
+                {"kind": "open", "status": "new", "score": 1},
+                {"kind": "closed", "status": "done", "score": 5},
+                {"kind": "open", "status": "new", "score": 3},
+            ],
+        }
+    )
+
+    first = collection.find_one_and_update(
+        {"items.kind": "open"},
+        {"$set": {"items.$.status": "working"}, "$inc": {"items.$.score": 2}},
+        return_document=ReturnDocument.AFTER,
+    )
+    assert first["items"][0] == {"kind": "open", "status": "working", "score": 3}
+    assert first["items"][2] == {"kind": "open", "status": "new", "score": 3}
+
+    filtered = collection.find_one_and_update(
+        {"_id": "o1"},
+        {
+            "$set": {"items.$[open].status": "closed"},
+            "$max": {"items.$[open].score": 10},
+        },
+        array_filters=[{"open.kind": "open"}],
+        return_document=ReturnDocument.AFTER,
+    )
+    assert filtered["items"] == [
+        {"kind": "open", "status": "closed", "score": 10},
+        {"kind": "closed", "status": "done", "score": 5},
+        {"kind": "open", "status": "closed", "score": 10},
+    ]
+
+    before = collection.find_one({"_id": "o1"})
+    with pytest.raises(OperationFailure):
+        collection.find_one_and_update(
+            {"_id": "o1"},
+            {"$inc": {"items.$[open].status": 1}},
+            array_filters=[{"open.kind": "open"}],
+            return_document=ReturnDocument.AFTER,
+        )
+    assert collection.find_one({"_id": "o1"}) == before
+
+
 def test_find_and_modify_targets_and_sorts_with_collation(collection):
     collection.insert_many(
         [
