@@ -52,6 +52,20 @@ scan. The CI benchmark budget remains the guardrail for accidental broad
 regressions, while Rust and PyMongo tests cover replay, conflict detection, and
 cache eviction behavior directly.
 
+## WriteConcern Durability Coverage
+
+SQLite connections use WAL with `synchronous=NORMAL` by default. Supported
+write commands that request `writeConcern: { j: true }` run that command with
+local SQLite `synchronous=FULL` and restore the previous connection setting
+afterward. This is a local fsync-strength mapping only: `w: "majority"` remains
+a local acknowledged write and does not provide replica majority durability.
+
+No dedicated normal-vs-journaled benchmark row is recorded yet. To measure the
+cost, run the same insert/update/delete workload with default write concern and
+with `writeConcern: { j: true }`, then record the exact command, profile,
+storage medium, and machine details. Expect the journaled path to trade write
+throughput for stronger local SQLite durability.
+
 ## Commands
 
 ```sh

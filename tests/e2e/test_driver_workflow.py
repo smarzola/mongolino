@@ -31,7 +31,7 @@ def test_client_sessions_and_end_sessions_are_accepted(mongo_client):
     assert "lsid.id" in str(excinfo.value)
 
 
-def test_safe_read_and_write_concerns_are_single_node_noops(mongo_client):
+def test_safe_read_concern_and_journaled_write_concern_are_single_node_local(mongo_client):
     db = mongo_client.get_database(
         "e2e",
         read_concern=ReadConcern("local"),
@@ -41,6 +41,13 @@ def test_safe_read_and_write_concerns_are_single_node_noops(mongo_client):
 
     collection.insert_one({"_id": "c1", "name": "Ada"})
     assert collection.find_one({"_id": "c1"})["name"] == "Ada"
+
+    journaled_collection = mongo_client.get_database(
+        "e2e",
+        write_concern=WriteConcern(j=True),
+    ).driver_concerns
+    journaled_collection.update_one({"_id": "c1"}, {"$set": {"journaled": True}})
+    assert journaled_collection.find_one({"_id": "c1"})["journaled"] is True
 
     available = mongo_client.get_database(
         "e2e",

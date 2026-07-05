@@ -243,11 +243,41 @@ fn init_database(path: &PathBuf) -> Result<()> {
 
 pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     init_migration_schema(conn)?;
     init_document_schema(conn)?;
     ensure_index_metadata_columns(conn)?;
     Ok(())
+}
+
+const SQLITE_SYNCHRONOUS_FULL: i64 = 2;
+
+fn sqlite_synchronous(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?)
+}
+
+fn with_sqlite_synchronous_full<T>(
+    conn: &Connection,
+    operation: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let previous = sqlite_synchronous(conn)?;
+    if previous != SQLITE_SYNCHRONOUS_FULL {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
+
+    let result = operation(conn);
+    let restore = if previous != SQLITE_SYNCHRONOUS_FULL {
+        conn.pragma_update(None, "synchronous", previous)
+    } else {
+        Ok(())
+    };
+
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err.into()),
+    }
 }
 
 fn init_migration_schema(conn: &Connection) -> Result<()> {
@@ -621,7 +651,7 @@ pub(crate) fn handle_command_with_state(
         None => None,
     };
 
-    let response = match command_name.as_str() {
+    let mut dispatch = |conn: &Connection| match command_name.as_str() {
         "hello" | "isMaster" | "ismaster" => Ok(hello_response()),
         "ping" => Ok(doc! { "ok": 1.0 }),
         "buildInfo" | "buildinfo" => Ok(doc! {
@@ -663,7 +693,13 @@ pub(crate) fn handle_command_with_state(
             59,
             &format!("command '{other}' is not supported yet"),
         )),
-    }?;
+    };
+
+    let response = if workflow.write_concern.journaled {
+        with_sqlite_synchronous_full(conn, dispatch)?
+    } else {
+        dispatch(conn)?
+    };
 
     if let (Some(key), Some(command_body)) = (workflow.retryable_key, retryable_body) {
         client_state.record_retryable_write(key, command_name, command_body, response.clone());
@@ -697,15 +733,20 @@ fn hello_response() -> Document {
 #[derive(Clone, Debug)]
 struct DriverWorkflowOptions {
     retryable_key: Option<RetryableWriteKey>,
+    write_concern: WriteConcernOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WriteConcernOptions {
+    journaled: bool,
 }
 
 fn parse_driver_workflow_options(
     command_name: &str,
     command: &Document,
 ) -> std::result::Result<DriverWorkflowOptions, Document> {
-    if let Err(errmsg) = validate_driver_workflow_options(command_name, command) {
-        return Err(command_error(72, &errmsg));
-    }
+    let write_concern = validate_driver_workflow_options(command_name, command)
+        .map_err(|errmsg| command_error(72, &errmsg))?;
 
     let session_id = match command.get("lsid") {
         Some(value) => Some(validate_lsid(value).map_err(|errmsg| command_error(72, &errmsg))?),
@@ -731,18 +772,20 @@ fn parse_driver_workflow_options(
                 session_id,
                 txn_number,
             }),
+            write_concern,
         });
     }
 
     Ok(DriverWorkflowOptions {
         retryable_key: None,
+        write_concern,
     })
 }
 
 fn validate_driver_workflow_options(
     command_name: &str,
     command: &Document,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<WriteConcernOptions, String> {
     if transaction_command_name(command_name) {
         return Err("transactions are not supported by mongolino".to_string());
     }
@@ -755,7 +798,7 @@ fn validate_driver_workflow_options(
     }
     if command_name == "endSessions" {
         validate_end_sessions_command(command)?;
-        return Ok(());
+        return Ok(WriteConcernOptions::default());
     }
     if let Some(value) = command.get("readConcern") {
         if !supports_read_concern(command_name) {
@@ -763,13 +806,15 @@ fn validate_driver_workflow_options(
         }
         validate_read_concern(value)?;
     }
-    if let Some(value) = command.get("writeConcern") {
+    let write_concern = if let Some(value) = command.get("writeConcern") {
         if !supports_write_concern(command_name) {
             return Err(format!("writeConcern is not supported for {command_name}"));
         }
-        validate_write_concern(value)?;
-    }
-    Ok(())
+        parse_write_concern(value)?
+    } else {
+        WriteConcernOptions::default()
+    };
+    Ok(write_concern)
 }
 
 fn supports_read_concern(command_name: &str) -> bool {
@@ -865,7 +910,7 @@ fn validate_read_concern(value: &Bson) -> std::result::Result<(), String> {
     }
 }
 
-fn validate_write_concern(value: &Bson) -> std::result::Result<(), String> {
+fn parse_write_concern(value: &Bson) -> std::result::Result<WriteConcernOptions, String> {
     let Bson::Document(write_concern) = value else {
         return Err("writeConcern must be a document".to_string());
     };
@@ -886,10 +931,11 @@ fn validate_write_concern(value: &Bson) -> std::result::Result<(), String> {
         }
         Some(_) => return Err("writeConcern w must be an integer or string".to_string()),
     }
-    match write_concern.get("j") {
-        None | Some(Bson::Boolean(_)) => {}
+    let journaled = match write_concern.get("j") {
+        None => false,
+        Some(Bson::Boolean(value)) => *value,
         Some(_) => return Err("writeConcern j must be a boolean".to_string()),
-    }
+    };
     if write_concern.contains_key("wtimeout") && write_concern.contains_key("wtimeoutMS") {
         return Err("writeConcern cannot include both wtimeout and wtimeoutMS".to_string());
     }
@@ -904,7 +950,7 @@ fn validate_write_concern(value: &Bson) -> std::result::Result<(), String> {
             Some(_) => return Err(format!("writeConcern {key} must be an integer")),
         }
     }
-    Ok(())
+    Ok(WriteConcernOptions { journaled })
 }
 
 fn validate_end_sessions_command(command: &Document) -> std::result::Result<(), String> {
@@ -11903,6 +11949,22 @@ mod tests {
         conn
     }
 
+    fn temp_sqlite_path(label: &str) -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "mongolino-test-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            next_request_id()
+        ));
+        path
+    }
+
+    fn cleanup_sqlite_path(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
     fn first_batch(response: &Document) -> Vec<Document> {
         batch(response, "firstBatch")
     }
@@ -11976,6 +12038,27 @@ mod tests {
     }
 
     #[test]
+    fn init_connection_sets_wal_normal_synchronous_and_foreign_keys() {
+        let path = temp_sqlite_path("pragmas");
+        let conn = Connection::open(&path).unwrap();
+        init_connection(&conn).unwrap();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 1);
+        assert_eq!(foreign_keys, 1);
+
+        drop(conn);
+        cleanup_sqlite_path(&path);
+    }
+
+    #[test]
     fn driver_workflow_validates_sessions_and_end_sessions() {
         let conn = test_conn();
         let valid_session = Bson::Document(session_doc(7));
@@ -12034,6 +12117,56 @@ mod tests {
     #[test]
     fn driver_workflow_accepts_safe_read_and_write_concern_shapes() {
         let conn = test_conn();
+        assert!(
+            !parse_driver_workflow_options(
+                "insert",
+                &doc! { "insert": "concerns", "$db": "app", "documents": [{}] },
+            )
+            .unwrap()
+            .write_concern
+            .journaled
+        );
+        assert!(
+            !parse_driver_workflow_options(
+                "insert",
+                &doc! {
+                    "insert": "concerns",
+                    "$db": "app",
+                    "writeConcern": { "j": false },
+                    "documents": [{}],
+                },
+            )
+            .unwrap()
+            .write_concern
+            .journaled
+        );
+        assert!(
+            parse_driver_workflow_options(
+                "insert",
+                &doc! {
+                    "insert": "concerns",
+                    "$db": "app",
+                    "writeConcern": { "j": true },
+                    "documents": [{}],
+                },
+            )
+            .unwrap()
+            .write_concern
+            .journaled
+        );
+        assert!(
+            parse_driver_workflow_options(
+                "aggregate",
+                &doc! {
+                    "aggregate": "concerns",
+                    "$db": "app",
+                    "pipeline": [],
+                    "cursor": {},
+                    "writeConcern": {},
+                },
+            )
+            .is_err()
+        );
         let inserted = handle_command(
             &conn,
             &doc! {
@@ -12104,6 +12237,90 @@ mod tests {
             raw_ids_in_namespace(&conn, "app.bad_write_concern"),
             vec!["expired".to_string(), "future".to_string()]
         );
+
+        seed_ttl_command_fixture(&conn, "bad_write_concern_j");
+        let bad_write_concern_j = handle_command(
+            &conn,
+            &doc! {
+                "insert": "bad_write_concern_j",
+                "$db": "app",
+                "writeConcern": { "j": "yes" },
+                "documents": [{ "_id": "bad" }],
+            },
+        )
+        .unwrap();
+        assert_command_error(&bad_write_concern_j);
+        assert_eq!(
+            raw_ids_in_namespace(&conn, "app.bad_write_concern_j"),
+            vec!["expired".to_string(), "future".to_string()]
+        );
+    }
+
+    #[test]
+    fn journaled_write_concern_uses_full_synchronous_and_restores() {
+        let conn = test_conn();
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 1);
+
+        let observed = with_sqlite_synchronous_full(&conn, |conn| {
+            assert_eq!(sqlite_synchronous(conn).unwrap(), SQLITE_SYNCHRONOUS_FULL);
+            Ok("during-full")
+        })
+        .unwrap();
+        assert_eq!(observed, "during-full");
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 1);
+
+        let inserted = handle_command(
+            &conn,
+            &doc! {
+                "insert": "sync_success",
+                "$db": "app",
+                "writeConcern": { "j": true },
+                "documents": [{ "_id": "ok" }],
+            },
+        )
+        .unwrap();
+        assert_eq!(inserted.get_i32("n").unwrap(), 1);
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 1);
+
+        let created = handle_command(
+            &conn,
+            &doc! {
+                "create": "sync_error",
+                "$db": "app",
+                "writeConcern": { "j": true },
+            },
+        )
+        .unwrap();
+        assert_eq!(created.get_f64("ok").unwrap(), 1.0);
+
+        let duplicate_create = handle_command(
+            &conn,
+            &doc! {
+                "create": "sync_error",
+                "$db": "app",
+                "writeConcern": { "j": true },
+            },
+        )
+        .unwrap();
+        assert_command_error(&duplicate_create);
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn synchronous_full_guard_restores_after_rust_error() {
+        let conn = test_conn();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 0);
+
+        let err = with_sqlite_synchronous_full(&conn, |conn| {
+            assert_eq!(sqlite_synchronous(conn).unwrap(), SQLITE_SYNCHRONOUS_FULL);
+            Err::<(), MongolinoError>(MongolinoError::Protocol("forced rust error".to_string()))
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("forced rust error"));
+        assert_eq!(sqlite_synchronous(&conn).unwrap(), 0);
+        conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
     }
 
     #[test]

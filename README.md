@@ -216,16 +216,20 @@ SQLite-transaction backed for one selected document, but it does not implement
 MongoDB causal consistency, durable retry history, distributed write concern
 durability, or multi-document transactions.
 
-Driver workflow support is intentionally single-node. Valid `lsid` documents are
-shape-checked, `endSessions` is a validating cleanup stub, safe `readConcern`
-forms (`{}`, `local`, `available`) and safe acknowledged `writeConcern` forms
-(`{}`, `w: 1`, `w: "majority"`, boolean `j`, and non-negative timeout fields)
-are accepted as local SQLite no-ops, and retryable writes replay exact duplicate
-`insert`, `update`, `delete`, and `findAndModify` responses for the same
-`lsid + txnNumber` on the same connection. The retry cache is bounded and
-in-memory; reconnects, process restarts, transactions, snapshot reads, causal
-ordering, unacknowledged writes, and distributed durability semantics are not
-supported.
+Driver workflow support is intentionally single-node. SQLite connections run in
+WAL mode with foreign keys enabled and `synchronous=NORMAL` by default. Valid
+`lsid` documents are shape-checked, `endSessions` is a validating cleanup stub,
+and safe `readConcern` forms (`{}`, `local`, `available`) are accepted as local
+SQLite no-ops. Safe acknowledged `writeConcern` forms (`{}`, `w: 1`,
+`w: "majority"`, boolean `j`, and non-negative timeout fields) are accepted as
+local acknowledged writes; `w: "majority"` does not imply replica majority
+durability. `writeConcern: { j: true }` upgrades that single command to local
+SQLite `synchronous=FULL` and then restores the prior connection mode. Retryable
+writes replay exact duplicate `insert`, `update`, `delete`, and
+`findAndModify` responses for the same `lsid + txnNumber` on the same
+connection. The retry cache is bounded and in-memory; reconnects, process
+restarts, transactions, snapshot reads, causal ordering, unacknowledged writes,
+and distributed durability semantics are not supported.
 
 Validation supports a small `$jsonSchema` subset for object documents:
 root `bsonType: "object"`, `required`, and nested `properties` with `bsonType`
@@ -285,6 +289,12 @@ The benchmark harness creates temporary SQLite databases, seeds data through
 index-entry refresh, and aggregation paths. Budget thresholds are intentionally
 coarse: they are meant to catch severe regressions in CI, not to decide small
 performance wins.
+
+To compare normal local writes against journaled local writes, run the same
+write workload with default write concern and then with `writeConcern: { j:
+true }`. The latter maps to SQLite `synchronous=FULL` for each supported write
+command, so expect higher write latency on durable storage; record command lines
+and machine details with any numbers.
 
 Current baseline results and SQLite pushdown targets are recorded in
 `docs/performance-baseline.md`.
