@@ -381,16 +381,17 @@ as a compatibility fallback.
    Baseline: `_id` equality is 0.023 ms/op, indexed scalar equality is
    2.098 ms/op, and collection scan is 30.914 ms/op on the local profile.
 
-   Proposed implementation: keep `_id` equality as the model fast path, then
-   use index entries more aggressively for supported simple equality filters,
-   including selected dotted scalar paths if index-entry maintenance can prove
-   equivalent. Continue to decode candidate BSON documents and run the Rust
-   matcher before returning results.
+   Completed: `_id` equality remains the model fast path, while maintained
+   index entries are used for supported scalar equality, compound prefix/range,
+   sparse/partial membership-proven filters, and scalar multikey paths. The
+   planner still decodes candidate BSON documents and runs the Rust matcher
+   before returning results.
 
-   Correctness risks: array traversal and multikey behavior are intentionally
-   limited today. Candidate narrowing must never drop a document that the Rust
-   matcher would accept. Projection and sort should remain Rust-side until their
-   semantics are covered.
+   Correctness fences: array traversal and multikey behavior remain
+   conservative, numeric equality falls back where type-tagged index entries
+   would be unsafe, and projection remains Rust-side because the planner
+   metadata does not store original BSON field values. Sort pushdown is limited
+   to the separately documented unique fully covered scalar subset.
 
    Measurement: compare `find_indexed_scalar_equality`,
    `find_collection_scan`, and targeted planner tests that verify candidate
@@ -412,22 +413,28 @@ as a compatibility fallback.
    Measurement: local `aggregation_match_count` improved from 30.032 to
    0.071 ms/op.
 
-4. Explore SQLite grouping for bounded scalar `$unwind`/`$group` workloads.
+4. Use side-table grouping for bounded scalar `$unwind`/`$group` workloads.
 
    Baseline: `aggregation_unwind_group` is 57.333 ms/op on the local profile,
    the slowest benchmark because it decodes documents, expands arrays, and
    groups in Rust.
 
-   Proposed implementation: do not start with general BSON array SQL. First
-   evaluate whether maintained side tables for selected array scalar fields are
-   worth the complexity, or whether this belongs after count/find pushdown.
+   Completed: `unwind_group_entries` stores one row per default `$unwind`
+   occurrence for simple single-field indexed paths, including duplicate array
+   values and scalar values. The optimized aggregate path handles only default
+   `$unwind` followed by same-path `$group` with `$sum: 1` count accumulators,
+   and falls back to the Rust executor for everything outside that proven
+   shape.
 
-   Correctness risks: `$unwind` preserve-null behavior, include-array-index,
-   whole-value equality, and accumulator ordering are subtle. This is lower
-   priority until simpler count/find pushdowns prove the measurement loop.
+   Correctness fences: preserve-null behavior, include-array-index, different
+   group paths, non-count accumulators, non-simple command collation,
+   unsupported unwound document/array values, partial index sources, and broad
+   aggregation pipelines remain Rust fallbacks. Existing databases are
+   protected by an idempotent side-table backfill migration.
 
-   Measurement: compare `aggregation_unwind_group` and the existing aggregation
-   tests for `$unwind`, `$group`, `$push`, and `$addToSet`.
+   Measurement: smoke `aggregation_unwind_group` improved from the original
+   7.682 ms/op baseline to 3.211 ms/op on the verified 2026-07-05 run. See
+   "Aggregation Unwind/Group Side-Table Results" below.
 
 5. Use SQLite for safe write target selection and unique conflict checks.
 
@@ -452,10 +459,12 @@ as a compatibility fallback.
    Measurement: local `update_index_refresh` improved from 30.707 to
    1.147 ms/op.
 
-Remaining pushdown candidates are aggregation-oriented: broader `$match`
-planning inside aggregation pipelines, possible SQLite grouping for bounded
-scalar fields, and any future side-table design for array-heavy `$unwind` and
-`$group` workloads.
+Remaining pushdown candidates after this roadmap are intentionally narrower
+and higher-risk: broad collection scans without selective predicates, covered
+projection without a value metadata design, general SQL aggregation, broad sort
+pushdown, text/geospatial/hashed/wildcard index planning, and non-simple
+collation range planning. The delivered roadmap keeps those as Rust fallbacks
+or explicit unsupported shapes rather than over-claiming planner parity.
 
 ## Aggregation v2 Benchmark Coverage
 

@@ -200,12 +200,44 @@ When a milestone is complete:
 
 ## Milestone Checklist
 
-- [ ] Milestone 0: Confirm current planner state and rank remaining uplifts
-- [ ] Milestone 1: Select and specify the first implementation slice
+- [x] Milestone 0: Confirm current planner state and rank remaining uplifts
+- [x] Milestone 1: Select and specify the first implementation slice
 - [x] Milestone 2: Deliver first-stage aggregation `$match` candidate narrowing
 - [x] Milestone 3: Deliver lookup-side candidate narrowing or write its
       separate executable goal prompt
-- [ ] Milestone 4: Benchmarks, docs, adversarial review, and fix loop
+- [x] Milestone 4: Benchmarks, docs, adversarial review, and fix loop
+
+Planner roadmap closeout status 2026-07-05:
+
+- Milestone 0 and 1 are complete. Source and benchmark inspection ranked the
+  next substantial planner slices as first-stage aggregation `$match` candidate
+  narrowing, lookup-side candidate narrowing, and bounded `$unwind`/`$group`
+  side-table pushdown. Covered find projection remains deferred because the
+  maintained planner metadata does not store enough original BSON value state
+  to avoid decoding documents for general projections without adding another
+  value-side metadata design.
+- Milestone 2 delivered first-stage aggregation `$match` candidate narrowing
+  and its adversarial fix loop. Commits: `9c38ef2`, `fc377a3`, `be70000`.
+- Milestone 3 delivered lookup-side candidate narrowing and benchmark coverage.
+  Commits: `d9c2715`, `04552c0`.
+- Milestone 4 expanded into the bounded `$unwind`/`$group` side-table slice,
+  implemented through `docs/aggregation-unwind-group-side-table-goal-loop.md`
+  and fixed through
+  `docs/aggregation-unwind-group-side-table-adversarial-fix-goal-loop.md`.
+  Commits: `fac0186`, `3c4311a`, `c83ae22`, `0adcbe1`, `a56add6`.
+- Parent verification after the final fix passed `cargo fmt -- --check`,
+  `git diff --check`, `cargo test unwind_group`, `cargo test aggregate`,
+  `cargo test index`, `cargo test`, `cargo build`,
+  `cargo run --bin mongolino-bench -- --profile smoke --check-budget`,
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`,
+  focused PyMongo aggregation e2e outside the sandbox, and full PyMongo e2e
+  outside the sandbox with 226 tests passed.
+- Residual planner work is intentionally deferred rather than part of this
+  roadmap closeout: broad collection scans without selective predicates,
+  general SQL aggregation, broad sort pushdown, covered projection without a
+  value metadata design, text/geospatial/hashed/wildcard index planning, and
+  non-simple collation range planning.
 
 ## Milestone 0: Confirm Current Planner State And Rank Remaining Uplifts
 
@@ -227,6 +259,13 @@ Verification:
 ```bash
 rg -n "aggregation_match|lookup|candidate|planner|pushdown" src/main.rs src/bin/mongolino-bench.rs docs
 ```
+
+Status note 2026-07-05:
+
+- Completed in the parent roadmap inspection. The implemented planner state is
+  summarized above and in `docs/performance-baseline.md`; residual candidates
+  are explicitly deferred because they require new semantics or metadata beyond
+  the conservative candidate-narrowing model.
 
 ## Milestone 1: Select And Specify The First Implementation Slice
 
@@ -259,6 +298,13 @@ Verification:
 cargo test aggregation
 cargo run --bin mongolino-bench -- --profile smoke --check-budget
 ```
+
+Status note 2026-07-05:
+
+- Completed. First-stage aggregation `$match` candidate narrowing was selected
+  and delivered first. Lookup-side candidate narrowing and bounded
+  `$unwind`/`$group` side-table pushdown followed as separate executable goal
+  prompts and worker/fix loops.
 
 ## Milestone 2: Deliver First-Stage Aggregation `$match` Candidate Narrowing
 
@@ -403,8 +449,11 @@ Status note 2026-07-05:
   - `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
     tests/e2e/test_aggregation.py`: sandbox run hit localhost bind
     `PermissionError`; rerun outside the sandbox passed with 28 tests.
-- Milestone 4 remains open for parent adversarial review and any follow-up fix
-  loop.
+- Parent adversarial review and fix-loop status 2026-07-05: lookup-side
+  candidate narrowing received adversarial regression coverage through
+  `docs/aggregation-match-pushdown-adversarial-fix-goal-loop.md` and the later
+  full planner verification runs. No remaining blocking lookup issue is open in
+  this roadmap.
 
 ## Milestone 4: Benchmarks, Docs, Review, And Fix Loop
 
@@ -436,6 +485,17 @@ cargo build
 cargo run --bin mongolino-bench -- --profile ci --check-budget
 UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest tests/e2e/test_aggregation.py
 ```
+
+Status note 2026-07-05:
+
+- Completed. Parent review found a real adversarial gap in the
+  `$unwind`/`$group` side-table implementation for existing databases with
+  indexes but empty new side tables. The fix loop added an idempotent
+  `unwind_group_side_table_backfill_v1` initialization migration, deterministic
+  optimized ordering aligned with executor scan order, and regression tests for
+  legacy backfill, idempotence, unsupported-value fallback, and order
+  alignment. Final parent verification is recorded in the closeout status
+  above.
 
 ## Final Response Requirements
 
