@@ -2608,6 +2608,7 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
             "projection",
             "hint",
             "collation",
+            "arrayFilters",
             "$db",
             "lsid",
         ],
@@ -2675,17 +2676,10 @@ fn find_and_modify(conn: &Connection, command_key: &str, command: &Document) -> 
         None
     } else {
         match command.get("update") {
-            Some(Bson::Document(update)) => match classify_update(update) {
+            Some(update) => match parse_update_spec(update, command.get("arrayFilters")) {
                 Ok(update) => Some(update),
                 Err(errmsg) => return Ok(command_error(update_error_code(&errmsg), &errmsg)),
             },
-            Some(Bson::Array(_)) => {
-                return Ok(command_error(
-                    72,
-                    "findAndModify pipeline updates are not supported",
-                ));
-            }
-            Some(_) => return Ok(command_error(9, "findAndModify update must be a document")),
             None => unreachable!("update presence checked above"),
         }
     };
@@ -2832,7 +2826,7 @@ fn apply_find_and_modify_update(
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
     collation: &Collation,
-    update: &UpdateSpec,
+    update: &ParsedUpdate,
     upsert: bool,
     return_new: bool,
     options: &CollectionOptions,
@@ -2852,7 +2846,7 @@ fn apply_find_and_modify_update(
             }));
         }
 
-        let mut new_document = match build_upsert_document(query, update) {
+        let mut new_document = match build_upsert_document(query, update, collation) {
             Ok(document) => document,
             Err(errmsg) => return Ok(Err(command_error(update_error_code(&errmsg), &errmsg))),
         };
@@ -2884,7 +2878,7 @@ fn apply_find_and_modify_update(
         }));
     };
 
-    let new_document = match apply_update_to_document(&target.document, update) {
+    let new_document = match apply_update_to_document(&target.document, update, query, collation) {
         Ok(document) => document,
         Err(errmsg) => {
             return Ok(Err(command_error(update_error_code(&errmsg), &errmsg)));
@@ -2933,7 +2927,7 @@ fn find_and_modify_update_preflight_error(
     sort: Option<&[(String, i32)]>,
     hint: Option<&ResolvedHint>,
     collation: &Collation,
-    update: &UpdateSpec,
+    update: &ParsedUpdate,
     upsert: bool,
     options: &CollectionOptions,
 ) -> Result<Option<Document>> {
@@ -2946,7 +2940,7 @@ fn find_and_modify_update_preflight_error(
         if !upsert {
             return Ok(None);
         }
-        let mut new_document = match build_upsert_document(query, update) {
+        let mut new_document = match build_upsert_document(query, update, collation) {
             Ok(document) => document,
             Err(errmsg) => return Ok(Some(command_error(update_error_code(&errmsg), &errmsg))),
         };
@@ -2957,7 +2951,7 @@ fn find_and_modify_update_preflight_error(
         return Ok(None);
     };
 
-    let new_document = match apply_update_to_document(&target.document, update) {
+    let new_document = match apply_update_to_document(&target.document, update, query, collation) {
         Ok(document) => document,
         Err(errmsg) => return Ok(Some(command_error(update_error_code(&errmsg), &errmsg))),
     };
@@ -7221,7 +7215,18 @@ fn validate_update_entry_shape_tx(
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint", "collation"])?;
+    reject_unsupported_entry_keys(
+        entry,
+        &[
+            "q",
+            "u",
+            "upsert",
+            "multi",
+            "hint",
+            "collation",
+            "arrayFilters",
+        ],
+    )?;
     let query = entry
         .get_document("q")
         .map_err(|_| "update entry requires q document".to_string())?;
@@ -7229,8 +7234,8 @@ fn validate_update_entry_shape_tx(
     let collation = Collation::parse_optional(entry, "collation")?;
     validate_filter_for_collation(query, &collation).map_err(|err| err.errmsg)?;
     let update = entry
-        .get_document("u")
-        .map_err(|_| "update entry requires u document".to_string())?;
+        .get("u")
+        .ok_or_else(|| "update entry requires u".to_string())?;
     optional_bool_doc(entry, "upsert")?;
     optional_bool_doc(entry, "multi")?;
     if let Some(hint) = parse_optional_hint(entry)? {
@@ -7240,7 +7245,7 @@ fn validate_update_entry_shape_tx(
         )?;
         validate_hint_collation(&resolved, &collation, query)?;
     }
-    classify_update(update)?;
+    parse_update_spec(update, entry.get("arrayFilters"))?;
     Ok(())
 }
 
@@ -7253,13 +7258,24 @@ fn apply_update_entry(
     let Bson::Document(entry) = entry else {
         return Err("update entries must be documents".to_string());
     };
-    reject_unsupported_entry_keys(entry, &["q", "u", "upsert", "multi", "hint", "collation"])?;
+    reject_unsupported_entry_keys(
+        entry,
+        &[
+            "q",
+            "u",
+            "upsert",
+            "multi",
+            "hint",
+            "collation",
+            "arrayFilters",
+        ],
+    )?;
     let query = entry
         .get_document("q")
         .map_err(|_| "update entry requires q document".to_string())?;
     let update = entry
-        .get_document("u")
-        .map_err(|_| "update entry requires u document".to_string())?;
+        .get("u")
+        .ok_or_else(|| "update entry requires u".to_string())?;
     let upsert = optional_bool_doc(entry, "upsert")?.unwrap_or(false);
     let multi = optional_bool_doc(entry, "multi")?.unwrap_or(false);
     let collation = Collation::parse_optional(entry, "collation")?;
@@ -7270,7 +7286,7 @@ fn apply_update_entry(
         )?),
         None => None,
     };
-    let update = classify_update(update)?;
+    let update = parse_update_spec(update, entry.get("arrayFilters"))?;
 
     let mut matches = Vec::new();
     for stored in
@@ -7295,7 +7311,7 @@ fn apply_update_entry(
             });
         }
 
-        let mut new_document = build_upsert_document(query, &update)?;
+        let mut new_document = build_upsert_document(query, &update, &collation)?;
         ensure_document_id(&mut new_document);
         let upserted_id = new_document
             .get("_id")
@@ -7322,7 +7338,7 @@ fn apply_update_entry(
     let matched = matches.len() as i32;
     let mut modified = 0_i32;
     for stored in matches {
-        let new_document = apply_update_to_document(&stored.document, &update)?;
+        let new_document = apply_update_to_document(&stored.document, &update, query, &collation)?;
         let new_id_key = id_key(&new_document).map_err(|err| err.to_string())?;
         if new_id_key != stored.id_key {
             return Err("update cannot change _id".to_string());
@@ -7802,9 +7818,35 @@ fn optional_bool_doc(document: &Document, key: &str) -> std::result::Result<Opti
 }
 
 #[derive(Clone, Debug)]
+struct ParsedUpdate {
+    spec: UpdateSpec,
+    array_filters: ArrayFilterSet,
+}
+
+#[derive(Clone, Debug)]
 enum UpdateSpec {
     Replacement(Document),
     Modifier(UpdateModifiers),
+    Pipeline(Vec<UpdatePipelineStage>),
+}
+
+#[derive(Clone, Debug)]
+enum UpdatePipelineStage {
+    AddFields(Vec<AggregationComputedField>),
+    Unset(AggregateUnsetSpec),
+    Project(Option<AggregateProjectSpec>),
+    ReplaceRoot(AggregateReplaceRootSpec),
+}
+
+#[derive(Clone, Debug, Default)]
+struct ArrayFilterSet {
+    filters: HashMap<String, ArrayFilterPredicate>,
+}
+
+#[derive(Clone, Debug)]
+struct ArrayFilterPredicate {
+    document: Document,
+    root: Option<Bson>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -7840,6 +7882,22 @@ impl UpdateModifiers {
             && self.pull.is_empty()
             && self.pull_all.is_empty()
     }
+}
+
+fn parse_update_spec(
+    update: &Bson,
+    array_filters: Option<&Bson>,
+) -> std::result::Result<ParsedUpdate, String> {
+    let spec = match update {
+        Bson::Document(update) => classify_update(update)?,
+        Bson::Array(stages) => UpdateSpec::Pipeline(parse_update_pipeline(stages)?),
+        _ => return Err("update entry requires u document or pipeline array".to_string()),
+    };
+    let array_filters = parse_array_filters(array_filters, &spec)?;
+    Ok(ParsedUpdate {
+        spec,
+        array_filters,
+    })
 }
 
 fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String> {
@@ -7924,13 +7982,209 @@ fn classify_update(update: &Document) -> std::result::Result<UpdateSpec, String>
     Ok(UpdateSpec::Modifier(modifiers))
 }
 
+fn parse_update_pipeline(stages: &[Bson]) -> std::result::Result<Vec<UpdatePipelineStage>, String> {
+    if stages.is_empty() {
+        return Err("update pipeline must not be empty".to_string());
+    }
+    let mut parsed = Vec::new();
+    for stage in stages {
+        let Bson::Document(stage) = stage else {
+            return Err("update pipeline stages must be documents".to_string());
+        };
+        if stage.len() != 1 {
+            return Err("update pipeline stages must contain one operator".to_string());
+        }
+        let (operator, operand) = stage.iter().next().expect("stage length checked above");
+        let parsed_stage = match operator.as_str() {
+            "$set" | "$addFields" => {
+                let Bson::Document(spec) = operand else {
+                    return Err(format!("{operator} requires a document"));
+                };
+                let fields =
+                    parse_aggregate_add_fields_stage(spec, operator).map_err(command_errmsg)?;
+                validate_aggregation_computed_fields_static(&fields).map_err(command_errmsg)?;
+                UpdatePipelineStage::AddFields(fields)
+            }
+            "$unset" => {
+                let unset = parse_aggregate_unset_stage(operand).map_err(command_errmsg)?;
+                UpdatePipelineStage::Unset(unset)
+            }
+            "$project" => {
+                let Bson::Document(projection) = operand else {
+                    return Err("$project requires a document".to_string());
+                };
+                let projection =
+                    parse_aggregate_project_stage(projection).map_err(command_errmsg)?;
+                if let Some(projection) = &projection {
+                    validate_aggregate_project_static_expressions(projection)
+                        .map_err(command_errmsg)?;
+                }
+                UpdatePipelineStage::Project(projection)
+            }
+            "$replaceRoot" | "$replaceWith" => {
+                let replacement = parse_aggregate_replace_root_stage(operator, operand)
+                    .map_err(command_errmsg)?;
+                validate_aggregate_replace_root_static_expression(&replacement)
+                    .map_err(command_errmsg)?;
+                UpdatePipelineStage::ReplaceRoot(replacement)
+            }
+            _ => return Err(format!("update pipeline stage {operator} is not supported")),
+        };
+        parsed.push(parsed_stage);
+    }
+    Ok(parsed)
+}
+
+fn command_errmsg(document: Document) -> String {
+    document
+        .get_str("errmsg")
+        .unwrap_or("command failed")
+        .to_string()
+}
+
+fn parse_array_filters(
+    value: Option<&Bson>,
+    update: &UpdateSpec,
+) -> std::result::Result<ArrayFilterSet, String> {
+    let used = update.used_array_filter_ids()?;
+    let Some(value) = value else {
+        if !used.is_empty() {
+            return Err(
+                "arrayFilters must be specified for filtered positional updates".to_string(),
+            );
+        }
+        return Ok(ArrayFilterSet::default());
+    };
+    let Bson::Array(filters) = value else {
+        return Err("arrayFilters must be an array".to_string());
+    };
+    if filters.is_empty() {
+        return Err("arrayFilters must not be empty".to_string());
+    }
+    if used.is_empty() {
+        return Err("arrayFilters contains unused filters".to_string());
+    }
+
+    let mut parsed = HashMap::new();
+    for filter in filters {
+        let Bson::Document(filter) = filter else {
+            return Err("arrayFilters entries must be documents".to_string());
+        };
+        if filter.is_empty() {
+            return Err("arrayFilters entries must be non-empty documents".to_string());
+        }
+        let mut identifier = None::<String>;
+        let mut document = Document::new();
+        let mut root = None::<Bson>;
+        for (path, condition) in filter {
+            let (candidate, rest) = split_array_filter_path(path)?;
+            match &identifier {
+                Some(existing) if existing != candidate => {
+                    return Err("arrayFilters entries must use one identifier".to_string());
+                }
+                None => identifier = Some(candidate.to_string()),
+                _ => {}
+            }
+            if rest.is_empty() {
+                if root.is_some() {
+                    return Err("arrayFilters root predicate is duplicated".to_string());
+                }
+                validate_array_filter_condition(condition)?;
+                root = Some(condition.clone());
+            } else {
+                validate_filter_shape(&doc! { rest.to_string(): condition.clone() })
+                    .map_err(|err| err.errmsg)?;
+                document.insert(rest, condition.clone());
+            }
+        }
+        let identifier = identifier.expect("non-empty filter checked above");
+        if parsed
+            .insert(identifier.clone(), ArrayFilterPredicate { document, root })
+            .is_some()
+        {
+            return Err(format!(
+                "arrayFilters contains duplicate identifier {identifier}"
+            ));
+        }
+    }
+
+    for identifier in &used {
+        if !parsed.contains_key(identifier) {
+            return Err(format!("arrayFilters missing identifier {identifier}"));
+        }
+    }
+    for identifier in parsed.keys() {
+        if !used.contains(identifier) {
+            return Err(format!(
+                "arrayFilters contains unused identifier {identifier}"
+            ));
+        }
+    }
+    Ok(ArrayFilterSet { filters: parsed })
+}
+
+fn validate_array_filter_condition(condition: &Bson) -> std::result::Result<(), String> {
+    if let Bson::Document(operators) = condition
+        && operators.keys().any(|key| key.starts_with('$'))
+    {
+        validate_operator_document_shape(operators).map_err(|err| err.errmsg)?;
+        return Ok(());
+    }
+    validate_filter_shape(&doc! { "value": condition.clone() }).map_err(|err| err.errmsg)
+}
+
+fn split_array_filter_path(path: &str) -> std::result::Result<(&str, &str), String> {
+    let mut parts = path.splitn(2, '.');
+    let identifier = parts.next().unwrap_or_default();
+    if !is_valid_array_filter_identifier(identifier) {
+        return Err(format!("arrayFilters identifier {identifier} is invalid"));
+    }
+    Ok((identifier, parts.next().unwrap_or_default()))
+}
+
+fn is_valid_array_filter_identifier(identifier: &str) -> bool {
+    let mut chars = identifier.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+impl UpdateSpec {
+    fn used_array_filter_ids(&self) -> std::result::Result<HashSet<String>, String> {
+        let mut used = HashSet::new();
+        if let UpdateSpec::Modifier(modifiers) = self {
+            for path in modifiers.positional_candidate_paths() {
+                for segment in parse_update_path("$[identifier]", path, true)? {
+                    if let UpdatePathSegment::Filtered(identifier) = segment {
+                        used.insert(identifier);
+                    }
+                }
+            }
+        }
+        Ok(used)
+    }
+}
+
+impl UpdateModifiers {
+    fn positional_candidate_paths(&self) -> Vec<&str> {
+        self.set
+            .keys()
+            .chain(self.unset.keys())
+            .chain(self.inc.keys())
+            .chain(self.min.keys())
+            .chain(self.max.keys())
+            .chain(self.mul.keys())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
 fn append_update_paths(
     operator: &str,
     document: &Document,
     paths: &mut Vec<String>,
 ) -> std::result::Result<(), String> {
     for key in document.keys() {
-        validate_update_path(operator, key)?;
+        validate_update_path_for_operator(operator, key)?;
         paths.push(key.to_string());
     }
     Ok(())
@@ -8033,39 +8287,109 @@ fn parse_each_operand(operator: &str, operand: &Bson) -> std::result::Result<Vec
 }
 
 fn validate_update_path(operator: &str, path: &str) -> std::result::Result<(), String> {
+    parse_update_path(operator, path, false).map(|_| ())
+}
+
+fn validate_update_path_for_operator(
+    operator: &str,
+    path: &str,
+) -> std::result::Result<(), String> {
+    parse_update_path(operator, path, positional_operator_supported(operator)).map(|_| ())
+}
+
+fn positional_operator_supported(operator: &str) -> bool {
+    matches!(
+        operator,
+        "$set" | "$unset" | "$inc" | "$min" | "$max" | "$mul"
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum UpdatePathSegment {
+    Field(String),
+    Positional,
+    AllPositional,
+    Filtered(String),
+}
+
+fn parse_update_path(
+    operator: &str,
+    path: &str,
+    allow_positional: bool,
+) -> std::result::Result<Vec<UpdatePathSegment>, String> {
     if path.is_empty() {
         return Err(format!("{operator} contains empty update path"));
     }
     if path.starts_with('$') {
         return Err(format!("{operator} contains unsupported path {path}"));
     }
+    let mut segments = Vec::new();
+    let mut positional_count = 0;
     for segment in path.split('.') {
         if segment.is_empty() {
             return Err(format!("{operator} contains unsupported path {path}"));
         }
-        if segment.contains('$') {
-            return Err(format!("{operator} contains positional path {path}"));
+        let parsed = match segment {
+            "$" => UpdatePathSegment::Positional,
+            "$[]" => UpdatePathSegment::AllPositional,
+            _ if segment.starts_with("$[") && segment.ends_with(']') => {
+                let identifier = &segment[2..segment.len() - 1];
+                if !is_valid_array_filter_identifier(identifier) {
+                    return Err(format!(
+                        "{operator} contains invalid array filter identifier"
+                    ));
+                }
+                UpdatePathSegment::Filtered(identifier.to_string())
+            }
+            _ if segment.contains('$') => {
+                return Err(format!(
+                    "{operator} contains unsupported positional path {path}"
+                ));
+            }
+            _ => UpdatePathSegment::Field(segment.to_string()),
+        };
+        if !matches!(parsed, UpdatePathSegment::Field(_)) {
+            if !allow_positional {
+                return Err(format!("{operator} contains positional path {path}"));
+            }
+            positional_count += 1;
+            if positional_count > 1 {
+                return Err(format!(
+                    "{operator} contains multiple positional segments {path}"
+                ));
+            }
         }
+        segments.push(parsed);
     }
     if path == "_id" || path.starts_with("_id.") {
         return Err("update cannot change _id".to_string());
     }
-    Ok(())
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, UpdatePathSegment::Field(field) if field == "_id"))
+    {
+        return Err("update cannot change _id".to_string());
+    }
+    Ok(segments)
 }
 
 fn apply_update_to_document(
     original: &Document,
-    update: &UpdateSpec,
+    update: &ParsedUpdate,
+    query: &Document,
+    collation: &Collation,
 ) -> std::result::Result<Document, String> {
-    apply_update_to_document_for_context(original, update, false)
+    apply_update_to_document_for_context(original, update, false, query, collation)
 }
 
 fn apply_update_to_document_for_context(
     original: &Document,
-    update: &UpdateSpec,
+    update: &ParsedUpdate,
     is_upsert_insert: bool,
+    query: &Document,
+    collation: &Collation,
 ) -> std::result::Result<Document, String> {
-    match update {
+    match &update.spec {
         UpdateSpec::Replacement(replacement) => {
             let mut document = replacement.clone();
             match (original.get("_id"), document.get("_id")) {
@@ -8079,10 +8403,19 @@ fn apply_update_to_document_for_context(
             }
             Ok(document)
         }
+        UpdateSpec::Pipeline(stages) => apply_update_pipeline(original, stages, collation),
         UpdateSpec::Modifier(modifiers) => {
             let mut document = original.clone();
             for (path, value) in &modifiers.set {
-                set_update_path(&mut document, path, value.clone())?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$set",
+                    path,
+                    Some(value),
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             if is_upsert_insert {
                 for (path, value) in &modifiers.set_on_insert {
@@ -8090,10 +8423,26 @@ fn apply_update_to_document_for_context(
                 }
             }
             for path in modifiers.unset.keys() {
-                unset_update_path(&mut document, path)?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$unset",
+                    path,
+                    None,
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             for (path, operand) in &modifiers.inc {
-                inc_update_path(&mut document, path, operand)?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$inc",
+                    path,
+                    Some(operand),
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             for (source, destination) in &modifiers.rename {
                 let Bson::String(destination) = destination else {
@@ -8102,13 +8451,37 @@ fn apply_update_to_document_for_context(
                 rename_update_path(&mut document, source, destination)?;
             }
             for (path, operand) in &modifiers.min {
-                min_update_path(&mut document, path, operand)?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$min",
+                    path,
+                    Some(operand),
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             for (path, operand) in &modifiers.max {
-                max_update_path(&mut document, path, operand)?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$max",
+                    path,
+                    Some(operand),
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             for (path, operand) in &modifiers.mul {
-                mul_update_path(&mut document, path, operand)?;
+                apply_scalar_modifier_path(
+                    &mut document,
+                    "$mul",
+                    path,
+                    Some(operand),
+                    query,
+                    &update.array_filters,
+                    collation,
+                )?;
             }
             for (path, operand) in &modifiers.push {
                 push_update_path(&mut document, path, operand)?;
@@ -8130,11 +8503,339 @@ fn apply_update_to_document_for_context(
     }
 }
 
+fn apply_update_pipeline(
+    original: &Document,
+    stages: &[UpdatePipelineStage],
+    collation: &Collation,
+) -> std::result::Result<Document, String> {
+    let original_id = original
+        .get("_id")
+        .cloned()
+        .ok_or_else(|| "pipeline update requires _id".to_string())?;
+    let mut document = original.clone();
+    for stage in stages {
+        document = match stage {
+            UpdatePipelineStage::AddFields(fields) => {
+                apply_aggregate_add_fields_stage(document, fields, collation)
+                    .map_err(command_errmsg)?
+            }
+            UpdatePipelineStage::Unset(unset) => {
+                let mut next = document;
+                for path in &unset.paths {
+                    unset_document_path(&mut next, path);
+                }
+                next
+            }
+            UpdatePipelineStage::Project(None) => Document::new(),
+            UpdatePipelineStage::Project(Some(projection)) => {
+                apply_aggregate_project_stage(&document, projection, collation)
+                    .map_err(command_errmsg)?
+            }
+            UpdatePipelineStage::ReplaceRoot(replacement) => {
+                apply_aggregate_replace_root_stage(&document, replacement, collation)
+                    .map_err(command_errmsg)?
+            }
+        };
+    }
+    match document.get("_id") {
+        Some(new_id) if bson_values_equal(new_id, &original_id) => Ok(document),
+        Some(_) => Err("pipeline update cannot change _id".to_string()),
+        None => Err("pipeline update cannot remove _id".to_string()),
+    }
+}
+
+fn update_contains_positional_paths(update: &ParsedUpdate) -> std::result::Result<bool, String> {
+    let UpdateSpec::Modifier(modifiers) = &update.spec else {
+        return Ok(false);
+    };
+    for path in modifiers.positional_candidate_paths() {
+        if parse_update_path("$positional", path, true)?
+            .iter()
+            .any(|segment| !matches!(segment, UpdatePathSegment::Field(_)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_scalar_modifier_path(
+    document: &mut Document,
+    operator: &str,
+    path: &str,
+    operand: Option<&Bson>,
+    query: &Document,
+    array_filters: &ArrayFilterSet,
+    collation: &Collation,
+) -> std::result::Result<(), String> {
+    let segments = parse_update_path(operator, path, true)?;
+    if segments
+        .iter()
+        .all(|segment| matches!(segment, UpdatePathSegment::Field(_)))
+    {
+        return apply_scalar_modifier_plain(document, operator, path, operand);
+    }
+    apply_positional_scalar_modifier(
+        document,
+        operator,
+        operand,
+        &segments,
+        query,
+        array_filters,
+        collation,
+    )
+}
+
+fn apply_scalar_modifier_plain(
+    document: &mut Document,
+    operator: &str,
+    path: &str,
+    operand: Option<&Bson>,
+) -> std::result::Result<(), String> {
+    match operator {
+        "$set" => set_update_path(
+            document,
+            path,
+            operand.expect("$set operand provided").clone(),
+        ),
+        "$unset" => unset_update_path(document, path),
+        "$inc" => inc_update_path(document, path, operand.expect("$inc operand provided")),
+        "$min" => min_update_path(document, path, operand.expect("$min operand provided")),
+        "$max" => max_update_path(document, path, operand.expect("$max operand provided")),
+        "$mul" => mul_update_path(document, path, operand.expect("$mul operand provided")),
+        _ => Err(format!("unsupported positional modifier {operator}")),
+    }
+}
+
+fn apply_positional_scalar_modifier(
+    document: &mut Document,
+    operator: &str,
+    operand: Option<&Bson>,
+    segments: &[UpdatePathSegment],
+    query: &Document,
+    array_filters: &ArrayFilterSet,
+    collation: &Collation,
+) -> std::result::Result<(), String> {
+    let Some(positional_index) = segments
+        .iter()
+        .position(|segment| !matches!(segment, UpdatePathSegment::Field(_)))
+    else {
+        return Err("positional update path is missing positional segment".to_string());
+    };
+    if positional_index == 0 {
+        return Err("positional update requires an array field prefix".to_string());
+    }
+    let array_path = field_segments_to_path(&segments[..positional_index])?;
+    let tail_path = field_segments_to_path(&segments[positional_index + 1..])?;
+    let selected_indices = match &segments[positional_index] {
+        UpdatePathSegment::Positional => {
+            vec![first_matching_array_index(
+                document,
+                &array_path,
+                query,
+                collation,
+            )?]
+        }
+        UpdatePathSegment::AllPositional => {
+            let len = array_values_at_path(document, &array_path)?.len();
+            (0..len).collect()
+        }
+        UpdatePathSegment::Filtered(identifier) => {
+            let predicate = array_filters
+                .filters
+                .get(identifier)
+                .ok_or_else(|| format!("arrayFilters missing identifier {identifier}"))?;
+            array_filter_matching_indices(document, &array_path, predicate, collation)?
+        }
+        UpdatePathSegment::Field(_) => unreachable!("position selected non-field"),
+    };
+
+    let mut values = array_values_at_path(document, &array_path)?.clone();
+    for index in selected_indices {
+        let Some(value) = values.get_mut(index) else {
+            return Err("positional update resolved out of bounds element".to_string());
+        };
+        apply_scalar_modifier_to_array_element(value, operator, &tail_path, operand)?;
+    }
+    set_update_path(document, &array_path, Bson::Array(values))
+}
+
+fn field_segments_to_path(segments: &[UpdatePathSegment]) -> std::result::Result<String, String> {
+    let mut parts = Vec::new();
+    for segment in segments {
+        let UpdatePathSegment::Field(field) = segment else {
+            return Err("nested positional paths are not supported".to_string());
+        };
+        parts.push(field.as_str());
+    }
+    Ok(parts.join("."))
+}
+
+fn array_values_at_path<'a>(
+    document: &'a Document,
+    array_path: &str,
+) -> std::result::Result<&'a Vec<Bson>, String> {
+    match get_update_path_checked(document, array_path)? {
+        Some(Bson::Array(values)) => {
+            if values.iter().any(|value| matches!(value, Bson::Array(_))) {
+                return Err("nested array positional updates are not supported".to_string());
+            }
+            Ok(values)
+        }
+        Some(_) => Err(format!(
+            "{array_path} must be an array for positional update"
+        )),
+        None => Err(format!("{array_path} must exist for positional update")),
+    }
+}
+
+fn apply_scalar_modifier_to_array_element(
+    value: &mut Bson,
+    operator: &str,
+    tail_path: &str,
+    operand: Option<&Bson>,
+) -> std::result::Result<(), String> {
+    if tail_path.is_empty() {
+        let mut wrapper = doc! { "value": value.clone() };
+        apply_scalar_modifier_plain(&mut wrapper, operator, "value", operand)?;
+        *value = wrapper.remove("value").unwrap_or(Bson::Null);
+        return Ok(());
+    }
+    let Bson::Document(document) = value else {
+        return Err("positional update cannot traverse scalar array element".to_string());
+    };
+    apply_scalar_modifier_plain(document, operator, tail_path, operand)
+}
+
+fn first_matching_array_index(
+    document: &Document,
+    array_path: &str,
+    query: &Document,
+    collation: &Collation,
+) -> std::result::Result<usize, String> {
+    let values = array_values_at_path(document, array_path)?;
+    let predicates = positional_query_predicates(array_path, query)?;
+    for (index, value) in values.iter().enumerate() {
+        if positional_element_matches(value, &predicates, collation)? {
+            return Ok(index);
+        }
+    }
+    Err(format!(
+        "query does not match an element for positional path {array_path}"
+    ))
+}
+
+fn positional_query_predicates(
+    array_path: &str,
+    query: &Document,
+) -> std::result::Result<Vec<ArrayFilterPredicate>, String> {
+    if query.keys().any(|key| key.starts_with('$')) {
+        return Err("positional $ requires a direct array predicate".to_string());
+    }
+    let mut predicates = Vec::new();
+    for (field, condition) in query {
+        if field == array_path {
+            if let Bson::Document(document) = condition
+                && let Some(elem_match) = document.get("$elemMatch")
+            {
+                let Bson::Document(filter) = elem_match else {
+                    return Err("$elemMatch requires a document".to_string());
+                };
+                validate_filter_shape(filter).map_err(|err| err.errmsg)?;
+                predicates.push(ArrayFilterPredicate {
+                    document: filter.clone(),
+                    root: None,
+                });
+                continue;
+            }
+            validate_array_filter_condition(condition)?;
+            predicates.push(ArrayFilterPredicate {
+                document: Document::new(),
+                root: Some(condition.clone()),
+            });
+        } else if let Some(rest) = field.strip_prefix(&format!("{array_path}.")) {
+            validate_filter_shape(&doc! { rest.to_string(): condition.clone() })
+                .map_err(|err| err.errmsg)?;
+            predicates.push(ArrayFilterPredicate {
+                document: doc! { rest.to_string(): condition.clone() },
+                root: None,
+            });
+        }
+    }
+    if predicates.is_empty() {
+        return Err("positional $ requires a supported array predicate".to_string());
+    }
+    Ok(predicates)
+}
+
+fn positional_element_matches(
+    value: &Bson,
+    predicates: &[ArrayFilterPredicate],
+    collation: &Collation,
+) -> std::result::Result<bool, String> {
+    for predicate in predicates {
+        if !array_filter_predicate_matches(value, predicate, collation)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn array_filter_matching_indices(
+    document: &Document,
+    array_path: &str,
+    predicate: &ArrayFilterPredicate,
+    collation: &Collation,
+) -> std::result::Result<Vec<usize>, String> {
+    let mut indices = Vec::new();
+    for (index, value) in array_values_at_path(document, array_path)?
+        .iter()
+        .enumerate()
+    {
+        if array_filter_predicate_matches(value, predicate, collation)? {
+            indices.push(index);
+        }
+    }
+    Ok(indices)
+}
+
+fn array_filter_predicate_matches(
+    value: &Bson,
+    predicate: &ArrayFilterPredicate,
+    collation: &Collation,
+) -> std::result::Result<bool, String> {
+    if let Some(root) = &predicate.root {
+        let matched = if let Bson::Document(operators) = root
+            && operators.keys().any(|key| key.starts_with('$'))
+        {
+            matches_operator_document_with_collation(&[value], operators, collation)
+                .map_err(|err| err.errmsg)?
+        } else {
+            bson_values_equal_with_collation(value, root, collation)
+        };
+        if !matched {
+            return Ok(false);
+        }
+    }
+    if !predicate.document.is_empty() {
+        let Bson::Document(document) = value else {
+            return Ok(false);
+        };
+        if !matches_filter_with_collation(document, &predicate.document, collation)
+            .map_err(|err| err.errmsg)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn build_upsert_document(
     query: &Document,
-    update: &UpdateSpec,
+    update: &ParsedUpdate,
+    collation: &Collation,
 ) -> std::result::Result<Document, String> {
-    match update {
+    match &update.spec {
         UpdateSpec::Replacement(replacement) => {
             let mut document = replacement.clone();
             if !document.contains_key("_id")
@@ -8145,9 +8846,18 @@ fn build_upsert_document(
             Ok(document)
         }
         UpdateSpec::Modifier(_) => {
+            if update_contains_positional_paths(update)? {
+                return Err("positional updates are not supported for upsert inserts".to_string());
+            }
             let mut document = equality_document_from_filter(query)?;
-            document = apply_update_to_document_for_context(&document, update, true)?;
+            document =
+                apply_update_to_document_for_context(&document, update, true, query, collation)?;
             Ok(document)
+        }
+        UpdateSpec::Pipeline(stages) => {
+            let mut document = equality_document_from_filter(query)?;
+            ensure_document_id(&mut document);
+            apply_update_pipeline(&document, stages, collation)
         }
     }
 }
@@ -17887,7 +18597,6 @@ mod tests {
             doc! { "findAndModify": "users", "$db": "app", "remove": true, "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "remove": false },
             doc! { "findAndModify": "users", "$db": "app" },
-            doc! { "findAndModify": "users", "$db": "app", "update": [{ "$set": { "name": "x" } }] },
             doc! { "findAndModify": "users", "$db": "app", "update": "bad" },
             doc! { "findAndModify": "users", "$db": "app", "arrayFilters": [], "update": { "$set": { "name": "x" } } },
             doc! { "findAndModify": "users", "$db": "app", "collation": {}, "update": { "$set": { "name": "x" } } },
@@ -21314,19 +22023,23 @@ mod tests {
     }
 
     #[test]
-    fn update_modifier_path_validation_rejects_protected_and_positional_paths() {
+    fn update_modifier_path_validation_rejects_protected_and_unsupported_positional_paths() {
         for update in [
             doc! { "$set": { "": 1_i32 } },
             doc! { "$set": { ".name": 1_i32 } },
             doc! { "$set": { "name.": 1_i32 } },
             doc! { "$set": { "$name": 1_i32 } },
-            doc! { "$set": { "items.$.name": 1_i32 } },
+            doc! { "$set": { "items.$[].$[bad].name": 1_i32 } },
+            doc! { "$push": { "items.$.name": 1_i32 } },
             doc! { "$set": { "_id": "changed" } },
             doc! { "$set": { "_id.value": "changed" } },
+            doc! { "$set": { "items.$._id": "changed" } },
             doc! { "$set": { "profile": {}, "profile.city": "Rome" } },
         ] {
             assert!(classify_update(&update).is_err(), "{update:?}");
         }
+
+        assert!(classify_update(&doc! { "$set": { "items.$.name": 1_i32 } }).is_ok());
 
         for update in [
             doc! { "$bit": { "age": { "and": 1_i32 } } },

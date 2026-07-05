@@ -167,7 +167,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Update spec architecture and preflight model
+- [x] Milestone 0: Update spec architecture and preflight model
 - [ ] Milestone 1: Update pipeline subset
 - [ ] Milestone 2: Positional `$` and `$[]`
 - [ ] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
@@ -227,6 +227,16 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Added parsed update architecture for document and pipeline update
+  specs, parsed positional path segments, parsed `arrayFilters`, and shared
+  preflight/application wiring for `update` and `findAndModify`. Verification
+  passed with `cargo fmt -- --check`, `cargo test update`, `cargo test
+  find_and_modify`, `cargo test validation`, and `cargo test` (180 main tests
+  and 182 bench-target tests passed). Commit hash pending at checkpoint commit
+  time.
 
 ## Milestone 1: Update Pipeline Subset
 
