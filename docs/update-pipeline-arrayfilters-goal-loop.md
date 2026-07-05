@@ -173,7 +173,7 @@ When a milestone is complete:
 - [x] Milestone 3: Filtered positional `$[identifier]` and `arrayFilters`
 - [x] Milestone 4: Invariant hardening across validation, indexes, TTL, and findAndModify
 - [x] Milestone 5: PyMongo e2e, spec corpus, docs, scorecard, and benchmarks
-- [ ] Milestone 6: Final verification and handoff
+- [x] Milestone 6: Final verification and handoff
 
 ## Milestone 0: Update Spec Architecture And Preflight Model
 
@@ -653,6 +653,31 @@ Likely files:
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status:
+
+- 2026-07-05: Final verification passed for the update pipeline, positional,
+  and arrayFilters uplift. Commands run: `cargo fmt -- --check`, `cargo test`
+  (183 main tests and 185 bench-target tests passed), `cargo build`, `cargo run
+  --bin mongolino-bench -- --profile ci --check-budget`,
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv lock --check`,
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv sync --locked --dev`, and
+  `UV_CACHE_DIR=/private/tmp/mongolino-uv-cache uv run --locked pytest
+  tests/e2e`. The sandboxed PyMongo command collected 211 tests but failed on
+  localhost bind permission before server startup; the exact command passed
+  unsandboxed with 211 tests passed in 109.86s. Benchmark profile `ci` passed
+  on `a939d0a`; representative update rows were `update_index_refresh`
+  605.03 ops/sec, `update_compound_target` 1869.89 ops/sec,
+  `update_partial_unique_check` 3600.85 ops/sec, and `update_multikey_target`
+  1407.53 ops/sec. Milestone commits: M0 `b879c3e`, M1 `74f421d`, M2
+  `d47f282`, M3 `76f3ebb`, M4 `88b73c9`, M5 `a939d0a`, and M6 pending at
+  checkpoint commit time. Residual unsupported behavior remains explicit:
+  unsupported update pipeline stages such as `$lookup`, unsupported expressions
+  outside the Aggregation v2 subset, positional updates beyond the bounded
+  single-array subset, nested arrays, multiple positional segments, positional
+  upserts, malformed/unused/duplicate arrayFilters, and positional use with
+  unsupported modifiers return command/write errors instead of silently
+  succeeding.
 
 ## Final Response Requirements
 
